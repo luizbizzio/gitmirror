@@ -4,12 +4,15 @@
 Default mode is audit/dry-run. Does not remove entire repositories, ever.
 This mirrors Git refs (heads/tags) and repo visibility, not issues, releases, wiki, Actions.
 """
+from contextlib import contextmanager
 import fnmatch
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -39,7 +42,7 @@ TRANSIENT_GIT_ERRORS = (
     'client_loop: send disconnect',
 )
 
-def configure_runtime(settings):
+def configure_runtime(settings, *, apply):
     """Configure legacy engine from validated config without touching live data."""
     global HOME, ROOT, GH_OWNER, CB_OWNER, GH_API, GL_API, CB_API
     global JOURNAL_DIR, RETRY_DELAYS, RUN_ID, SSH_ENV
@@ -54,7 +57,15 @@ def configure_runtime(settings):
     RETRY_DELAYS = tuple(settings['retry']['delays_seconds'])
     RUN_ID = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6]
     SSH_ENV = dict(os.environ)
-    SSH_ENV.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=20')
+    ssh = 'ssh -o BatchMode=yes -o ConnectTimeout=20'
+    if apply:
+        SSH_ENV.setdefault('GIT_SSH_COMMAND', ssh)
+    else:
+        SSH_ENV['GIT_SSH_COMMAND'] = (ssh + ' -o StrictHostKeyChecking=yes -o UpdateHostKeys=no'
+                                     ' -o ControlPath=none -o AddKeysToAgent=no -o PermitLocalCommand=no')
+        SSH_ENV['GIT_SSH_VARIANT'] = 'ssh'
+        SSH_ENV['GIT_OPTIONAL_LOCKS'] = '0'
+        SSH_ENV['GIT_TERMINAL_PROMPT'] = '0'
 
 
 
@@ -119,12 +130,16 @@ def api(url, headers, method='GET', payload=None):
             raise SyncError(f'API invalid JSON: {url}: {e}') from e
 
 
-def cmd(args, *, check=True, cwd=None, timeout=420):
+def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None):
     """Retry Git commands only when the failure looks like a transport issue."""
+    # Git's stdin protocols require LF even on Windows.
+    input_bytes = None if input_text is None else input_text.encode('utf-8', 'surrogateescape')
     for attempt in range(len(RETRY_DELAYS) + 1):
         try:
-            p = subprocess.run(args, text=True, capture_output=True, cwd=cwd,
-                               env=SSH_ENV, timeout=timeout)
+            p = subprocess.run(args, capture_output=True, cwd=cwd, input=input_bytes,
+                               env=SSH_ENV if env is None else env, timeout=timeout)
+            p.stdout = p.stdout.decode('utf-8', 'surrogateescape').replace('\r\n', '\n')
+            p.stderr = p.stderr.decode('utf-8', 'surrogateescape').replace('\r\n', '\n')
         except subprocess.TimeoutExpired as e:
             if args[0] == 'git' and attempt < len(RETRY_DELAYS):
                 retry_notice('Git', attempt + 1, RETRY_DELAYS[attempt], 'command timeout')
@@ -143,25 +158,25 @@ def cmd(args, *, check=True, cwd=None, timeout=420):
         return p
 
 
-def git(*args, repo=None, check=True, timeout=420):
+def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None):
     a = ['git']
     if repo is not None:
         a += ['-C', str(repo)]
     a += list(args)
-    return cmd(a, check=check, timeout=timeout)
+    return cmd(a, check=check, timeout=timeout, input_text=input_text, env=env)
 
 
-def parse_refs(text):
+def parse_refs(text, prefix='refs'):
     result = {}
-    for line in text.splitlines():
+    for line in text.split('\n'):
         bits = line.split('\t', 1)
         if len(bits) != 2:
             continue
         oid, ref = bits
         if ref.endswith('^{}') or not re.fullmatch('[0-9a-f]{40,64}', oid):
             continue
-        if ref.startswith('refs/heads/') or ref.startswith('refs/tags/'):
-            result[ref] = oid
+        if ref.startswith((f'{prefix}/heads/', f'{prefix}/tags/')):
+            result['refs/' + ref[len(prefix) + 1:]] = oid
     return result
 
 
@@ -169,9 +184,10 @@ def remote_refs(url):
     return parse_refs(git('ls-remote', '--heads', '--tags', url, timeout=100).stdout)
 
 
-def local_refs(repo):
-    out = git('for-each-ref', '--format=%(objectname)\t%(refname)', 'refs/heads/', 'refs/tags/', repo=repo).stdout
-    return parse_refs(out)
+def local_refs(repo, prefix='refs'):
+    out = git('for-each-ref', '--format=%(objectname)%09%(refname)',
+              f'{prefix}/heads/', f'{prefix}/tags/', repo=repo).stdout
+    return parse_refs(out, prefix)
 
 
 def count_changes(src, dst):
@@ -188,9 +204,82 @@ def ensure_remote(repo, remote, url):
         git('remote', 'set-url', remote, url, repo=repo)
 
 
-def archive_source_old_tips(repo):
+@contextmanager
+def lfs_snapshot(repo, refs):
+    """Share Git objects with an isolated repository containing only these refs."""
+    try:
+        with tempfile.TemporaryDirectory(prefix='.lfs-check-', dir=repo) as directory:
+            snapshot = Path(directory)
+            object_format = git('rev-parse', '--show-object-format', repo=repo).stdout.strip()
+            git('init', '--bare', '--template=', f'--object-format={object_format}', directory)
+            env = {**SSH_ENV, 'GIT_OBJECT_DIRECTORY': str(repo.resolve() / 'objects')}
+            # LFS can borrow objects from Git alternates, masking a missing remote object.
+            env.pop('GIT_ALTERNATE_OBJECT_DIRECTORIES', None)
+            updates = ''.join(f'create {ref} {oid}\n' for ref, oid in refs.items())
+            git('update-ref', '--stdin', repo=snapshot, input_text=updates, env=env)
+            yield snapshot, env
+    except OSError as exc:
+        raise SyncError(f'Cannot verify Git LFS objects: {exc}') from exc
+
+
+def lfs_objects(repo, refs):
+    """List LFS objects in the full history of these refs, excluding other backups."""
+    if not refs:
+        return {}
+    with lfs_snapshot(repo, refs) as (snapshot, env):
+        inventory = git('lfs', 'ls-files', '--all', '--json', '--include=', '--exclude=',
+                        repo=snapshot, timeout=1200, env=env).stdout
+    try:
+        objects = {}
+        for item in json.loads(inventory)['files'] or []:
+            oid, size = item['oid'], item['size']
+            if (not re.fullmatch(r'[0-9a-f]{64}', oid) or type(size) is not int
+                    or size <= 0 or objects.setdefault(oid, size) != size):
+                raise ValueError('Invalid Git LFS object')
+        return objects
+    except (ValueError, KeyError, TypeError) as exc:
+        raise SyncError('Could not read the Git LFS object inventory') from exc
+
+
+def verify_lfs_objects(media_dir, objects):
+    for oid, size in objects.items():
+        path = media_dir / oid[:2] / oid[2:4] / oid
+        try:
+            with path.open('rb') as file:
+                if os.fstat(file.fileno()).st_size != size or hashlib.file_digest(file, 'sha256').hexdigest() != oid:
+                    raise SyncError(f'Corrupt Git LFS object: {oid}')
+        except OSError as exc:
+            raise SyncError(f'Missing or unreadable Git LFS object: {oid}') from exc
+
+
+def fetch_backup_lfs(repo, remote, refs, objects):
+    if not objects:
+        return
+    git('lfs', 'fetch', '--all', remote, *refs, repo=repo, timeout=1800)
+    for line in git('lfs', 'env', repo=repo).stdout.splitlines():
+        if line.startswith('LocalMediaDir='):
+            verify_lfs_objects(Path(line.removeprefix('LocalMediaDir=')), objects)
+            return
+    raise SyncError('Git LFS did not report its local object directory')
+
+
+def verify_destination_lfs(repo, remote, refs, objects):
+    if not objects:
+        return
+    # An existing object in the backup cache cannot prove it can be downloaded from this destination.
+    with lfs_snapshot(repo, refs) as (snapshot, env):
+        storage = snapshot / 'lfs'
+        # Retain named remotes and their auth settings. Set storage locally so it
+        # cannot leak to the other side of Git LFS's standalone file transport.
+        git('config', '--local', '--add', 'include.path', str(repo.resolve() / 'config'), repo=snapshot)
+        git('config', '--local', '--add', 'lfs.storage', str(storage), repo=snapshot)
+        git('-c', 'lfs.remote.searchall=false', '-c', 'lfs.remote.autodetect=false',
+            'lfs', 'fetch', '--all', remote, *refs, repo=snapshot, env=env, timeout=1800)
+        verify_lfs_objects(storage / 'objects', objects)
+
+
+def archive_source_old_tips(repo, previous):
     """Keep each previously observed GitHub head/tag object reachable forever."""
-    previous = local_refs(repo)
     for sha in set(previous.values()):
         ref = f'refs/archive/github/{sha}'
         if git('show-ref', '--verify', '--quiet', ref, repo=repo, check=False).returncode:
@@ -202,13 +291,29 @@ def backup_destination_refs(repo, platform, url, refs):
     if not refs:
         return
     prefix = f'refs/archive/{RUN_ID}/{platform}'
-    git('fetch', '--no-tags', '--no-prune', '--refmap=', url,
+    git('fetch', '--atomic', '--no-tags', '--no-prune', '--refmap=', url,
         f'+refs/heads/*:{prefix}/heads/*',
         f'+refs/tags/*:{prefix}/tags/*', repo=repo, timeout=1200)
-    saved = git('for-each-ref', '--format=%(refname)', prefix, repo=repo).stdout.splitlines()
-    if len(saved) < len(refs):
-        raise SyncError(f'Destination backup incomplete ({platform}): saved {len(saved)} of {len(refs)} refs')
-    print(f'    Backup preserved {len(saved)} destination refs under {prefix}')
+    saved = local_refs(repo, prefix)
+    if saved != refs:
+        missing, changed, unexpected = count_changes(refs, saved)
+        raise SyncError(f'Destination backup ref mismatch ({platform}): '
+                        f'{missing} missing, {changed} changed, {unexpected} unexpected')
+    archived = [f'{prefix}/{ref.removeprefix("refs/")}' for ref in saved]
+    objects = lfs_objects(repo, saved)
+    if objects:
+        ensure_remote(repo, platform, url)
+        fetch_backup_lfs(repo, platform, archived, objects)
+    print(f'    Backup verified {len(saved)} destination refs and {len(objects)} LFS objects under {prefix}')
+
+
+def push_snapshot(repo, remote, source, previous):
+    """Only change refs covered by the verified destination snapshot."""
+    changed = sorted(ref for ref in source.keys() | previous.keys()
+                     if source.get(ref) != previous.get(ref))
+    leases = [f'--force-with-lease={ref}:{previous.get(ref, "")}' for ref in changed]
+    refspecs = [f'{source.get(ref, "")}:{ref}' for ref in changed]
+    git('push', '--no-follow-tags', *leases, '--', remote, *refspecs, repo=repo, timeout=1800)
 
 
 def discover_repos(gh_headers):
@@ -640,21 +745,19 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
         raise SyncError(f'Repository path is not a bare Git repo: {repo}')
     ensure_remote(repo, 'origin', source_url)
     # Only fetch heads/tags: never prune local recovery refs under refs/archive/.
-    archive_source_old_tips(repo)
+    previous = local_refs(repo)
+    previous_lfs = lfs_objects(repo, previous)
+    fetch_backup_lfs(repo, 'origin', previous, previous_lfs)
+    archive_source_old_tips(repo, previous)
     git('fetch', '--atomic', '--prune', '--no-tags', '--refmap=', 'origin',
         '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*', repo=repo, timeout=1200)
     src = local_refs(repo)
     if not any(k.startswith('refs/heads/') for k in src):
         raise SyncError('Fetched GitHub state has no branches; refusing all pushes')
 
-    # Keep LFS refs scoped to current GitHub heads/tags, not recovery refs.
-    has_lfs = False
-    if cmd(['git','lfs','version'], check=False).returncode == 0:
-        has_lfs = bool(git('lfs', 'ls-files', '--all', repo=repo).stdout.strip())
-    else:
-        raise SyncError('git-lfs is missing. Install it before applying to avoid incomplete backups.')
-    if has_lfs:
-        git('lfs','fetch','--all','origin',*src.keys(),repo=repo,timeout=1800)
+    source_lfs = previous_lfs if src == previous else lfs_objects(repo, src)
+    if src != previous:
+        fetch_backup_lfs(repo, 'origin', src, source_lfs)
 
     successes, failures = 0, blocked
     for platform, (url, vis) in destinations.items():
@@ -668,49 +771,31 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
                 if not url:
                     raise SyncError('New project URL not available from API')
             old = remote_refs(url)
-            changes = count_changes(src, old)
-            if changes == (0,0,0):
-                # The Git refs can already match even when a previously private
-                # destination must now be made public. Do not skip that change.
-                target = desired_visibility(priv)
-                if vis != target:
-                    if priv:
-                        # Privacy reduction is performed in the resolution phase.
-                        raise SyncError('Private GitHub repository still has non-private destination')
-                    print(f'  {platform}: Git refs already synchronized; publishing destination')
-                    verify_github_public_now(name, gh_headers)
-                    set_destination_visibility(platform, name, False,
-                                               gl_headers, cb_headers, gl_user)
-                    print(f'  {platform}: VISIBILITY SYNCED ({target})')
-                else:
-                    print(f'  {platform}: already synchronized')
-                successes += 1
-                continue
-            if old:
+            refs_changed = src != old
+            if refs_changed and old:
                 backup_destination_refs(repo, platform, url, old)
-            ensure_remote(repo, platform, url)
-            if has_lfs:
-                git('lfs','push','--all',platform,*src.keys(),repo=repo,timeout=1800)
-            gl_project = None
-            gl_pid = None
-            if platform == 'gitlab':
-                gl_project = gl_project_info(name, gl_headers, gl_user)
-                gl_pid = gl_project['id']
-            try:
-                if gl_pid is not None:
-                    prepare_gl_permissions(gl_pid, gl_project, src, old, gl_headers)
-                # Scoped to heads/tags, so local refs/archive are never pushed.
-                git('push','--force','--prune',platform,
-                    '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*',
-                    repo=repo,timeout=1800)
-                actual = remote_refs(url)
-                if actual != src:
-                    raise SyncError('Post-push refs do not match the GitHub snapshot')
-            finally:
-                # Never leave force-push enabled after a normal or failed run.
-                # Recovery journal also handles SIGKILL or machine power loss.
-                if gl_pid is not None:
-                    restore_gl_permissions(gl_pid, gl_headers)
+            if refs_changed or source_lfs:
+                ensure_remote(repo, platform, url)
+            if source_lfs:
+                git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
+                    platform, *src, repo=repo, timeout=1800)
+            if refs_changed:
+                gl_project = None
+                gl_pid = None
+                if platform == 'gitlab':
+                    gl_project = gl_project_info(name, gl_headers, gl_user)
+                    gl_pid = gl_project['id']
+                try:
+                    if gl_pid is not None:
+                        prepare_gl_permissions(gl_pid, gl_project, src, old, gl_headers)
+                    push_snapshot(repo, platform, src, old)
+                finally:
+                    # The recovery journal also handles SIGKILL or machine power loss.
+                    if gl_pid is not None:
+                        restore_gl_permissions(gl_pid, gl_headers)
+            verify_destination_lfs(repo, platform, src, source_lfs)
+            if (refs_changed or source_lfs) and remote_refs(url) != src:
+                raise SyncError('Destination refs do not match the GitHub snapshot')
             # Make a formerly private destination public ONLY after its Git
             # refs match the public GitHub snapshot. This avoids publishing
             # an old/unrelated destination state on a failed Git push.
@@ -722,7 +807,7 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
                 verify_github_public_now(name, gh_headers)
                 set_destination_visibility(platform, name, False,
                                            gl_headers, cb_headers, gl_user)
-            print(f'  {platform}: SYNCED (Git refs and visibility verified)')
+            print(f'  {platform}: SYNCED (Git refs, Git LFS and visibility verified)')
             successes += 1
         except SyncError as e:
             print(f'  {platform}: FAILED without deleting project: {e}')
@@ -733,8 +818,7 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
 
 def run(settings, *, apply=False, only=None, platform='both'):
     """Run the existing v3 mirror engine under the new configuration layer."""
-    configure_runtime(settings)
-    ROOT.mkdir(parents=True, exist_ok=True)
+    configure_runtime(settings, apply=apply)
     for executable in ('git', 'ssh', 'git-lfs'):
         if shutil.which(executable) is None:
             raise SyncError(f'Missing executable: {executable}')

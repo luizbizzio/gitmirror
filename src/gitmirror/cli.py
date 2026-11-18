@@ -21,8 +21,9 @@ def main(argv=None):
     sub.add_parser('doctor', help='Check local tools without connecting to providers')
     for name in ('sync', 'run'):
         command = sub.add_parser(name)
-        command.add_argument('--apply', action='store_true', help='Make changes (default: dry-run)')
-        command.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
+        mode = command.add_mutually_exclusive_group()
+        mode.add_argument('--apply', action='store_true', help='Make changes (default: dry-run)')
+        mode.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
         command.add_argument('--only', help='Only one repository')
         command.add_argument('--platform', choices=['both', 'gitlab', 'codeberg'], default='both')
     args = parser.parse_args(argv)
@@ -39,13 +40,15 @@ def main(argv=None):
             print('Local tools available: git, git-lfs, ssh')
             print('Provider access is not checked by doctor.')
             return 0
-        data = cfg['storage']['path']
-        data.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(str(data / '.gitmirror.lock'), timeout=0)
         def execute():
+            if not args.apply:
+                return run(cfg, only=args.only, platform=args.platform)
+            data = cfg['storage']['path']
+            data.mkdir(parents=True, exist_ok=True)
+            lock = FileLock(str(data / '.gitmirror.lock'), timeout=0)
             try:
                 with lock:
-                    return run(cfg, apply=args.apply, only=args.only, platform=args.platform)
+                    return run(cfg, apply=True, only=args.only, platform=args.platform)
             except Timeout:
                 print('Another GitMirror process is running; no changes made.', file=sys.stderr)
                 return 2
