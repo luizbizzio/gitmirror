@@ -1,0 +1,25 @@
+# GitMirror configuration, version 1
+# Copy this file to config.yml and edit the owners.
+# Keep tokens in environment variables or separate files, never in Git.
+version: 1
+
+source:
+  provider: github
+  owner: your-github-user
+  token_env: GITHUB_TOKEN
+
+destinations:
+  gitlab:
+    token_env: GITLAB_TOKEN
+  codeberg:
+    owner: your-codeberg-user
+    token_env: CODEBERG_TOKEN
+
+storage:
+  path: ~/gitmirror-data
+
+retry:
+  delays_seconds: [3, 8, 20]
+
+schedule:
+  interval_hours: 12
