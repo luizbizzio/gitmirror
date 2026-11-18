@@ -1,7 +1,7 @@
 from pathlib import Path
 import os
 import pytest
-from gitmirror.config import load_config, ConfigError
+from gitmirror import load_config, ConfigError
 
 CONFIG = """version: 1
 source:

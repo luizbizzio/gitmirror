@@ -39,6 +39,13 @@ gitmirror --config config.yml sync --only example-repo
 gitmirror --config config.yml sync --apply --only example-repo
 ```
 
+`python -m gitmirror` supports the same commands. The application source is `gitmirror.py`.
+
+Dry-run reads the providers and Git refs without creating storage or a lock. For SSH, it
+uses OpenSSH with strict host-key verification and reads identities from the SSH config
+or agent. Configure trusted host keys before running it. Pass only one of `--apply` and
+`--dry-run`.
+
 For regular sync every 12 hours:
 
 ```sh
@@ -58,6 +65,12 @@ docker compose up -d --build
 The Docker Compose example is a starting point. Do not use it before testing SSH file permissions and API access in your own environment.
 
 ## Safety
+
+Before overwriting a destination, GitMirror verifies the archived ref names and object
+hashes and preserves the Git LFS objects referenced by that history. During an applied
+sync, GitMirror downloads the destination's required LFS objects into temporary storage
+to verify their contents, including when Git refs already match. Plan for that transfer
+and temporary disk usage on repositories with large LFS histories.
 
 The local archive is not a complete independent backup. Keep a second copy on another device. Test restore procedures before relying on it. Do not publish secrets in configuration or logs.
 

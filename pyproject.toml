@@ -16,11 +16,11 @@ keywords = ["git", "backup", "mirror", "github", "gitlab", "codeberg"]
 dev = ["pytest>=8,<10"]
 
 [project.scripts]
-gitmirror = "gitmirror.cli:main"
+gitmirror = "gitmirror:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+py-modules = ["gitmirror"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["."]

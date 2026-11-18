@@ -1,4 +1,4 @@
-from gitmirror.engine import parse_refs, count_changes, desired_visibility, SyncError, token
+from gitmirror import parse_refs, count_changes, desired_visibility, SyncError, token
 import pytest
 
 def test_parse_refs_ignores_peeled_and_unrelated():

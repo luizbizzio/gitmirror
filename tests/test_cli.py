@@ -1,6 +1,6 @@
 import pytest
 
-from gitmirror.cli import main
+from gitmirror import main
 
 def test_validate(tmp_path, capsys):
     config = tmp_path / 'c.yml'
@@ -15,7 +15,7 @@ def test_conflicting_modes_fail_before_loading_config(command, flags, monkeypatc
     def unexpected_config(*args):
         pytest.fail('Conflicting flags must be rejected before loading config')
 
-    monkeypatch.setattr('gitmirror.cli.load_config', unexpected_config)
+    monkeypatch.setattr('gitmirror.load_config', unexpected_config)
     with pytest.raises(SystemExit) as exc:
         main([command, *flags])
     assert exc.value.code == 2

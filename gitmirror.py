@@ -1,25 +1,103 @@
-#!/usr/bin/env python3
-"""GitHub -> GitLab + Codeberg; resilient Git mirroring and visibility sync.
+"""GitMirror mirrors Git history across hosts and verifies local Git and LFS backups."""
+from __future__ import annotations
 
-Default mode is audit/dry-run. Does not remove entire repositories, ever.
-This mirrors Git refs (heads/tags) and repo visibility, not issues, releases, wiki, Actions.
-"""
+import argparse
 from contextlib import contextmanager
-import fnmatch
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
+from urllib.parse import urlparse
 import urllib.request
 import uuid
-import shutil
-from pathlib import Path
+
+from filelock import FileLock, Timeout
+import yaml
+
+__version__ = "0.1.0a1"
+
+
+# Configuration
+
+class ConfigError(ValueError):
+    pass
+
+
+def _mapping(data, name):
+    if not isinstance(data, dict):
+        raise ConfigError(f'{name} must be a YAML mapping')
+    return data
+
+
+def _token_source(cfg, label):
+    if 'token' in cfg:
+        raise ConfigError(f'{label}: plaintext token in config is not supported; use token_env or token_file')
+    keys = [k for k in ('token_env', 'token_file') if k in cfg]
+    if len(keys) != 1 or not isinstance(cfg[keys[0]], str) or not cfg[keys[0]].strip():
+        raise ConfigError(f'{label}: specify exactly one token_env or token_file')
+
+
+def _url(value, name):
+    if not isinstance(value, str) or urlparse(value).scheme != 'https' or not urlparse(value).netloc:
+        raise ConfigError(f'{name} must be an HTTPS URL')
+    return value.rstrip('/')
+
+
+def load_config(path):
+    file = Path(path).expanduser().resolve()
+    try:
+        raw = yaml.safe_load(file.read_text(encoding='utf-8'))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigError(f'Cannot load config {file}: {exc}') from exc
+    raw = _mapping(raw, 'config')
+    if raw.get('version') != 1:
+        raise ConfigError('version must be 1')
+    source = _mapping(raw.get('source'), 'source')
+    if source.get('provider') != 'github':
+        raise ConfigError('source.provider currently supports github only')
+    if not isinstance(source.get('owner'), str) or not source['owner'].strip():
+        raise ConfigError('source.owner is required')
+    _token_source(source, 'source')
+    source['api_url'] = _url(source.get('api_url', 'https://api.github.com'), 'source.api_url')
+    dests = _mapping(raw.get('destinations'), 'destinations')
+    for provider, default_url in (('gitlab', 'https://gitlab.com/api/v4'),
+                                  ('codeberg', 'https://codeberg.org/api/v1')):
+        cfg = _mapping(dests.get(provider), f'destinations.{provider}')
+        _token_source(cfg, f'destinations.{provider}')
+        cfg['api_url'] = _url(cfg.get('api_url', default_url), f'destinations.{provider}.api_url')
+    if not isinstance(dests['codeberg'].get('owner'), str) or not dests['codeberg']['owner'].strip():
+        raise ConfigError('destinations.codeberg.owner is required')
+    storage = _mapping(raw.get('storage'), 'storage')
+    pathstr = storage.get('path')
+    if not isinstance(pathstr, str) or not pathstr.strip():
+        raise ConfigError('storage.path must be a non-empty path')
+    storage['path'] = Path(os.path.expandvars(pathstr)).expanduser().resolve()
+    retry = _mapping(raw.get('retry', {'delays_seconds': [3, 8, 20]}), 'retry')
+    delays = retry.get('delays_seconds', [3, 8, 20])
+    if (not isinstance(delays, list) or len(delays) > 8 or
+        any(type(v) is not int or v < 0 or v > 300 for v in delays)):
+        raise ConfigError('retry.delays_seconds must be a list of 0–8 integers from 0 to 300')
+    retry['delays_seconds'] = delays
+    schedule = _mapping(raw.get('schedule', {'interval_hours': 12}), 'schedule')
+    hours = schedule.get('interval_hours', 12)
+    if type(hours) not in (int, float) or not (0.1 <= hours <= 720):
+        raise ConfigError('schedule.interval_hours must be between 0.1 and 720')
+    schedule['interval_hours'] = hours
+    return {'version': 1, 'source': source, 'destinations': dests,
+            'storage': storage, 'retry': retry, 'schedule': schedule}
+
+
+# Runtime, credentials, and transports
 
 HOME = Path.home()
 ROOT = HOME / 'gitmirror-data'
@@ -68,8 +146,6 @@ def configure_runtime(settings, *, apply):
         SSH_ENV['GIT_TERMINAL_PROMPT'] = '0'
 
 
-
-
 class SyncError(Exception):
     pass
 
@@ -90,7 +166,6 @@ def token(spec):
     if not value:
         raise SyncError(f'Empty token file: {path}')
     return value
-
 
 
 def retry_notice(target, attempt, delay, reason):
@@ -165,6 +240,8 @@ def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None):
     a += list(args)
     return cmd(a, check=check, timeout=timeout, input_text=input_text, env=env)
 
+
+# Git references and LFS backups
 
 def parse_refs(text, prefix='refs'):
     result = {}
@@ -316,6 +393,8 @@ def push_snapshot(repo, remote, source, previous):
     git('push', '--no-follow-tags', *leases, '--', remote, *refspecs, repo=repo, timeout=1800)
 
 
+# Provider APIs
+
 def discover_repos(gh_headers):
     repos, page = [], 1
     while True:
@@ -444,6 +523,7 @@ def set_destination_visibility(platform, name, desired_private, gl_headers, cb_h
     return target
 
 
+# GitLab branch protection and recovery journal
 
 # GitLab protected branch support. Only exact, project-owned rules are
 # modified. Wildcard/group rules and protected tags are never bypassed.
@@ -673,6 +753,8 @@ def prepare_gl_permissions(project_id, project, src, old, headers):
             print(f'    GitLab temporarily unprotected stale branch for deletion: {branch}')
 
 
+# Synchronization
+
 def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, platforms):
     name = record['name']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
@@ -815,7 +897,6 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     return successes, failures
 
 
-
 def run(settings, *, apply=False, only=None, platform='both'):
     """Run the existing v3 mirror engine under the new configuration layer."""
     configure_runtime(settings, apply=apply)
@@ -861,3 +942,62 @@ def run(settings, *, apply=False, only=None, platform='both'):
     print(f'\nSUMMARY: repositories={len(repos)}, successful/checked destinations={successes}, failed={failures}, mode={"apply" if apply else "dry-run"}')
     print('Missing GitHub repositories are never deleted from destinations.')
     return 0 if failures == 0 else 1
+
+
+# Command-line interface
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='gitmirror', description='Resilient Git mirroring')
+    parser.add_argument('--version', action='version', version=__version__)
+    parser.add_argument('--config', default='config.yml', help='Path to YAML config')
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('validate', help='Validate YAML without connecting to providers')
+    sub.add_parser('doctor', help='Check local tools without connecting to providers')
+    for name in ('sync', 'run'):
+        command = sub.add_parser(name)
+        mode = command.add_mutually_exclusive_group()
+        mode.add_argument('--apply', action='store_true', help='Make changes (default: dry-run)')
+        mode.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
+        command.add_argument('--only', help='Only one repository')
+        command.add_argument('--platform', choices=['both', 'gitlab', 'codeberg'], default='both')
+    args = parser.parse_args(argv)
+    try:
+        cfg = load_config(args.config)
+        if args.command == 'validate':
+            print(f'Config valid: {Path(args.config).expanduser()}')
+            return 0
+        if args.command == 'doctor':
+            missing = [x for x in ('git', 'git-lfs', 'ssh') if shutil.which(x) is None]
+            if missing:
+                print('Missing tools: ' + ', '.join(missing), file=sys.stderr)
+                return 2
+            print('Local tools available: git, git-lfs, ssh')
+            print('Provider access is not checked by doctor.')
+            return 0
+        def execute():
+            if not args.apply:
+                return run(cfg, only=args.only, platform=args.platform)
+            data = cfg['storage']['path']
+            data.mkdir(parents=True, exist_ok=True)
+            lock = FileLock(str(data / '.gitmirror.lock'), timeout=0)
+            try:
+                with lock:
+                    return run(cfg, apply=True, only=args.only, platform=args.platform)
+            except Timeout:
+                print('Another GitMirror process is running; no changes made.', file=sys.stderr)
+                return 2
+        if args.command == 'sync':
+            return execute()
+        while True:
+            result = execute()
+            print(f'Sync cycle finished with status {result}', flush=True)
+            time.sleep(cfg['schedule']['interval_hours'] * 3600)
+    except (ConfigError, SyncError, OSError) as exc:
+        print(f'GitMirror: {exc}', file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

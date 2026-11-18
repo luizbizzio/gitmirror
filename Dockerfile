@@ -5,7 +5,7 @@ RUN apt-get update \
  && git lfs install --system
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
-COPY src ./src
+COPY gitmirror.py ./
 RUN pip install --no-cache-dir . \
  && useradd --create-home --uid 10001 gitmirror \
  && mkdir -p /data /config \
