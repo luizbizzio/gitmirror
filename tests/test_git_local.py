@@ -312,6 +312,19 @@ def test_atomic_rejection_preserves_all_refs(mirror):
     assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
 
 
+def test_push_refuses_second_push_url(mirror):
+    other = mirror.store / 'unverified.git'
+    cmd('init', '--bare', other)
+    cmd('remote', 'set-url', '--add', '--push', 'dest', mirror.dest.as_uri(), cwd=mirror.work)
+    cmd('remote', 'set-url', '--add', '--push', 'dest', other.as_uri(), cwd=mirror.work)
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+    desired = {**previous, 'refs/tags/v1': previous['refs/heads/main']}
+    with pytest.raises(gitmirror.SyncError, match='one URL matching'):
+        gitmirror.push_snapshot(mirror.work, 'dest', desired, previous)
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
+    assert not gitmirror.remote_refs(other.as_uri())
+
+
 @pytest.mark.parametrize('returncode', [0, 1])
 def test_partial_result_fails_and_later_run_recovers(mirror, monkeypatch, capsys, returncode):
     previous = gitmirror.remote_refs(mirror.dest.as_uri())

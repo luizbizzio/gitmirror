@@ -463,10 +463,10 @@ def push_snapshot(repo, remote, source, previous, *, url=None):
                      if source.get(ref) != previous.get(ref))
     if not changed:
         return
-    push_url = git('remote', 'get-url', '--push', remote, repo=repo).stdout.strip()
+    push_urls = git('remote', 'get-url', '--push', '--all', remote, repo=repo).stdout.splitlines()
     fetch_url = git('remote', 'get-url', remote, repo=repo).stdout.strip()
-    if push_url != fetch_url:
-        raise SyncError('Push URL differs from the destination used for backup')
+    if push_urls != [fetch_url]:
+        raise SyncError('Push requires one URL matching the destination used for backup')
     url = fetch_url if url is None else url
     if remote_refs(url) != previous:
         raise SyncError('Destination changed since the verified backup (stale info)')
