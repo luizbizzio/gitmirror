@@ -11,6 +11,7 @@ GitMirror copies Git branches, tags, Git LFS objects, and repository visibility 
 - Can create missing destination projects.
 - Keeps destination projects if the source repository disappears.
 - Backs up old Git refs locally before force push and branch deletion.
+- Mirrors the GitHub default branch to GitLab and Codeberg.
 - Can temporarily change simple GitLab branch protections and restore them.
 - Retries temporary network errors.
 - Has dry-run mode by default.
@@ -91,6 +92,20 @@ and hashes, and checks the size and SHA-256 of the LFS objects needed to restore
 Only complete snapshots move into `refs/archive/`. Interrupted or failed backups may leave
 refs under `refs/gitmirror-staging/`. The next cycle builds a fresh snapshot. Use
 `refs/archive/` for restoration. GitMirror keeps destination projects when their sources disappear.
+
+GitMirror rechecks GitHub repository identity, visibility and default branch before
+each outgoing Git or LFS transfer and before publishing a destination. If the check
+disagrees with discovery or fails, it stops that repository for the current cycle.
+New destinations start private and can be published after Git and LFS verification.
+The provider reads and writes are separate requests, so a change after the final
+check is still possible.
+
+When the default branch changes, GitMirror archives the existing destination and
+pushes the replacement branch first. It confirms the new default through the
+destination API and Git's advertised `HEAD` before the push that can remove the former
+branch. The former branch stays when it still exists on GitHub. If the default
+cannot be confirmed or deletion fails, the next applied run inspects the destination
+again and resumes from its observed state. [GitLab Projects API](https://docs.gitlab.com/api/projects/#edit-a-project) · [Codeberg API schema](https://codeberg.org/swagger.v1.json)
 
 Pushes use atomic updates and explicit leases. A server that declines atomic push
 can receive a single leased change after a fresh ref check. Multi-ref updates on such

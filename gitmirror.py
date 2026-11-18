@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 import datetime as dt
 import fnmatch
 import hashlib
@@ -151,6 +152,10 @@ class SyncError(Exception):
     pass
 
 
+class SourceStateError(SyncError):
+    """The discovery snapshot can no longer be used for any destination."""
+
+
 def token(spec):
     """Resolve a token from the environment or a separate file, never a YAML literal."""
     if 'token_env' in spec:
@@ -206,12 +211,15 @@ def api(url, headers, method='GET', payload=None):
             raise SyncError(f'API invalid JSON: {url}: {e}') from e
 
 
-def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, retry=True):
+def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, retry=True,
+        before_retry=None):
     """Retry Git commands only when the failure looks like a transport issue."""
     # Git's stdin protocols require LF even on Windows.
     input_bytes = None if input_text is None else input_text.encode('utf-8', 'surrogateescape')
     attempts = len(RETRY_DELAYS) + 1 if retry else 1
     for attempt in range(attempts):
+        if attempt and before_retry:
+            before_retry()
         try:
             p = subprocess.run(args, capture_output=True, cwd=cwd, input=input_bytes,
                                env=SSH_ENV if env is None else env, timeout=timeout)
@@ -235,12 +243,14 @@ def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, r
         return p
 
 
-def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None, retry=True):
+def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None, retry=True,
+        before_retry=None):
     a = ['git']
     if repo is not None:
         a += ['-C', str(repo)]
     a += list(args)
-    return cmd(a, check=check, timeout=timeout, input_text=input_text, env=env, retry=retry)
+    return cmd(a, check=check, timeout=timeout, input_text=input_text, env=env, retry=retry,
+               before_retry=before_retry)
 
 
 # Git references and LFS backups
@@ -261,6 +271,13 @@ def parse_refs(text, prefix='refs'):
 
 def remote_refs(url):
     return parse_refs(git('ls-remote', '--heads', '--tags', url, timeout=100).stdout)
+
+
+def verify_remote_head(url, branch):
+    expected = f'ref: refs/heads/{branch}\tHEAD'
+    result = git('ls-remote', '--symref', '--', url, 'HEAD', timeout=100)
+    if expected not in result.stdout.split('\n'):
+        raise SyncError(f'Destination Git HEAD is not confirmed at {branch}; refusing to continue')
 
 
 def local_refs(repo, prefix='refs'):
@@ -457,7 +474,7 @@ def backup_destination_refs(repo, platform, url, refs):
     print(f'    Backup verified {len(saved)} destination refs and {len(objects)} LFS objects under {prefix}')
 
 
-def push_snapshot(repo, remote, source, previous, *, url=None):
+def push_snapshot(repo, remote, source, previous, *, url=None, before_push=None):
     """Only change refs covered by the verified destination snapshot."""
     changed = sorted(ref for ref in source.keys() | previous.keys()
                      if source.get(ref) != previous.get(ref))
@@ -474,6 +491,8 @@ def push_snapshot(repo, remote, source, previous, *, url=None):
     refspecs = [f'{source.get(ref, "")}:{ref}' for ref in changed]
     arguments = ('--no-follow-tags', *leases, '--', remote, *refspecs)
     env = {**SSH_ENV, 'LC_ALL': 'C', 'LANGUAGE': 'C'}
+    if before_push:
+        before_push()
     try:
         result = git('push', '--atomic', *arguments, repo=repo, env=env,
                      check=False, retry=False, timeout=1800)
@@ -482,8 +501,12 @@ def push_snapshot(repo, remote, source, previous, *, url=None):
                 raise SyncError('Destination lacks atomic push support; multiple refs were left untouched')
             if remote_refs(url) != previous:
                 raise SyncError('Destination changed before the single-ref push')
+            if before_push:
+                before_push()
             result = git('push', '--no-atomic', *arguments, repo=repo, env=env,
                          check=False, retry=False, timeout=1800)
+    except SourceStateError:
+        raise
     except SyncError as exc:
         if remote_refs(url) != previous:
             raise SyncError(f'Push failed and destination refs changed; inspect the verified backup ({exc})') from exc
@@ -519,111 +542,113 @@ def discover_repos(gh_headers):
     return sorted(repos, key=lambda x: x['name'].lower())
 
 
-def get_gitlab(name, desired_private, headers, user, apply):
-    ident = urllib.parse.quote(f'{user}/{name}', safe='')
-    status, obj = api(f'{GL_API}/projects/{ident}', headers)
-    if status == 404:
-        if not apply:
-            return None, 'would-create'
-        _, obj = api(f'{GL_API}/projects', headers, method='POST', payload={
-            'name':name, 'path':name, 'visibility':'private' if desired_private else 'public',
-            'builds_access_level':'disabled'
-        })
-        print('    Created GitLab project.')
-    if not isinstance(obj, dict) or not obj.get('ssh_url_to_repo'):
-        raise SyncError('Missing GitLab SSH URL')
-    visibility = obj.get('visibility')
-    if visibility not in ('private', 'public', 'internal'):
-        raise SyncError(f'Unknown GitLab visibility for {name}: {visibility!r}; refusing changes')
-    return obj['ssh_url_to_repo'], visibility
-
-
-def codeberg_url(name):
-    ident = f'{urllib.parse.quote(CB_OWNER, safe="")}/{urllib.parse.quote(name, safe="")}'
-    return f'{CB_API}/repos/{ident}'
-
-
-def get_codeberg(name, desired_private, headers, apply):
-    status, obj = api(codeberg_url(name), headers)
-    if status == 404:
-        if not apply:
-            return None, 'would-create'
-        _, obj = api(f'{CB_API}/user/repos', headers, method='POST', payload={
-            'name':name, 'private':desired_private, 'auto_init':False
-        })
-        print('    Created Codeberg repository.')
-    if not isinstance(obj, dict) or not obj.get('ssh_url'):
-        raise SyncError('Missing Codeberg SSH URL')
-    if type(obj.get('private')) is not bool:
-        raise SyncError(f'Unknown Codeberg visibility for {name}; refusing changes')
-    return obj['ssh_url'], 'private' if obj['private'] else 'public'
-
-
 def desired_visibility(desired_private):
     return 'private' if desired_private else 'public'
 
 
-def verify_github_public_now(name, gh_headers):
-    # Re-check GitHub directly before making a destination public.
-    # It may have been made private or deleted since initial discovery.
+def verify_github_snapshot(record, gh_headers):
+    name = record['name']
     url = f'{GH_API}/repos/{urllib.parse.quote(GH_OWNER, safe="")}/{urllib.parse.quote(name, safe="")}'
-    status, info = api(url, gh_headers)
-    if (status != 200 or not isinstance(info, dict)
-            or not isinstance(info.get('owner'), dict)
-            or info['owner'].get('login', '').lower() != GH_OWNER.lower()
-            or info.get('private') is not False):
-        raise SyncError(f'GitHub {name} is no longer confirmed public; refusing publication')
+    try:
+        status, info = api(url, {**gh_headers, 'Cache-Control': 'no-cache'})
+    except SyncError as exc:
+        raise SourceStateError(f'Cannot recheck GitHub state for {name}; stopping this sync') from exc
+    if status != 200 or not isinstance(info, dict):
+        raise SourceStateError(f'GitHub state for {name} is unavailable; stopping this sync')
+    owner = info.get('owner')
+    login = owner.get('login') if isinstance(owner, dict) else None
+    if (not isinstance(login, str) or login.casefold() != GH_OWNER.casefold()
+            or type(info.get('id')) is not int or info['id'] != record['id']
+            or info.get('name') != name or info.get('ssh_url') != record['ssh_url']):
+        raise SourceStateError(f'GitHub repository identity changed for {name}; stopping this sync')
+    private = record['private']
+    expected_visibility = record.get('visibility', desired_visibility(private))
+    actual_visibility = info.get('visibility', desired_visibility(private))
+    allowed_visibility = ('private', 'internal') if private else ('public',)
+    if (info.get('private') is not private or actual_visibility != expected_visibility
+            or actual_visibility not in allowed_visibility):
+        raise SourceStateError(f'GitHub visibility changed or is unconfirmed for {name}; stopping this sync')
+    if info.get('default_branch') != record['default_branch']:
+        raise SourceStateError(f'GitHub default branch changed or is unconfirmed for {name}; stopping this sync')
 
 
-def read_destination_visibility(platform, name, gl_headers, cb_headers, gl_user):
+@dataclass(frozen=True)
+class Destination:
+    id: int
+    url: str
+    visibility: str
+    default_branch: str | None
+
+
+def destination_api_url(platform, name, gl_user):
     if platform == 'gitlab':
-        project = gl_project_info(name, gl_headers, gl_user)
-        vis = project.get('visibility')
-        if vis not in ('private', 'public', 'internal'):
-            raise SyncError(f'Cannot verify GitLab visibility on {name}: {vis!r}')
-        return vis
-    status, obj = api(codeberg_url(name), cb_headers)
-    if status != 200 or not isinstance(obj, dict) or type(obj.get('private')) is not bool:
-        raise SyncError(f'Cannot verify Codeberg visibility on {name}')
-    return 'private' if obj['private'] else 'public'
+        return f'{GL_API}/projects/{urllib.parse.quote(f"{gl_user}/{name}", safe="")}'
+    owner, repo = (urllib.parse.quote(part, safe='') for part in (CB_OWNER, name))
+    return f'{CB_API}/repos/{owner}/{repo}'
 
 
-def set_destination_visibility(platform, name, desired_private, gl_headers, cb_headers, gl_user):
-    """Change and re-read visibility. A timeout on a write may be ambiguous.
-
-    Only a subsequent GET with the exact desired result counts as success.
-    No automatic POST/PATCH/PUT retries are attempted.
-    """
-    target = desired_visibility(desired_private)
+def read_destination(platform, name, headers, gl_user, *, create=False):
+    url = destination_api_url(platform, name, gl_user)
+    status, obj = api(url, {**headers, 'Cache-Control': 'no-cache'})
+    if status == 404:
+        if not create:
+            return None
+        if platform == 'gitlab':
+            url = f'{GL_API}/projects'
+            payload = {'name': name, 'path': name, 'visibility': 'private', 'builds_access_level': 'disabled'}
+        else:
+            url = f'{CB_API}/user/repos'
+            payload = {'name': name, 'private': True, 'auto_init': False}
+        # Stage new destinations privately. Publication requires a verified mirror.
+        status, obj = api(url, headers, method='POST', payload=payload)
+        if status != 201:
+            raise SyncError(f'Cannot create private {platform} destination for {name}')
+        print(f'    Created private {platform} destination.')
+    if status not in (200, 201) or not isinstance(obj, dict):
+        raise SyncError(f'Cannot read {platform} destination for {name}')
     if platform == 'gitlab':
-        project = gl_project_info(name, gl_headers, gl_user)
-        url = f'{GL_API}/projects/{project["id"]}'
-        headers = gl_headers
-        method = 'PUT'
-        payload = {'visibility': target}
+        url, visibility = obj.get('ssh_url_to_repo'), obj.get('visibility')
     else:
-        url = codeberg_url(name)
-        headers = cb_headers
-        method = 'PATCH'
-        payload = {'private': desired_private}
+        url, private = obj.get('ssh_url'), obj.get('private')
+        visibility = desired_visibility(private) if type(private) is bool else None
+    if not isinstance(url, str) or not url or visibility not in ('private', 'public', 'internal'):
+        raise SyncError(f'Cannot verify {platform} destination URL or visibility for {name}')
+    if status == 201 and visibility != 'private':
+        raise SyncError(f'New {platform} destination is not confirmed private for {name}')
+    default_branch = obj.get('default_branch')
+    if (type(obj.get('id')) is not int or 'default_branch' not in obj
+            or (default_branch is not None and not isinstance(default_branch, str))):
+        raise SyncError(f'Cannot verify {platform} destination identity or default branch for {name}')
+    return Destination(obj['id'], url, visibility, default_branch or None)
 
+
+def update_destination(platform, name, destination, headers, gl_user, **change):
+    """Send one metadata edit and confirm the result, including after an ambiguous response."""
+    expected = replace(destination, **change)
+    if platform == 'gitlab':
+        url, method = f'{GL_API}/projects/{destination.id}', 'PUT'
+        payload = change
+    else:
+        url, method = destination_api_url(platform, name, gl_user), 'PATCH'
+        payload = {'private': change['visibility'] == 'private'} if 'visibility' in change else change
+
+    field = next(iter(change))
     error = None
     try:
         status, _ = api(url, headers, method=method, payload=payload)
         if status != 200:
-            error = f'Unexpected HTTP {status} from {platform} visibility update'
+            error = f'HTTP {status}'
     except SyncError as exc:
         error = str(exc)
     try:
-        actual = read_destination_visibility(platform, name, gl_headers, cb_headers, gl_user)
+        actual = read_destination(platform, name, headers, gl_user)
     except SyncError as exc:
-        raise SyncError(f'{platform}: visibility update not verified for {name}; '
+        raise SyncError(f'{platform}: {field} update not verified for {name}; '
                         f'write issue={error or "none"}; read issue={exc}') from exc
-    if actual != target:
-        raise SyncError(f'{platform}: visibility update failed for {name}; '
-                        f'expected={target}, actual={actual}; write issue={error or "none"}')
-    print(f'    {platform}: visibility verified as {target}')
-    return target
+    if actual != expected:
+        raise SyncError(f'{platform}: {field} update not verified for {name}; write issue={error or "none"}')
+    print(f'    {platform}: {field} verified as {getattr(expected, field)}')
+    return expected
 
 
 # GitLab branch protection and recovery journal
@@ -632,14 +657,6 @@ def set_destination_visibility(platform, name, desired_private, gl_headers, cb_h
 # modified. Wildcard/group rules and protected tags are never bypassed.
 # A write-ahead journal prevents a killed process from leaving permissions
 # temporarily relaxed without detection/recovery on the next --apply run.
-
-
-def gl_project_info(name, headers, owner):
-    path = urllib.parse.quote(f'{owner}/{name}', safe='')
-    status, project = api(f'{GL_API}/projects/{path}', headers)
-    if status != 200 or not isinstance(project, dict) or not isinstance(project.get('id'), int):
-        raise SyncError(f'Cannot resolve GitLab project {owner}/{name} for protection management')
-    return project
 
 
 def gl_list_all(project_id, resource, headers):
@@ -811,7 +828,7 @@ def protection_matches(pattern, name):
     return fnmatch.fnmatchcase(name, pattern)
 
 
-def plan_gl_permissions(project_id, project, src, old, headers):
+def plan_gl_permissions(project_id, default_branch, src, old, headers):
     """Read-only protection plan, using only exact project-owned rules."""
     protected_branches = gl_list_all(project_id, 'protected_branches', headers)
     protected_tags = gl_list_all(project_id, 'protected_tags', headers)
@@ -836,7 +853,7 @@ def plan_gl_permissions(project_id, project, src, old, headers):
             raise SyncError(f'Cannot safely automate wildcard/inherited GitLab protection on {branch}')
         rule = matches[0]
         if deleted:
-            if branch == project.get('default_branch'):
+            if branch == default_branch:
                 raise SyncError(f'Refusing deletion of GitLab default branch {branch}; align defaults first')
             payload = rule_backup_payload(rule)
             operations.append(('unprotect-delete', branch, payload))
@@ -846,9 +863,9 @@ def plan_gl_permissions(project_id, project, src, old, headers):
     return operations
 
 
-def prepare_gl_permissions(project_id, project, src, old, headers):
+def prepare_gl_permissions(project_id, default_branch, src, old, headers):
     """Apply prevalidated, journaled permission edits after backup succeeds."""
-    operations = plan_gl_permissions(project_id, project, src, old, headers)
+    operations = plan_gl_permissions(project_id, default_branch, src, old, headers)
     for action, branch, payload in operations:
         if action == 'force':
             add_journal(project_id, action, branch)
@@ -864,71 +881,157 @@ def prepare_gl_permissions(project_id, project, src, old, headers):
 
 # Synchronization
 
+def describe_destination_plan(platform, destination, src, source_default, private, headers):
+    if destination is None:
+        print(f'  {platform}: would create a private project, then mirror {len(src)} refs')
+        if not private:
+            print(f'    {platform}: WOULD publish after Git and LFS verification')
+        return
+    old = remote_refs(destination.url)
+    add, change, delete = count_changes(src, old)
+    print(f'  {platform}: visibility={destination.visibility}, add={add}, rewrite/update={change}, delete={delete} refs')
+    if destination.default_branch != source_default:
+        print(f'    {platform}: WOULD verify {source_default}, then set it as default before deleting old branches')
+    target = desired_visibility(private)
+    if destination.visibility != target:
+        when = 'before Git sync' if private else 'after Git and LFS verification'
+        print(f'    {platform}: WOULD change visibility {destination.visibility} -> {target} ({when})')
+    if platform == 'gitlab' and src != old:
+        for action, branch, _ in plan_gl_permissions(destination.id, source_default, src, old, headers):
+            operation = 'temporarily allow force push' if action == 'force' else 'unprotect for deletion'
+            print(f'    GitLab WOULD {operation}: {branch}')
+
+
+def sync_destination(record, gh_headers, repo, platform, destination, headers, gl_user, src, source_lfs, full_lfs):
+    name, source_default = record['name'], record['default_branch']
+    url = destination.url
+    old = remote_refs(url)
+    refs_changed = src != old
+    if refs_changed and old:
+        backup_destination_refs(repo, platform, url, old)
+    if refs_changed or source_lfs:
+        ensure_remote(repo, platform, url)
+
+    def confirm_destination():
+        if read_destination(platform, name, headers, gl_user) != destination:
+            raise SyncError(f'{platform} destination state changed during sync')
+
+    def confirm_transfer():
+        # Check source last so a provider read or Git ref preflight cannot delay this check.
+        confirm_destination()
+        verify_github_snapshot(record, gh_headers)
+
+    def upload_lfs():
+        confirm_transfer()
+        git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
+            platform, *src, repo=repo, timeout=1800, before_retry=confirm_transfer)
+
+    def push_refs(desired, previous):
+        if desired == previous:
+            return
+        removes_branch = any(ref.startswith('refs/heads/') for ref in previous.keys() - desired.keys())
+
+        def before_push():
+            if removes_branch:
+                verify_remote_head(url, source_default)
+            confirm_transfer()
+
+        if platform != 'gitlab':
+            push_snapshot(repo, platform, desired, previous, url=url, before_push=before_push)
+            return
+        project_id = destination.id
+        try:
+            confirm_destination()
+            prepare_gl_permissions(project_id, destination.default_branch, desired, previous, headers)
+            push_snapshot(repo, platform, desired, previous, url=url, before_push=before_push)
+        finally:
+            restore_gl_permissions(project_id, headers)
+
+    if source_lfs and refs_changed:
+        upload_lfs()
+
+    if destination.default_branch != source_default or not any(ref.startswith('refs/heads/') for ref in old):
+        # Seed only the target branch. Retain every existing branch and tag until the switch is confirmed.
+        default_ref = f'refs/heads/{source_default}'
+        staged = {**old, default_ref: src[default_ref]}
+        push_refs(staged, old)
+        if remote_refs(url) != staged:
+            raise SyncError('Destination refs changed before the default branch switch')
+        current = read_destination(platform, name, headers, gl_user)
+        if current not in (destination, replace(destination, default_branch=source_default)):
+            raise SyncError('Destination state changed before the default branch switch')
+        destination = current
+        if destination.default_branch != source_default:
+            verify_github_snapshot(record, gh_headers)
+            destination = update_destination(platform, name, destination, headers, gl_user,
+                                             default_branch=source_default)
+        verify_remote_head(url, source_default)
+        old = staged
+
+    push_refs(src, old)
+    try:
+        verify_destination_lfs(repo, platform, src, source_lfs, full=full_lfs)
+    except SyncError:
+        if full_lfs or refs_changed or not source_lfs:
+            raise
+        # Equal refs can still reference missing LFS objects.
+        upload_lfs()
+        verify_destination_lfs(repo, platform, src, source_lfs)
+    if remote_refs(url) != src:
+        raise SyncError('Destination refs do not match the GitHub snapshot')
+
+    verify_remote_head(url, source_default)
+    confirm_transfer()
+    if destination.visibility != desired_visibility(record['private']):
+        # Private destinations are only published after all ref, default and LFS checks.
+        update_destination(platform, name, destination, headers, gl_user, visibility='public')
+    print(f'  {platform}: SYNCED (Git refs, default branch, Git LFS and visibility verified)')
+
+
 def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, platforms, *, full_lfs=False):
     name = record['name']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise SyncError(f'Unsupported repository name: {name}')
     source_url = record.get('ssh_url')
-    if not source_url:
-        raise SyncError('Missing GitHub SSH URL')
+    if not isinstance(source_url, str) or not source_url or type(record.get('id')) is not int:
+        raise SyncError('GitHub repository ID or SSH URL missing; refusing destination updates')
     if type(record.get('private')) is not bool:
         raise SyncError('GitHub privacy field missing or invalid; refusing destination updates')
     priv = record['private']
-    repo = ROOT / (name + '.git')
+    source_default = record.get('default_branch')
     gh = remote_refs(source_url)
-    heads = {k:v for k,v in gh.items() if k.startswith('refs/heads/')}
-    if not heads:
-        raise SyncError('No GitHub branch found: keeping existing backups/destinations unchanged')
-    print(f'  source: {len(heads)} branches, {len(gh)-len(heads)} tags; privacy={"private" if priv else "public"}')
+    default_ref = f'refs/heads/{source_default}'
+    if not isinstance(source_default, str) or not source_default or default_ref not in gh:
+        raise SyncError('GitHub default branch is unconfirmed in advertised refs; refusing destination updates')
+    verify_github_snapshot(record, gh_headers)
+    heads = sum(ref.startswith('refs/heads/') for ref in gh)
+    print(f'  source: {heads} branches, {len(gh) - heads} tags; privacy={desired_visibility(priv)}')
 
-    # Resolve API objects before changing any repository data.
+    headers = {'gitlab': gl_headers, 'codeberg': cb_headers}
     destinations = {}
-    blocked = 0
+    successes = failures = 0
     for platform in platforms:
         try:
-            if platform == 'gitlab':
-                url, vis = get_gitlab(name, priv, gl_headers, gl_user, apply)
-            else:
-                url, vis = get_codeberg(name, priv, cb_headers, apply)
-            target = desired_visibility(priv)
-            # Privacy reduction (public/internal -> private) MUST happen before
-            # any push or LFS transfer. Never allow private GitHub data into
-            # a publicly accessible destination.
-            if apply and url is not None and priv and vis != 'private':
-                print(f'  {platform}: securing visibility {vis} -> private before Git operations')
-                vis = set_destination_visibility(platform, name, True,
-                                                 gl_headers, cb_headers, gl_user)
-            destinations[platform] = (url, vis)
-        except SyncError as e:
-            print(f'  {platform}: BLOCKED: {e}')
-            blocked += 1
+            secrets = headers[platform]
+            destination = read_destination(platform, name, secrets, gl_user, create=apply)
+            if not apply:
+                describe_destination_plan(platform, destination, gh, source_default, priv, secrets)
+                successes += 1
+                continue
+            if priv and destination.visibility != 'private':
+                verify_github_snapshot(record, gh_headers)
+                destination = update_destination(platform, name, destination, secrets, gl_user, visibility='private')
+            destinations[platform] = destination
+        except SourceStateError:
+            raise
+        except SyncError as exc:
+            print(f'  {platform}: BLOCKED: {exc}')
+            failures += 1
+    if not apply or not destinations:
+        return successes, failures
 
-    planned = {}
-    for platform, (url, vis) in destinations.items():
-        if url is None:
-            print(f'  {platform}: would create project, then copy {len(gh)} refs')
-            continue
-        try:
-            old = remote_refs(url)
-            changes = count_changes(gh, old)
-            print(f'  {platform}: visibility={vis}, add={changes[0]}, rewrite/update={changes[1]}, delete={changes[2]} refs')
-            target = desired_visibility(priv)
-            if not apply and vis != target:
-                when = 'before Git sync' if priv else 'after Git ref verification'
-                print(f'    {platform}: WOULD change visibility {vis} -> {target} ({when})')
-            if not apply and platform == 'gitlab' and changes != (0,0,0):
-                project = gl_project_info(name, gl_headers, gl_user)
-                ops = plan_gl_permissions(project['id'], project, gh, old, gl_headers)
-                for action, branch, _ in ops:
-                    print(f'    GitLab WOULD {"temporarily allow force push" if action == "force" else "unprotect for deletion"}: {branch}')
-            planned[platform] = (url, old, changes)
-        except SyncError as e:
-            print(f'  {platform}: BLOCKED: cannot read Git refs: {e}')
-            blocked += 1
-
-    if not apply:
-        return len(planned) + sum(u is None for u, _ in destinations.values()), blocked
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    repo = ROOT / (name + '.git')
     if not repo.exists():
         git('init', '--bare', str(repo))
         os.chmod(repo, 0o700)
@@ -943,8 +1046,8 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     git('fetch', '--atomic', '--prune', '--no-tags', '--refmap=', 'origin',
         '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*', repo=repo, timeout=1200)
     src = local_refs(repo)
-    if not any(k.startswith('refs/heads/') for k in src):
-        raise SyncError('Fetched GitHub state has no branches; refusing all pushes')
+    if default_ref not in src:
+        raise SourceStateError('GitHub default branch is absent from the fetched snapshot; refusing all pushes')
 
     source_lfs = previous_lfs if src == previous else lfs_objects(repo, src)
     if src != previous:
@@ -952,66 +1055,15 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     if full_lfs:
         verify_archived_lfs(repo)
 
-    successes, failures = 0, blocked
-    for platform, (url, vis) in destinations.items():
+    for platform, destination in destinations.items():
         try:
-            if url is None:
-                # Newly created destination: retrieve its SSH URL from API again.
-                if platform == 'gitlab':
-                    url, _ = get_gitlab(name, priv, gl_headers, gl_user, False)
-                else:
-                    url, _ = get_codeberg(name, priv, cb_headers, False)
-                if not url:
-                    raise SyncError('New project URL not available from API')
-            old = remote_refs(url)
-            refs_changed = src != old
-            if refs_changed and old:
-                backup_destination_refs(repo, platform, url, old)
-            if refs_changed or source_lfs:
-                ensure_remote(repo, platform, url)
-            if source_lfs and refs_changed:
-                git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
-                    platform, *src, repo=repo, timeout=1800)
-            if refs_changed:
-                gl_project = None
-                gl_pid = None
-                if platform == 'gitlab':
-                    gl_project = gl_project_info(name, gl_headers, gl_user)
-                    gl_pid = gl_project['id']
-                try:
-                    if gl_pid is not None:
-                        prepare_gl_permissions(gl_pid, gl_project, src, old, gl_headers)
-                    push_snapshot(repo, platform, src, old, url=url)
-                finally:
-                    # The recovery journal also handles SIGKILL or machine power loss.
-                    if gl_pid is not None:
-                        restore_gl_permissions(gl_pid, gl_headers)
-            try:
-                verify_destination_lfs(repo, platform, src, source_lfs, full=full_lfs)
-            except SyncError:
-                if full_lfs or refs_changed or not source_lfs:
-                    raise
-                # The destination may be missing LFS objects despite already having the refs.
-                git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
-                    platform, *src, repo=repo, timeout=1800)
-                verify_destination_lfs(repo, platform, src, source_lfs)
-            if (refs_changed or source_lfs) and remote_refs(url) != src:
-                raise SyncError('Destination refs do not match the GitHub snapshot')
-            # Make a formerly private destination public ONLY after its Git
-            # refs match the public GitHub snapshot. This avoids publishing
-            # an old/unrelated destination state on a failed Git push.
-            target = desired_visibility(priv)
-            if vis != target:
-                if priv:
-                    raise SyncError('Private GitHub repository still has non-private destination')
-                print(f'  {platform}: Git refs verified; updating visibility {vis} -> public')
-                verify_github_public_now(name, gh_headers)
-                set_destination_visibility(platform, name, False,
-                                           gl_headers, cb_headers, gl_user)
-            print(f'  {platform}: SYNCED (Git refs, Git LFS and visibility verified)')
+            sync_destination(record, gh_headers, repo, platform, destination, headers[platform], gl_user,
+                             src, source_lfs, full_lfs)
             successes += 1
-        except SyncError as e:
-            print(f'  {platform}: FAILED without deleting project: {e}')
+        except SourceStateError:
+            raise
+        except SyncError as exc:
+            print(f'  {platform}: FAILED without deleting project: {exc}')
             failures += 1
     return successes, failures
 
@@ -1168,10 +1220,9 @@ def doctor_network(settings, platforms, ssh, only, report):
         try:
             if name == 'github':
                 url = record.get('ssh_url')
-            elif name == 'gitlab':
-                url, _ = get_gitlab(record['name'], record['private'], headers, login, False)
             else:
-                url, _ = get_codeberg(record['name'], record['private'], headers, False)
+                destination = read_destination(name, record['name'], headers, login)
+                url = destination.url if destination else None
             if not url and name != 'github':
                 report('WARNING', f'{name} SSH', 'matching destination is absent; read access was not checked')
                 continue

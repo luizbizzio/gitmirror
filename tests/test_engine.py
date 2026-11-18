@@ -40,9 +40,30 @@ def test_protection_journal_recovers_after_interrupted_patch(tmp_path, monkeypat
 
     monkeypatch.setattr(gitmirror, 'api', mock_api)
     with pytest.raises(KeyboardInterrupt):
-        gitmirror.prepare_gl_permissions(3, {'default_branch': 'main'},
+        gitmirror.prepare_gl_permissions(3, 'main',
                                         {'refs/heads/main': 'new'}, {'refs/heads/main': 'old'}, {})
     assert rule['allow_force_push'] and gitmirror.load_journal(3)
     interrupted = False
     gitmirror.recover_all_gl_permissions({})
     assert not rule['allow_force_push'] and not gitmirror.load_journal(3)
+
+
+def test_lfs_retry_rechecks_source_before_starting_another_upload(monkeypatch):
+    import subprocess
+
+    import gitmirror
+
+    attempts = []
+
+    def interrupted(args, **kwargs):
+        attempts.append(args)
+        return subprocess.CompletedProcess(args, 1, b'', b'connection reset')
+
+    def source_changed():
+        raise gitmirror.SourceStateError('GitHub visibility changed')
+
+    monkeypatch.setattr(gitmirror, 'RETRY_DELAYS', (0,))
+    monkeypatch.setattr(gitmirror.subprocess, 'run', interrupted)
+    with pytest.raises(gitmirror.SourceStateError, match='visibility changed'):
+        gitmirror.git('lfs', 'push', '--all', 'gitlab', before_retry=source_changed)
+    assert len(attempts) == 1

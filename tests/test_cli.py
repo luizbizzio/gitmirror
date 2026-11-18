@@ -82,7 +82,8 @@ def test_doctor_opt_in_uses_only_api_get_and_ssh_read(doctor_config, capsys, mon
             return 200, [{'name': 'demo', 'private': False, 'owner': {'login': 'demo'},
                           'ssh_url': 'git@github.example.invalid:demo/demo.git'}]
         if url.endswith('/projects/demo%2Fdemo'):
-            return 200, {'ssh_url_to_repo': 'git@gitlab.example.invalid:demo/demo.git', 'visibility': 'public'}
+            return 200, {'id': 123, 'ssh_url_to_repo': 'git@gitlab.example.invalid:demo/demo.git',
+                         'visibility': 'public', 'default_branch': 'main'}
         pytest.fail(f'Unexpected API request {url}')
 
     def mock_git(*args, **kwargs):

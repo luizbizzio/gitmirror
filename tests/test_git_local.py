@@ -60,26 +60,35 @@ def mirror(tmp_path, monkeypatch):
     }), encoding='utf-8')
     monkeypatch.setenv('TEST_GITHUB_TOKEN', 'test-source')
     monkeypatch.setenv('TEST_GITLAB_TOKEN', 'test-destination')
+    monkeypatch.setenv('TEST_CODEBERG_TOKEN', 'test-codeberg')
     reads = []
+    source_record = {'id': 45, 'name': 'demo', 'owner': {'login': 'source'}, 'private': False,
+                     'default_branch': 'main', 'ssh_url': source.as_uri()}
 
     def mock_api(url, headers, method='GET', payload=None):
         assert method == 'GET'
         reads.append(url)
         if url.startswith('https://api.github.com/user/repos?'):
-            return 200, [{'name': 'demo', 'owner': {'login': 'source'},
-                          'private': False, 'ssh_url': source.as_uri()}]
+            return 200, [dict(source_record)]
+        if url == 'https://api.github.com/repos/source/demo':
+            assert headers['Cache-Control'] == 'no-cache'
+            return 200, dict(source_record)
         if url == 'https://gitlab.com/api/v4/user':
             return 200, {'username': 'mirror'}
+        if url == 'https://codeberg.org/api/v1/user':
+            return 200, {'login': 'mirror'}
         if url == 'https://gitlab.com/api/v4/projects/mirror%2Fdemo':
             return 200, {'id': 123, 'ssh_url_to_repo': dest.as_uri(),
                          'visibility': 'public', 'default_branch': 'main'}
         if url.startswith('https://gitlab.com/api/v4/projects/123/protected_'):
             return 200, []
+        if url == 'https://codeberg.org/api/v1/repos/mirror/demo':
+            return 200, {'id': 124, 'ssh_url': dest.as_uri(), 'private': False, 'default_branch': 'main'}
         pytest.fail(f'Unexpected provider request {url}')
 
     monkeypatch.setattr(gitmirror, 'api', mock_api)
     return SimpleNamespace(work=work, source=source, dest=dest, store=store,
-                           repo=store / 'demo.git', reads=reads,
+                           repo=store / 'demo.git', reads=reads, source_record=source_record,
                            args=['--config', str(config)])
 
 
@@ -432,7 +441,7 @@ def test_existing_private_destination_is_published_after_ref_verification(mirror
         if url == 'https://api.github.com/repos/source/demo':
             assert method == 'GET'
             rechecked_source = True
-            return 200, {'private': False, 'owner': {'login': 'source'}}
+            return original_api(url, headers, method, payload)
         if url.endswith('/projects/mirror%2Fdemo'):
             status, project = original_api(url, headers)
             return status, {**project, 'visibility': visibility}
@@ -449,3 +458,297 @@ def test_existing_private_destination_is_published_after_ref_verification(mirror
     cmd('push', 'source', '--tags', cwd=mirror.work)
     assert main([*mirror.args, 'sync', '--platform', 'gitlab', '--apply']) == 0
     assert visibility == 'public'
+
+
+@pytest.mark.parametrize('stage', ['git', 'lfs-upload', 'lfs-repair', 'publish'])
+def test_visibility_change_blocks_outgoing_data_or_publication(mirror, monkeypatch, capsys, stage):
+    original_api = gitmirror.api
+    original_git = gitmirror.git
+    verify_lfs = gitmirror.verify_destination_lfs
+    flipped = False
+    destination_reads = 0
+
+    if stage.startswith('lfs'):
+        _, location = add_lfs_file(mirror.work)
+        cmd('lfs', 'push', '--all', 'source', 'main', cwd=mirror.work)
+        cmd('push', '--no-verify', 'source', 'main', cwd=mirror.work)
+        if stage == 'lfs-repair':
+            cmd('push', '--no-verify', 'dest', 'main', cwd=mirror.work)
+    else:
+        cmd('tag', 'v1', cwd=mirror.work)
+        cmd('push', 'source', '--tags', cwd=mirror.work)
+
+    def mock_api(url, headers, method='GET', payload=None):
+        assert method == 'GET', 'A stale public snapshot must never publish the destination'
+        status, body = original_api(url, headers)
+        if url.endswith('/repos/source/demo') and flipped:
+            return status, {**body, 'private': True}
+        if stage == 'publish' and url.endswith('/projects/mirror%2Fdemo'):
+            return status, {**body, 'visibility': 'private'}
+        return status, body
+
+    def git_with_late_flip(*args, **kwargs):
+        nonlocal flipped, destination_reads
+        if args[0] == 'push':
+            assert stage == 'publish' and not flipped
+        if 'lfs' in args and args[args.index('lfs') + 1] == 'push':
+            pytest.fail('LFS must never upload after source visibility changed')
+        result = original_git(*args, **kwargs)
+        if (stage == 'git' and mirror.repo.exists()
+                and args[:3] == ('ls-remote', '--heads', '--tags') and args[-1] == mirror.dest.as_uri()):
+            destination_reads += 1
+            # Flip during push_snapshot's read, after backup and protection planning.
+            flipped |= destination_reads == 2
+        if stage == 'lfs-upload' and args[:4] == ('lfs', 'fetch', '--all', 'origin'):
+            flipped = True
+        return result
+
+    def lfs_with_late_flip(*args, **kwargs):
+        nonlocal flipped
+        try:
+            return verify_lfs(*args, **kwargs)
+        finally:
+            if stage in ('publish', 'lfs-repair'):
+                flipped = True
+
+    monkeypatch.setattr(gitmirror, 'api', mock_api)
+    monkeypatch.setattr(gitmirror, 'git', git_with_late_flip)
+    monkeypatch.setattr(gitmirror, 'verify_destination_lfs', lfs_with_late_flip)
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+    assert main([*mirror.args, 'sync', '--platform', 'gitlab', '--apply']) == 1
+    assert flipped
+    output = capsys.readouterr().out
+    assert 'GitHub visibility changed' in output
+    assert 'SYNCED (' not in output
+    remote = gitmirror.remote_refs(mirror.dest.as_uri())
+    assert remote == (gitmirror.remote_refs(mirror.source.as_uri()) if stage == 'publish' else previous)
+    if stage.startswith('lfs'):
+        assert not mirror.dest.joinpath(*location).exists()
+
+
+@pytest.mark.parametrize('failure, message', [
+    ('replaced', 'identity changed'), ('unavailable', 'state for demo is unavailable'),
+    ('new-default', 'default branch changed'), ('non-public', 'visibility changed'),
+])
+def test_source_metadata_change_stops_all_destinations(mirror, monkeypatch, capsys, failure, message):
+    original_api = gitmirror.api
+    original_git = gitmirror.git
+    seen = 0
+    cmd('tag', 'new', cwd=mirror.work)
+    cmd('push', 'source', '--tags', cwd=mirror.work)
+
+    def mock_api(url, headers, method='GET', payload=None):
+        nonlocal seen
+        status, body = original_api(url, headers, method, payload)
+        if url.endswith('/repos/source/demo'):
+            seen += 1
+            # A later healthy reply must never resume work from the inconsistent snapshot.
+            if seen == 2:
+                if failure == 'unavailable':
+                    return 404, None
+                if failure == 'new-default':
+                    return status, {**body, 'default_branch': 'trunk'}
+                if failure == 'non-public':
+                    return status, {**body, 'visibility': 'internal'}
+                return status, {**body, 'id': body['id'] + 1}
+        return status, body
+
+    def git_without_push(*args, **kwargs):
+        assert args[0] != 'push'
+        return original_git(*args, **kwargs)
+
+    monkeypatch.setattr(gitmirror, 'api', mock_api)
+    monkeypatch.setattr(gitmirror, 'git', git_without_push)
+    assert main([*mirror.args, 'sync', '--apply']) == 1
+    assert seen == 2
+    assert message in capsys.readouterr().out
+
+
+@pytest.fixture
+def default_change(mirror, monkeypatch):
+    """Model default branch metadata and the Git server's actual HEAD independently."""
+    original_api = gitmirror.api
+    state = SimpleNamespace(default='main', fail=None, switches=0, visibility='public',
+                            missing=False, created=False)
+    cmd('branch', '-m', 'trunk', cwd=mirror.work)
+    cmd('push', 'source', 'trunk', cwd=mirror.work)
+    cmd('symbolic-ref', 'HEAD', 'refs/heads/trunk', cwd=mirror.source)
+    cmd('push', 'source', ':refs/heads/main', cwd=mirror.work)
+    mirror.source_record['default_branch'] = 'trunk'
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+
+    hook = mirror.dest / 'hooks' / 'update'
+    hook.write_text('#!/bin/sh\n'
+                    'case "$3" in\n'
+                    '    *[!0]*) ;;\n'
+                    '    *) if test "$1" = "$(git symbolic-ref HEAD)"; then exit 1; fi ;;\n'
+                    'esac\n'
+                    'if test -f block-main-deletion && test "$1" = refs/heads/main; then exit 1; fi\n',
+                    encoding='utf-8', newline='\n')
+    hook.chmod(0o755)
+
+    def mock_api(url, headers, method='GET', payload=None):
+        gitlab = 'gitlab.com' in url
+        if method == 'POST':
+            assert url in ('https://gitlab.com/api/v4/projects', 'https://codeberg.org/api/v1/user/repos')
+            assert state.missing
+            if gitlab:
+                assert payload['visibility'] == 'private'
+            else:
+                assert payload['private'] is True
+            state.visibility, state.missing, state.default = 'private', False, None
+            state.created = True
+            status = 201
+        elif method in ('PUT', 'PATCH'):
+            assert (method, url) in (('PUT', 'https://gitlab.com/api/v4/projects/123'),
+                                     ('PATCH', 'https://codeberg.org/api/v1/repos/mirror/demo'))
+            if 'default_branch' in payload:
+                assert payload == {'default_branch': 'trunk'}
+                refs = gitmirror.remote_refs(mirror.dest.as_uri())
+                assert refs['refs/heads/trunk'] == gitmirror.remote_refs(mirror.source.as_uri())['refs/heads/trunk']
+                if not state.created:
+                    assert refs['refs/heads/main'] == previous['refs/heads/main']
+                state.switches += 1
+                if state.fail == 'reject-switch':
+                    return 403, None
+                state.default = 'trunk'
+                if state.fail != 'stale-head':
+                    cmd('symbolic-ref', 'HEAD', 'refs/heads/trunk', cwd=mirror.dest)
+                if state.fail == 'lost-response':
+                    raise gitmirror.SyncError('connection closed after commit')
+            else:
+                assert payload == ({'visibility': 'public'} if gitlab else {'private': False})
+                assert state.default == 'trunk'
+                assert gitmirror.remote_refs(mirror.dest.as_uri()) == gitmirror.remote_refs(mirror.source.as_uri())
+                state.visibility = 'public'
+            return 200, {}
+        elif url.endswith(('/projects/mirror%2Fdemo', '/repos/mirror/demo')):
+            if state.missing:
+                return 404, None
+            status = 200
+        else:
+            return original_api(url, headers, method, payload)
+        body = {'default_branch': state.default}
+        if gitlab:
+            body.update(id=123, ssh_url_to_repo=mirror.dest.as_uri(), visibility=state.visibility)
+        else:
+            body.update(id=124, ssh_url=mirror.dest.as_uri(), private=state.visibility == 'private')
+        return status, body
+
+    monkeypatch.setattr(gitmirror, 'api', mock_api)
+    return state, previous
+
+
+@pytest.mark.parametrize('platform', ['gitlab', 'codeberg'])
+@pytest.mark.parametrize('failure', ['reject-switch', 'stale-head', 'reject-deletion', 'lost-response', None])
+def test_default_change_orders_ref_updates_and_recovers(mirror, default_change, platform, failure, capsys):
+    state, previous = default_change
+    state.fail = failure
+    reject_deletion = mirror.dest / 'block-main-deletion'
+    if failure == 'reject-deletion':
+        reject_deletion.touch()
+    args = [*mirror.args, 'sync', '--platform', platform, '--apply']
+    must_retry = failure in ('reject-switch', 'stale-head', 'reject-deletion')
+    assert main(args) == (1 if must_retry else 0)
+    archive = f'refs/archive/{gitmirror.RUN_ID}/{platform}'
+    assert gitmirror.local_refs(mirror.repo, archive) == previous
+    assert state.switches == 1
+    if must_retry:
+        refs = gitmirror.remote_refs(mirror.dest.as_uri())
+        assert refs['refs/heads/main'] == previous['refs/heads/main']
+        assert 'refs/heads/trunk' in refs
+        assert 'SYNCED (' not in capsys.readouterr().out
+        if failure == 'stale-head':
+            cmd('symbolic-ref', 'HEAD', 'refs/heads/trunk', cwd=mirror.dest)
+        reject_deletion.unlink(missing_ok=True)
+        state.fail = None
+        assert main(args) == 0
+        assert state.switches == (2 if failure == 'reject-switch' else 1)
+    assert state.default == 'trunk'
+    assert cmd('symbolic-ref', 'HEAD', cwd=mirror.dest) == 'refs/heads/trunk'
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == gitmirror.remote_refs(mirror.source.as_uri())
+    assert gitmirror.local_refs(mirror.repo, archive) == previous
+
+
+@pytest.mark.parametrize('platform', ['gitlab', 'codeberg'])
+def test_default_change_retains_old_branch_if_still_on_source(mirror, default_change, platform):
+    _, previous = default_change
+    cmd('update-ref', 'refs/heads/main', previous['refs/heads/main'], cwd=mirror.source)
+    assert main([*mirror.args, 'sync', '--platform', platform, '--apply']) == 0
+    assert 'refs/heads/main' in gitmirror.remote_refs(mirror.dest.as_uri())
+    assert cmd('symbolic-ref', 'HEAD', cwd=mirror.dest) == 'refs/heads/trunk'
+
+
+@pytest.mark.parametrize('platform', ['gitlab', 'codeberg'])
+@pytest.mark.parametrize('stale_head', [False, True])
+def test_new_destination_is_private_until_default_and_refs_are_verified(mirror, default_change, platform, stale_head):
+    state, _ = default_change
+    cmd('update-ref', '-d', 'refs/heads/main', cwd=mirror.dest)
+    state.missing = True
+    args = [*mirror.args, 'sync', '--platform', platform, '--apply']
+    if stale_head:
+        state.fail = 'stale-head'
+        assert main(args) == 1
+        assert state.default == 'trunk' and state.visibility == 'private'
+        # Identical refs and a matching API default still require a valid Git HEAD.
+        assert main(args) == 1
+        assert state.switches == 1 and state.visibility == 'private'
+        cmd('symbolic-ref', 'HEAD', 'refs/heads/trunk', cwd=mirror.dest)
+    assert main(args) == 0
+    assert state.created and state.default == 'trunk' and state.visibility == 'public'
+
+
+def test_default_change_dry_run_never_updates_branches(mirror, default_change, capsys):
+    state, previous = default_change
+    assert main([*mirror.args, 'sync', '--dry-run']) == 0
+    assert 'WOULD verify trunk, then set it as default' in capsys.readouterr().out
+    assert not state.switches
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
+    assert not mirror.store.exists()
+
+
+def test_gitlab_restores_protection_if_former_default_cannot_be_deleted(mirror, default_change, monkeypatch):
+    state, _ = default_change
+    original_api = gitmirror.api
+    rule = {'name': 'main', 'allow_force_push': False,
+            'push_access_levels': [{'access_level': 40}],
+            'merge_access_levels': [{'access_level': 40}],
+            'unprotect_access_levels': [{'access_level': 40}]}
+    protected = True
+    events = []
+
+    def mock_api(url, headers, method='GET', payload=None):
+        nonlocal protected
+        if '/protected_branches?' in url:
+            return 200, [rule] if protected else []
+        if url.endswith('/protected_branches/main'):
+            if method == 'DELETE':
+                assert state.default == 'trunk'
+                assert cmd('symbolic-ref', 'HEAD', cwd=mirror.dest) == 'refs/heads/trunk'
+                assert protected
+                events.append('unprotect')
+                protected = False
+                return 204, None
+            assert method == 'GET'
+            return (200, rule) if protected else (404, None)
+        if url.endswith('/protected_branches'):
+            assert method == 'POST' and payload == gitmirror.rule_backup_payload(rule)
+            protected = True
+            events.append('restore')
+            return 201, rule
+        if url.endswith('/repository/branches/main'):
+            assert method == 'GET'
+            exists = 'refs/heads/main' in gitmirror.remote_refs(mirror.dest.as_uri())
+            return (200, {'name': 'main'}) if exists else (404, None)
+        return original_api(url, headers, method, payload)
+
+    monkeypatch.setattr(gitmirror, 'api', mock_api)
+    blocked = mirror.dest / 'block-main-deletion'
+    blocked.touch()
+    args = [*mirror.args, 'sync', '--platform', 'gitlab', '--apply']
+    assert main(args) == 1
+    assert protected and events == ['unprotect', 'restore'] and not gitmirror.load_journal(123)
+    blocked.unlink()
+    assert main(args) == 0
+    assert not protected and events == ['unprotect', 'restore', 'unprotect']
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == gitmirror.remote_refs(mirror.source.as_uri())
