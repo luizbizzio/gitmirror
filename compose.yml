@@ -9,7 +9,7 @@ services:
       # Mount SSH files prepared for the container account.
       # Include verified known_hosts. Never use StrictHostKeyChecking=no.
       - ./docker/ssh:/home/gitmirror/.ssh:ro
-    command: ["--config", "/config/config.yml", "run", "--apply"]
+    command: ["--config", "/config/config.yml", "run"]
 
 volumes:
   gitmirror-data:

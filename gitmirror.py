@@ -111,6 +111,7 @@ SSH_ENV = dict(os.environ)
 SSH_ENV.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=20')
 JOURNAL_DIR = ROOT / 'gitlab-protection-journal'
 RETRY_DELAYS = (3, 8, 20)
+LFS_VERIFICATION_MAX_AGE = 7 * 24 * 60 * 60
 TRANSIENT_GIT_ERRORS = (
     'connection closed', 'connection timed out', 'connection reset',
     'connection refused', 'connection aborted', 'broken pipe',
@@ -205,18 +206,19 @@ def api(url, headers, method='GET', payload=None):
             raise SyncError(f'API invalid JSON: {url}: {e}') from e
 
 
-def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None):
+def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, retry=True):
     """Retry Git commands only when the failure looks like a transport issue."""
     # Git's stdin protocols require LF even on Windows.
     input_bytes = None if input_text is None else input_text.encode('utf-8', 'surrogateescape')
-    for attempt in range(len(RETRY_DELAYS) + 1):
+    attempts = len(RETRY_DELAYS) + 1 if retry else 1
+    for attempt in range(attempts):
         try:
             p = subprocess.run(args, capture_output=True, cwd=cwd, input=input_bytes,
                                env=SSH_ENV if env is None else env, timeout=timeout)
             p.stdout = p.stdout.decode('utf-8', 'surrogateescape').replace('\r\n', '\n')
             p.stderr = p.stderr.decode('utf-8', 'surrogateescape').replace('\r\n', '\n')
         except subprocess.TimeoutExpired as e:
-            if args[0] == 'git' and attempt < len(RETRY_DELAYS):
+            if args[0] == 'git' and attempt + 1 < attempts:
                 retry_notice('Git', attempt + 1, RETRY_DELAYS[attempt], 'command timeout')
                 continue
             raise SyncError(f'Command timed out: {args[0]} ({e})') from e
@@ -225,7 +227,7 @@ def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None):
         if check and p.returncode:
             err = (p.stderr or p.stdout or '').strip()[-1400:]
             transient = args[0] == 'git' and any(x in err.lower() for x in TRANSIENT_GIT_ERRORS)
-            if transient and attempt < len(RETRY_DELAYS):
+            if transient and attempt + 1 < attempts:
                 retry_notice('Git', attempt + 1, RETRY_DELAYS[attempt],
                              err.splitlines()[0][:120] if err else 'SSH network failure')
                 continue
@@ -233,12 +235,12 @@ def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None):
         return p
 
 
-def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None):
+def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None, retry=True):
     a = ['git']
     if repo is not None:
         a += ['-C', str(repo)]
     a += list(args)
-    return cmd(a, check=check, timeout=timeout, input_text=input_text, env=env)
+    return cmd(a, check=check, timeout=timeout, input_text=input_text, env=env, retry=retry)
 
 
 # Git references and LFS backups
@@ -333,26 +335,90 @@ def fetch_backup_lfs(repo, remote, refs, objects):
     if not objects:
         return
     git('lfs', 'fetch', '--all', remote, *refs, repo=repo, timeout=1800)
+    verify_lfs_objects(lfs_media_dir(repo), objects)
+
+
+def lfs_media_dir(repo):
     for line in git('lfs', 'env', repo=repo).stdout.splitlines():
         if line.startswith('LocalMediaDir='):
-            verify_lfs_objects(Path(line.removeprefix('LocalMediaDir=')), objects)
-            return
+            return Path(line.removeprefix('LocalMediaDir='))
     raise SyncError('Git LFS did not report its local object directory')
 
 
-def verify_destination_lfs(repo, remote, refs, objects):
+def verify_archived_lfs(repo):
+    out = git('for-each-ref', '--format=%(refname)%09%(objectname)', 'refs/archive/', repo=repo)
+    refs = dict(line.split('\t', 1) for line in out.stdout.split('\n') if line)
+    objects = lfs_objects(repo, refs)
+    if objects:
+        verify_lfs_objects(lfs_media_dir(repo), objects)
+
+
+def verify_destination_lfs(repo, remote, refs, objects, *, full=False):
     if not objects:
         return
-    # An existing object in the backup cache cannot prove it can be downloaded from this destination.
+    # Scope evidence to this destination and its LFS endpoint/configuration.
+    config = git('config', '--get-regexp', rf'^(lfs\.|remote\.{re.escape(remote)}\.|url\.)',
+                 repo=repo, check=False)
+    if config.returncode not in (0, 1):
+        raise SyncError('Cannot inspect Git LFS configuration')
+    tracked = git('rev-parse', '--verify', 'HEAD:.lfsconfig', repo=repo, check=False)
+    identity = hashlib.sha256(f'{remote}\n{config.stdout}\n{tracked.stdout}'.encode(
+        'utf-8', 'surrogateescape')).hexdigest()
+    path = repo / f'gitmirror-lfs-{remote}.json'
+    try:
+        record = json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError, OSError):
+        record = {}
+    history = record.get('objects') if isinstance(record, dict) and record.get('identity') == identity else None
+    if not isinstance(history, dict):
+        history = {}
+    now = time.time()
+    fresh = {}
+    if not full:
+        for oid, size in objects.items():
+            entry = history.get(oid)
+            if (isinstance(entry, list) and len(entry) == 2 and entry[0] == size
+                    and type(entry[1]) in (int, float)
+                    and now - LFS_VERIFICATION_MAX_AGE < entry[1] <= now):
+                fresh[oid] = entry
+    pending = {oid: size for oid, size in objects.items() if oid not in fresh}
+    if not pending:
+        print(f'    Git LFS: reused recent read-back evidence for {len(fresh)} objects')
+        return
+    # Invalidate the pending evidence before the network call, including on interruption.
+    try:
+        store_json(path, {'identity': identity, 'objects': fresh})
+    except OSError as exc:
+        raise SyncError('Cannot update the Git LFS verification record') from exc
+    media_dir = lfs_media_dir(repo) if fresh else None
     with lfs_snapshot(repo, refs) as (snapshot, env):
         storage = snapshot / 'lfs'
         # Retain named remotes and their auth settings. Set storage locally so it
         # cannot leak to the other side of Git LFS's standalone file transport.
         git('config', '--local', '--add', 'include.path', str(repo.resolve() / 'config'), repo=snapshot)
         git('config', '--local', '--add', 'lfs.storage', str(storage), repo=snapshot)
+        head = git('symbolic-ref', '--quiet', 'HEAD', repo=repo, check=False)
+        if head.returncode == 0:
+            git('symbolic-ref', 'HEAD', head.stdout.strip(), repo=snapshot, env=env)
+        # Seed only recently verified bytes. Git LFS skips these and retrieves the rest.
+        for oid in fresh:
+            relative = Path(oid[:2], oid[2:4], oid)
+            target = storage / 'objects' / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(media_dir / relative, target)
+            except OSError:
+                shutil.copyfile(media_dir / relative, target)
         git('-c', 'lfs.remote.searchall=false', '-c', 'lfs.remote.autodetect=false',
             'lfs', 'fetch', '--all', remote, *refs, repo=snapshot, env=env, timeout=1800)
-        verify_lfs_objects(storage / 'objects', objects)
+        verify_lfs_objects(storage / 'objects', pending)
+    checked_at = time.time()
+    fresh.update({oid: [size, checked_at] for oid, size in pending.items()})
+    try:
+        store_json(path, {'identity': identity, 'objects': fresh})
+    except OSError as exc:
+        raise SyncError('Cannot save the Git LFS verification record') from exc
+    print(f'    Git LFS: read back {len(pending)} objects; reused evidence for {len(objects) - len(pending)}')
 
 
 def archive_source_old_tips(repo, previous):
@@ -368,29 +434,66 @@ def backup_destination_refs(repo, platform, url, refs):
     if not refs:
         return
     prefix = f'refs/archive/{RUN_ID}/{platform}'
+    staging = f'refs/gitmirror-staging/{RUN_ID}/{platform}'
     git('fetch', '--atomic', '--no-tags', '--no-prune', '--refmap=', url,
-        f'+refs/heads/*:{prefix}/heads/*',
-        f'+refs/tags/*:{prefix}/tags/*', repo=repo, timeout=1200)
-    saved = local_refs(repo, prefix)
+        f'+refs/heads/*:{staging}/heads/*',
+        f'+refs/tags/*:{staging}/tags/*', repo=repo, timeout=1200)
+    saved = local_refs(repo, staging)
     if saved != refs:
         missing, changed, unexpected = count_changes(refs, saved)
         raise SyncError(f'Destination backup ref mismatch ({platform}): '
                         f'{missing} missing, {changed} changed, {unexpected} unexpected')
-    archived = [f'{prefix}/{ref.removeprefix("refs/")}' for ref in saved]
+    staged = [f'{staging}/{ref.removeprefix("refs/")}' for ref in saved]
     objects = lfs_objects(repo, saved)
     if objects:
         ensure_remote(repo, platform, url)
-        fetch_backup_lfs(repo, platform, archived, objects)
+        fetch_backup_lfs(repo, platform, staged, objects)
+    # Publish only a complete snapshot and verify the staging values in the same transaction.
+    updates = []
+    for ref, oid in saved.items():
+        suffix = ref.removeprefix('refs/')
+        updates.extend((f'create {prefix}/{suffix} {oid}', f'delete {staging}/{suffix} {oid}'))
+    git('update-ref', '--stdin', repo=repo, input_text='\n'.join(updates) + '\n')
     print(f'    Backup verified {len(saved)} destination refs and {len(objects)} LFS objects under {prefix}')
 
 
-def push_snapshot(repo, remote, source, previous):
+def push_snapshot(repo, remote, source, previous, *, url=None):
     """Only change refs covered by the verified destination snapshot."""
     changed = sorted(ref for ref in source.keys() | previous.keys()
                      if source.get(ref) != previous.get(ref))
+    if not changed:
+        return
+    push_url = git('remote', 'get-url', '--push', remote, repo=repo).stdout.strip()
+    fetch_url = git('remote', 'get-url', remote, repo=repo).stdout.strip()
+    if push_url != fetch_url:
+        raise SyncError('Push URL differs from the destination used for backup')
+    url = fetch_url if url is None else url
+    if remote_refs(url) != previous:
+        raise SyncError('Destination changed since the verified backup (stale info)')
     leases = [f'--force-with-lease={ref}:{previous.get(ref, "")}' for ref in changed]
     refspecs = [f'{source.get(ref, "")}:{ref}' for ref in changed]
-    git('push', '--no-follow-tags', *leases, '--', remote, *refspecs, repo=repo, timeout=1800)
+    arguments = ('--no-follow-tags', *leases, '--', remote, *refspecs)
+    env = {**SSH_ENV, 'LC_ALL': 'C', 'LANGUAGE': 'C'}
+    try:
+        result = git('push', '--atomic', *arguments, repo=repo, env=env,
+                     check=False, retry=False, timeout=1800)
+        if result.returncode and 'the receiving end does not support --atomic push' in result.stderr:
+            if len(changed) > 1:
+                raise SyncError('Destination lacks atomic push support; multiple refs were left untouched')
+            if remote_refs(url) != previous:
+                raise SyncError('Destination changed before the single-ref push')
+            result = git('push', '--no-atomic', *arguments, repo=repo, env=env,
+                         check=False, retry=False, timeout=1800)
+    except SyncError as exc:
+        if remote_refs(url) != previous:
+            raise SyncError(f'Push failed and destination refs changed; inspect the verified backup ({exc})') from exc
+        raise
+    actual = remote_refs(url)
+    if result.returncode:
+        state = 'destination refs changed; inspect the verified backup' if actual != previous else 'destination refs unchanged'
+        raise SyncError(f'Push failed ({state}): {(result.stderr or result.stdout).strip()[-900:]}')
+    if actual != source:
+        raise SyncError('Push did not produce the complete snapshot; inspect the verified backup')
 
 
 # Provider APIs
@@ -627,21 +730,27 @@ def load_journal(project_id):
     return entries
 
 
-def store_journal(project_id, entries):
-    JOURNAL_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = journal_path(project_id)
+def store_json(path, value):
     temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-    with open(temp, 'w', encoding='utf-8') as file:
-        json.dump(entries, file, indent=2, sort_keys=True)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temp, path)
+    try:
+        with open(temp, 'w', encoding='utf-8') as file:
+            json.dump(value, file, indent=2, sort_keys=True)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
     if os.name != 'nt':
-        directory_fd = os.open(str(JOURNAL_DIR), os.O_RDONLY)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+
+
+def store_journal(project_id, entries):
+    JOURNAL_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    store_json(journal_path(project_id), entries)
 
 
 def add_journal(project_id, action, name, **kwargs):
@@ -755,7 +864,7 @@ def prepare_gl_permissions(project_id, project, src, old, headers):
 
 # Synchronization
 
-def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, platforms):
+def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, platforms, *, full_lfs=False):
     name = record['name']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise SyncError(f'Unsupported repository name: {name}')
@@ -840,6 +949,8 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     source_lfs = previous_lfs if src == previous else lfs_objects(repo, src)
     if src != previous:
         fetch_backup_lfs(repo, 'origin', src, source_lfs)
+    if full_lfs:
+        verify_archived_lfs(repo)
 
     successes, failures = 0, blocked
     for platform, (url, vis) in destinations.items():
@@ -858,7 +969,7 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
                 backup_destination_refs(repo, platform, url, old)
             if refs_changed or source_lfs:
                 ensure_remote(repo, platform, url)
-            if source_lfs:
+            if source_lfs and refs_changed:
                 git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
                     platform, *src, repo=repo, timeout=1800)
             if refs_changed:
@@ -870,12 +981,20 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
                 try:
                     if gl_pid is not None:
                         prepare_gl_permissions(gl_pid, gl_project, src, old, gl_headers)
-                    push_snapshot(repo, platform, src, old)
+                    push_snapshot(repo, platform, src, old, url=url)
                 finally:
                     # The recovery journal also handles SIGKILL or machine power loss.
                     if gl_pid is not None:
                         restore_gl_permissions(gl_pid, gl_headers)
-            verify_destination_lfs(repo, platform, src, source_lfs)
+            try:
+                verify_destination_lfs(repo, platform, src, source_lfs, full=full_lfs)
+            except SyncError:
+                if full_lfs or refs_changed or not source_lfs:
+                    raise
+                # The destination may be missing LFS objects despite already having the refs.
+                git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
+                    platform, *src, repo=repo, timeout=1800)
+                verify_destination_lfs(repo, platform, src, source_lfs)
             if (refs_changed or source_lfs) and remote_refs(url) != src:
                 raise SyncError('Destination refs do not match the GitHub snapshot')
             # Make a formerly private destination public ONLY after its Git
@@ -897,13 +1016,13 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     return successes, failures
 
 
-def run(settings, *, apply=False, only=None, platform='both'):
+def run(settings, *, apply=False, only=None, platform='both', full_lfs=False):
     """Run the existing v3 mirror engine under the new configuration layer."""
     configure_runtime(settings, apply=apply)
     for executable in ('git', 'ssh', 'git-lfs'):
         if shutil.which(executable) is None:
             raise SyncError(f'Missing executable: {executable}')
-    platforms = ['gitlab', 'codeberg'] if platform == 'both' else [platform]
+    platforms = selected_platforms(platform)
     gh_headers = {'Authorization': f'Bearer {token(settings["source"])}',
                   'X-GitHub-Api-Version': '2022-11-28'}
     gl_headers = {'PRIVATE-TOKEN': token(settings['destinations']['gitlab'])} if 'gitlab' in platforms else {}
@@ -933,7 +1052,7 @@ def run(settings, *, apply=False, only=None, platform='both'):
         print(f'\n[{n}/{len(repos)}] {repo["name"]}')
         try:
             ok, bad = sync_repository(repo, gh_headers, gl_headers, cb_headers,
-                                      gl_user, apply, platforms)
+                                      gl_user, apply, platforms, full_lfs=full_lfs)
             successes += ok
             failures += bad
         except SyncError as exc:
@@ -944,6 +1063,127 @@ def run(settings, *, apply=False, only=None, platform='both'):
     return 0 if failures == 0 else 1
 
 
+# Read-only diagnostics
+
+
+def doctor(config, *, network=False, ssh=False, only=None, platform='both'):
+    results = []
+
+    def report(status, item, detail):
+        results.append(status)
+        print(f'{status} {item} - {detail}')
+
+    report('OK' if sys.version_info >= (3, 11) else 'ERROR', 'Python', sys.version.split()[0])
+    tool_env = {**os.environ, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'}
+    for label, arguments in (('Git', ('git', '--version')), ('Git LFS', ('git', 'lfs', 'version')),
+                             ('SSH', ('ssh', '-V'))):
+        try:
+            process = cmd(arguments, check=False, retry=False, timeout=10, env=tool_env)
+            version = (process.stdout or process.stderr).strip().splitlines()
+            if process.returncode or not version:
+                raise SyncError('Version unavailable')
+            report('OK', label, version[0])
+        except SyncError:
+            report('ERROR', label, 'version probe failed; check that the tool is installed and on PATH')
+
+    try:
+        settings = load_config(config)
+    except (ConfigError, OSError, ValueError):
+        report('ERROR', 'configuration', 'check that the YAML file exists and follows config.example.yml')
+        return 2
+    report('OK', 'configuration', 'YAML is valid')
+    storage = settings['storage']['path']
+    try:
+        ancestor = next(path for path in (storage, *storage.parents) if path.exists())
+        if not ancestor.is_dir():
+            raise OSError('Storage or parent is not a directory')
+        if not os.access(ancestor, os.R_OK | os.W_OK | os.X_OK):
+            report('ERROR', 'storage access', 'the directory or nearest existing parent failed the access check')
+        elif storage != ancestor:
+            report('WARNING', 'storage access', 'nearest parent passes; the backup directory does not exist yet')
+        elif os.name == 'nt':
+            report('WARNING', 'storage access',
+                   'the existing path passes a preliminary check; effective Windows ACLs remain unverified')
+        else:
+            report('OK', 'storage access', 'directory passes the permission check')
+        free = shutil.disk_usage(ancestor).free
+        report('OK' if free else 'ERROR', 'storage space', f'{free:,} bytes free on the backup volume')
+    except (OSError, StopIteration):
+        report('ERROR', 'storage', 'cannot inspect the backup directory or volume')
+
+    if network or ssh:
+        configure_runtime(settings, apply=False)
+        doctor_network(settings, selected_platforms(platform), ssh, only, report)
+    else:
+        report('WARNING', 'provider and SSH checks', 'skipped; pass --network or --ssh to opt in')
+    return 2 if 'ERROR' in results else 0
+
+
+def selected_platforms(platform):
+    return ['gitlab', 'codeberg'] if platform == 'both' else [platform]
+
+
+def doctor_network(settings, platforms, ssh, only, report):
+    providers = {
+        'github': (settings['source'], GH_API, 'login', GH_OWNER, 'Authorization', 'Bearer '),
+        'gitlab': (settings['destinations']['gitlab'], GL_API, 'username', None, 'PRIVATE-TOKEN', ''),
+        'codeberg': (settings['destinations']['codeberg'], CB_API, 'login', CB_OWNER, 'Authorization', 'token '),
+    }
+    authenticated = {}
+    for name in ('github', *platforms):
+        spec, base, field, expected, header, prefix = providers[name]
+        try:
+            headers = {header: prefix + token(spec)}
+        except (SyncError, ValueError):
+            report('ERROR', f'{name} credentials', 'configured token is missing or unreadable')
+            continue
+        if name == 'github':
+            headers['X-GitHub-Api-Version'] = '2022-11-28'
+        try:
+            status, account = api(f'{base}/user', headers)
+            login = account.get(field) if isinstance(account, dict) else None
+            if status != 200 or not isinstance(login, str) or not login:
+                raise SyncError('Authentication failed')
+            if expected and login.casefold() != expected.casefold():
+                report('ERROR', f'{name} API', 'authenticated account differs from the configured owner')
+                continue
+        except (SyncError, ValueError):
+            report('ERROR', f'{name} API', 'identity request failed; check credentials and network access')
+            continue
+        authenticated[name] = (headers, login)
+        report('OK', f'{name} API', 'authenticated identity request succeeded')
+
+    if not ssh:
+        return
+    try:
+        if 'github' not in authenticated:
+            raise SyncError('Source authentication failed')
+        repos = discover_repos(authenticated['github'][0])
+        record = next(repo for repo in repos if only is None or repo['name'].casefold() == only.casefold())
+    except (SyncError, StopIteration, ValueError):
+        report('ERROR', 'SSH', 'cannot select an accessible source repository')
+        return
+
+    for name, (headers, login) in authenticated.items():
+        try:
+            if name == 'github':
+                url = record.get('ssh_url')
+            elif name == 'gitlab':
+                url, _ = get_gitlab(record['name'], record['private'], headers, login, False)
+            else:
+                url, _ = get_codeberg(record['name'], record['private'], headers, False)
+            if not url and name != 'github':
+                report('WARNING', f'{name} SSH', 'matching destination is absent; read access was not checked')
+                continue
+            if not isinstance(url, str) or not re.match(r'^(ssh://|[^/@:\s]+@[^/:\s]+:)', url):
+                raise SyncError('SSH URL unavailable')
+            git('ls-remote', '--heads', '--tags', '--', url, timeout=30, retry=False,
+                env={**SSH_ENV, 'GIT_ALLOW_PROTOCOL': 'ssh'})
+            report('OK', f'{name} SSH', 'authenticated Git read succeeded')
+        except (SyncError, ValueError):
+            report('ERROR', f'{name} SSH', 'Git read failed; check trusted host keys and SSH key access')
+
+
 # Command-line interface
 
 def main(argv=None):
@@ -952,7 +1192,11 @@ def main(argv=None):
     parser.add_argument('--config', default='config.yml', help='Path to YAML config')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', help='Validate YAML without connecting to providers')
-    sub.add_parser('doctor', help='Check local tools without connecting to providers')
+    health = sub.add_parser('doctor', help='Check dependencies, configuration, and backup storage')
+    health.add_argument('--network', action='store_true', help='Check provider credentials and API access')
+    health.add_argument('--ssh', action='store_true', help='Check provider credentials and SSH Git read access')
+    health.add_argument('--only', help='Repository to sample for the SSH check')
+    health.add_argument('--platform', choices=['both', 'gitlab', 'codeberg'], default='both')
     for name in ('sync', 'run'):
         command = sub.add_parser(name)
         mode = command.add_mutually_exclusive_group()
@@ -960,19 +1204,16 @@ def main(argv=None):
         mode.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
         command.add_argument('--only', help='Only one repository')
         command.add_argument('--platform', choices=['both', 'gitlab', 'codeberg'], default='both')
+        command.add_argument('--verify-lfs', action='store_true', help='Recheck all archived and mirrored LFS objects (requires --apply)')
     args = parser.parse_args(argv)
+    if args.command in ('sync', 'run') and args.verify_lfs and not args.apply:
+        parser.error('--verify-lfs requires --apply')
     try:
+        if args.command == 'doctor':
+            return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform)
         cfg = load_config(args.config)
         if args.command == 'validate':
             print(f'Config valid: {Path(args.config).expanduser()}')
-            return 0
-        if args.command == 'doctor':
-            missing = [x for x in ('git', 'git-lfs', 'ssh') if shutil.which(x) is None]
-            if missing:
-                print('Missing tools: ' + ', '.join(missing), file=sys.stderr)
-                return 2
-            print('Local tools available: git, git-lfs, ssh')
-            print('Provider access is not checked by doctor.')
             return 0
         def execute():
             if not args.apply:
@@ -982,7 +1223,7 @@ def main(argv=None):
             lock = FileLock(str(data / '.gitmirror.lock'), timeout=0)
             try:
                 with lock:
-                    return run(cfg, apply=True, only=args.only, platform=args.platform)
+                    return run(cfg, apply=True, only=args.only, platform=args.platform, full_lfs=args.verify_lfs)
             except Timeout:
                 print('Another GitMirror process is running; no changes made.', file=sys.stderr)
                 return 2

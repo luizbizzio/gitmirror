@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import subprocess
 from types import SimpleNamespace
@@ -123,7 +124,8 @@ def test_rewrite_preserves_previous_destination_ref(tmp_path):
 
 @pytest.mark.parametrize('command, flags', [('sync', []), ('sync', ['--dry-run']), ('run', ['--dry-run'])])
 def test_dry_run_does_not_create_storage_or_modify_repos(mirror, command, flags, monkeypatch):
-    def stop_after_first_cycle(_):
+    def stop_after_first_cycle(delay):
+        assert delay == 12 * 3600
         raise KeyboardInterrupt
 
     monkeypatch.setattr('gitmirror.time.sleep', stop_after_first_cycle)
@@ -275,3 +277,162 @@ def test_corrupt_lfs_cache_is_rejected_even_when_size_matches(mirror, capsys):
     assert main([*mirror.args, 'sync', '--platform', 'gitlab', '--apply']) == 1
     assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
     assert 'Corrupt Git LFS object' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('multiple', [False, True])
+def test_server_without_atomic_push(mirror, multiple):
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+    (mirror.work / 'data.txt').write_text('new', encoding='utf-8')
+    cmd('commit', '-am', 'New tip', cwd=mirror.work)
+    head = cmd('rev-parse', 'HEAD', cwd=mirror.work)
+    desired = {'refs/heads/main': head}
+    if multiple:
+        desired['refs/tags/v1'] = head
+    cmd('config', 'receive.advertiseAtomic', 'false', cwd=mirror.dest)
+    if multiple:
+        with pytest.raises(gitmirror.SyncError, match='lacks atomic push'):
+            gitmirror.push_snapshot(mirror.work, 'dest', desired, previous)
+        assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
+    else:
+        gitmirror.push_snapshot(mirror.work, 'dest', desired, previous)
+        assert gitmirror.remote_refs(mirror.dest.as_uri()) == desired
+
+
+def test_atomic_rejection_preserves_all_refs(mirror):
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+    (mirror.work / 'data.txt').write_text('new', encoding='utf-8')
+    cmd('commit', '-am', 'New tip', cwd=mirror.work)
+    head = cmd('rev-parse', 'HEAD', cwd=mirror.work)
+    hook = mirror.dest / 'hooks' / 'update'
+    hook.write_text('#!/bin/sh\n[ "$1" != "refs/tags/rejected" ]\n', encoding='utf-8', newline='\n')
+    hook.chmod(0o755)
+
+    with pytest.raises(gitmirror.SyncError, match='destination refs unchanged'):
+        gitmirror.push_snapshot(mirror.work, 'dest', {'refs/heads/main': head, 'refs/tags/rejected': head}, previous)
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
+
+
+@pytest.mark.parametrize('returncode', [0, 1])
+def test_partial_result_fails_and_later_run_recovers(mirror, monkeypatch, capsys, returncode):
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+    (mirror.work / 'data.txt').write_text('updated', encoding='utf-8')
+    cmd('commit', '-am', 'Updated tip', cwd=mirror.work)
+    cmd('tag', 'v1', cwd=mirror.work)
+    cmd('push', 'source', 'main', '--tags', cwd=mirror.work)
+    actual_git = gitmirror.git
+
+    def partial(*args, **kwargs):
+        if args[:2] == ('push', '--atomic'):
+            cmd('push', 'dest', 'main', cwd=mirror.work)
+            return subprocess.CompletedProcess(args, returncode, '', 'simulated partial update')
+        return actual_git(*args, **kwargs)
+
+    args = [*mirror.args, 'sync', '--platform', 'gitlab', '--apply']
+    with monkeypatch.context() as patch:
+        patch.setattr(gitmirror, 'git', partial)
+        assert main(args) == 1
+    output = capsys.readouterr().out
+    assert 'inspect the verified backup' in output and 'SYNCED (' not in output
+    assert 'refs/tags/v1' not in gitmirror.remote_refs(mirror.dest.as_uri())
+    archived = f'refs/archive/{gitmirror.RUN_ID}/gitlab'
+    assert gitmirror.local_refs(mirror.repo, archived) == previous
+    assert main(args) == 0
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == gitmirror.remote_refs(mirror.source.as_uri())
+    assert gitmirror.local_refs(mirror.repo, archived) == previous
+
+
+def test_interrupt_before_lfs_backup_keeps_archive_unpublished(mirror, monkeypatch):
+    _, location = add_lfs_file(mirror.work)
+    cmd('lfs', 'push', '--all', 'dest', 'main', cwd=mirror.work)
+    cmd('push', '--no-verify', 'dest', 'main', cwd=mirror.work)
+    previous = gitmirror.remote_refs(mirror.dest.as_uri())
+    original = gitmirror.fetch_backup_lfs
+
+    def interrupt(repo, remote, refs, objects):
+        if remote == 'gitlab':
+            raise KeyboardInterrupt
+        return original(repo, remote, refs, objects)
+
+    args = [*mirror.args, 'sync', '--platform', 'gitlab', '--apply']
+    with monkeypatch.context() as patch:
+        patch.setattr(gitmirror, 'fetch_backup_lfs', interrupt)
+        assert main(args) == 130
+    interrupted = gitmirror.RUN_ID
+    assert not gitmirror.local_refs(mirror.repo, f'refs/archive/{interrupted}/gitlab')
+    assert gitmirror.local_refs(mirror.repo, f'refs/gitmirror-staging/{interrupted}/gitlab') == previous
+    assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
+    assert main(args) == 0
+    assert gitmirror.local_refs(mirror.repo, f'refs/archive/{gitmirror.RUN_ID}/gitlab') == previous
+    assert mirror.repo.joinpath(*location).is_file()
+
+
+def test_lfs_recent_evidence_is_incremental_and_full_mode_detects_damage(mirror, capsys):
+    payload, old = add_lfs_file(mirror.work)
+    cmd('lfs', 'push', '--all', 'source', 'main', cwd=mirror.work)
+    cmd('push', '--no-verify', 'source', 'main', cwd=mirror.work)
+    args = [*mirror.args, 'sync', '--platform', 'gitlab', '--apply']
+    assert main(args) == 0
+    record = mirror.repo / 'gitmirror-lfs-gitlab.json'
+    first = json.loads(record.read_text())['objects'][old[-1]]
+    assert 'read back 1 objects' in capsys.readouterr().out
+    assert main(args) == 0
+    assert 'reused recent read-back evidence for 1 objects' in capsys.readouterr().out
+
+    _, new = add_lfs_file(mirror.work, b'new LFS version')
+    cmd('lfs', 'push', '--all', 'source', 'main', cwd=mirror.work)
+    cmd('push', '--no-verify', 'source', 'main', cwd=mirror.work)
+    assert main(args) == 0
+    objects = json.loads(record.read_text())['objects']
+    assert objects[old[-1]] == first and new[-1] in objects
+    assert 'read back 1 objects; reused evidence for 1' in capsys.readouterr().out
+
+    # The local LFS transport may hard-link objects between repositories.
+    damaged = mirror.dest.joinpath(*old)
+    damaged.unlink()
+    damaged.write_bytes(b'x' * len(payload))
+    assert main([*args, '--verify-lfs']) == 1
+    assert 'SYNCED (' not in capsys.readouterr().out
+    assert not json.loads(record.read_text())['objects']
+
+
+def test_lfs_expired_record_cannot_hide_missing_destination_object(mirror, monkeypatch, capsys):
+    _, location = add_lfs_file(mirror.work)
+    cmd('lfs', 'push', '--all', 'source', 'main', cwd=mirror.work)
+    cmd('push', '--no-verify', 'source', 'main', cwd=mirror.work)
+    args = [*mirror.args, 'sync', '--platform', 'gitlab', '--apply']
+    assert main(args) == 0
+    capsys.readouterr()
+    mirror.dest.joinpath(*location).unlink()
+    monkeypatch.setattr(gitmirror, 'LFS_VERIFICATION_MAX_AGE', 0)
+    assert main(args) == 0
+    assert mirror.dest.joinpath(*location).is_file()
+    assert 'read back 1 objects' in capsys.readouterr().out
+
+
+def test_existing_private_destination_is_published_after_ref_verification(mirror, monkeypatch):
+    original_api = gitmirror.api
+    visibility = 'private'
+    rechecked_source = False
+
+    def mock_api(url, headers, method='GET', payload=None):
+        nonlocal visibility, rechecked_source
+        if url == 'https://api.github.com/repos/source/demo':
+            assert method == 'GET'
+            rechecked_source = True
+            return 200, {'private': False, 'owner': {'login': 'source'}}
+        if url.endswith('/projects/mirror%2Fdemo'):
+            status, project = original_api(url, headers)
+            return status, {**project, 'visibility': visibility}
+        if url.endswith('/projects/123'):
+            assert method == 'PUT' and payload == {'visibility': 'public'}
+            assert rechecked_source
+            assert gitmirror.remote_refs(mirror.dest.as_uri()) == gitmirror.remote_refs(mirror.source.as_uri())
+            visibility = 'public'
+            return 200, {}
+        return original_api(url, headers, method, payload)
+
+    monkeypatch.setattr(gitmirror, 'api', mock_api)
+    cmd('tag', 'v1', cwd=mirror.work)
+    cmd('push', 'source', '--tags', cwd=mirror.work)
+    assert main([*mirror.args, 'sync', '--platform', 'gitlab', '--apply']) == 0
+    assert visibility == 'public'

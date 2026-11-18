@@ -4,7 +4,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && git lfs install --system
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE NOTICE.txt ./
 COPY gitmirror.py ./
 RUN pip install --no-cache-dir . \
  && useradd --create-home --uid 10001 gitmirror \
@@ -14,4 +14,4 @@ USER gitmirror
 ENV HOME=/home/gitmirror PYTHONUNBUFFERED=1
 VOLUME ["/data"]
 ENTRYPOINT ["gitmirror"]
-CMD ["--config", "/config/config.yml", "run", "--apply"]
+CMD ["--config", "/config/config.yml", "run"]

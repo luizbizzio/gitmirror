@@ -17,3 +17,32 @@ def test_missing_token_env(monkeypatch):
     monkeypatch.delenv('TEST_GITMIRROR_TOKEN', raising=False)
     with pytest.raises(SyncError, match='missing'):
         token({'token_env':'TEST_GITMIRROR_TOKEN'})
+
+
+def test_protection_journal_recovers_after_interrupted_patch(tmp_path, monkeypatch):
+    import gitmirror
+
+    monkeypatch.setattr(gitmirror, 'JOURNAL_DIR', tmp_path / 'journal')
+    rule = {'name': 'main', 'allow_force_push': False}
+    interrupted = True
+
+    def mock_api(url, headers, method='GET', payload=None):
+        if 'protected_branches?' in url:
+            return 200, [dict(rule)]
+        if 'protected_tags?' in url:
+            return 200, []
+        assert url.endswith('/protected_branches/main')
+        if method == 'PATCH':
+            rule.update(payload)
+            if interrupted:
+                raise KeyboardInterrupt
+        return 200, dict(rule)
+
+    monkeypatch.setattr(gitmirror, 'api', mock_api)
+    with pytest.raises(KeyboardInterrupt):
+        gitmirror.prepare_gl_permissions(3, {'default_branch': 'main'},
+                                        {'refs/heads/main': 'new'}, {'refs/heads/main': 'old'}, {})
+    assert rule['allow_force_push'] and gitmirror.load_journal(3)
+    interrupted = False
+    gitmirror.recover_all_gl_permissions({})
+    assert not rule['allow_force_push'] and not gitmirror.load_journal(3)
