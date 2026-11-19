@@ -389,10 +389,14 @@ function retentionText(policy) {
 }
 
 function renderDestinations(data) {
-  $("#destinations").innerHTML = data.destinations.map((destination) => `<article class="panel"><header>
+  $("#destinations").innerHTML = data.destinations.length
+    ? data.destinations.map((destination) => `<article class="panel"><header>
     <h2>${escape(destination.id)}</h2><span class="pill">${escape(destination.provider)}</span></header>
-    ${list(destination.provider === "local" ? [["Backup path", destination.path], ["Retention", retentionText(destination.retention)]]
-      : [["Account", destination.owner ?? "Determined on login"], ["API", destination.api_url]])}</article>`).join("");
+    ${list(destination.provider === "local"
+      ? [["Backup path", destination.path], ["Retention", retentionText(destination.retention)]]
+      : [["Account", destination.owner ?? "Determined on login"], ["API", destination.api_url]])}</article>`).join("")
+    : emptyPage("No destinations configured",
+      "Configure a remote mirror or local backup location.", "Edit configuration");
 }
 
 function renderSettings(data) {
@@ -429,15 +433,18 @@ function statusFor(repos) {
 }
 
 function renderRepositories() {
+  $("#repository-workspace").hidden = false;
+  $("#repository-onboarding").hidden = true;
   const query = $("#repo-search").value.trim().toLowerCase();
   const visibility = $("#repo-filter").value, status = $("#status-filter").value;
   const filtered = repositories.filter((repo) => repo.name.toLowerCase().includes(query)
     && (!visibility || repo.visibility === visibility)
     && (!status || statusFor(repo.destinations) === status));
-  $("#repositories").innerHTML = filtered.length ? table(["Repository", "Visibility", "Default branch", "Sync status", "Last verified backup"],
-    filtered.map((repo) => row(button("details", repo.id, repo.name), escape(repo.visibility),
-      `<code>${escape(repo.default_branch || "Unconfirmed")}</code>`, pill(statusFor(repo.destinations)), escape(date(repo.last_backup)))))
-    : empty(repositories.length ? "No repositories match your filters." : "No source inventory recorded. Read it from the source to populate this view.");
+  $("#repositories").innerHTML = filtered.length ? table(["Repository", "Source size", "Visibility", "Default branch", "Sync status", "Last backup"],
+    filtered.map((repo) => row(button("details", repo.id, repo.name), escape(size(repo.size_bytes)),
+      escape(repo.visibility), `<code>${escape(repo.default_branch || "Unconfirmed")}</code>`,
+      pill(statusFor(repo.destinations)), escape(date(repo.last_backup)))))
+    : empty(repositories.length ? "No repositories match your filters." : "No repositories loaded. Click Read source inventory to fetch them.");
 }
 
 function openRepository(id) {
@@ -449,7 +456,7 @@ function openRepository(id) {
     return row(escape(destination.id), pill(result?.state), escape(date(result?.at)), escape(result?.detail || ""));
   });
   $("#details-content").innerHTML = list([["Visibility", repo.visibility], ["Default branch", repo.default_branch || "Unconfirmed"],
-    ["Last verified backup", date(repo.last_backup)]]) + `<div class="table-wrap">${table(["Destination", "Status", "Checked", "Detail"], destinations)}</div>`
+    ["Reported source size", size(repo.size_bytes)], ["Last verified backup", date(repo.last_backup)]]) + `<div class="table-wrap">${table(["Destination", "Status", "Checked", "Detail"], destinations)}</div>`
     + button("prepare-sync", repo.id, "Prepare manual synchronization", !snapshot.web.allow_actions);
   $("#details-dialog").showModal();
 }
@@ -470,11 +477,11 @@ function renderBackups(data) {
            ${button("restore", index, "Restore", !snapshot.web.allow_actions || !snapshot.web.restore_enabled || busy)}`);
       });
       return `<details data-key="${escape(key)}" ${opened.has(key) ? "open" : ""}>
-        <summary>${escape(repo.name)} <small class="muted">· ${repo.generations.length} generations</small></summary>
+        <summary>${escape(repo.name)} <small class="muted">· ${size(repo.logical_bytes)} logical · ${repo.generations.length} generations</small></summary>
         ${repo.error ? `<p class="error">${escape(repo.error)}</p>` : ""}
         <div class="table-wrap">${table(["Generation", "Integrity", "Last check", "Created", "Actions"], generations)}</div>
         </details>`;
-    }).join("") || empty("No backup generations observed.")}</article>`).join("") || empty("No local volumes configured.");
+    }).join("") || empty("No backup generations observed.")}</article>`).join("") || emptyPage("No backup volumes yet", "Add a local destination to store recoverable Git backups.", "Edit configuration");
 }
 
 function renderActivity() {
@@ -603,6 +610,13 @@ document.addEventListener("click", (event) => {
   const target = event.target.closest("button");
   if (!target) return;
   if (target.dataset.view || target.dataset.go) openView(target.dataset.view || target.dataset.go);
+  if (target.hasAttribute("data-setup-open")) {
+    if (previewMode) showInitialSetup();
+    else {
+      openView("settings");
+      if (snapshot?.web?.managed) $("#edit-configuration").click();
+    }
+  }
   if (target.dataset.close) $(`#${target.dataset.close}`).close();
   const value = target.dataset.value;
   switch (target.dataset.action) {
