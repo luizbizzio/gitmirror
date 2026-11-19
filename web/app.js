@@ -106,6 +106,7 @@ function stat(label, value, note) {
 }
 
 function runName(run) {
+  if (run.operation === "doctor") return "Verify connections";
   if (run.operation !== "sync") return run.operation === "restore" ? "Restore" : "Verify backup";
   return run.mode === "apply" ? "Synchronization" : "Dry-run";
 }
@@ -154,10 +155,12 @@ function renderDestinations(data) {
 
 function renderSettings(data) {
   $("#edit-configuration").hidden = !data.web.managed;
+  $("#check-connections").hidden = !data.web.managed;
+  $("#check-connections button").disabled = busy;
   $("#settings").innerHTML = list([["Source", `${data.source.provider} / ${data.source.owner}`],
     ["Source API", data.source.api_url], ["Schedule interval", `${data.schedule_hours} hours`],
     ["Next observed run", date(data.next_run, "Unavailable")], ["Working path", data.storage.path],
-    ["Web actions", data.web.allow_actions ? "Enabled" : "Read-only"],
+    ["Web actions", data.web.writes_paused ? "Applied sync paused" : data.web.allow_actions ? "Enabled" : "Read-only"],
     ["Web restores", data.web.restore_enabled ? "Enabled" : "Disabled"],
     ["Access", data.web.secure ? "HTTPS secure session" : "HTTP local session"]])
     + (data.web.managed ? "" : empty("This dashboard reads the server’s configuration. Changes take effect after a dashboard restart."));
@@ -498,6 +501,11 @@ function openConfiguration(initial, data) {
   form.elements.password.required = initial;
   form.elements.hours.value = data.schedule?.interval_hours ?? 12;
   form.elements.enabled.checked = data.schedule?.enabled ?? false;
+  form.elements.enabled.disabled = Boolean(data.migration_pending);
+  if (data.migration_pending) {
+    form.elements.enabled.checked = false;
+    form.querySelector("[data-schedule-note]").textContent = "Complete the legacy cutover before enabling the schedule.";
+  }
   form.elements.repositories.value = (data.repositories ?? []).join("\n");
   form.elements.known_hosts.value = data.known_hosts ?? "";
   form.querySelector("[data-public-key]").textContent = data.public_key;
@@ -570,4 +578,16 @@ async function startDashboard() {
 
 $("#edit-configuration").addEventListener("click", () => api("/api/managed/settings")
   .then((data) => openConfiguration(false, data)).catch(report));
+$("#check-connections").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const trigger = event.currentTarget.querySelector("button");
+  trigger.disabled = true;
+  try {
+    const job = await post("/api/managed/check", {repo: $("#check-repository").value.trim(), ssh: $("#check-ssh").checked});
+    await afterStart(job);
+  } catch (failure) {
+    report(failure);
+    trigger.disabled = false;
+  }
+});
 startDashboard().catch(signOut);

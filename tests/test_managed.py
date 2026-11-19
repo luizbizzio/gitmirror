@@ -2,6 +2,7 @@
 import base64
 import hashlib
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -130,3 +131,71 @@ def test_setup_host_key_lookup_requires_bootstrap_and_exact_fingerprint(installa
         response = client.post(path, json=arguments)
         assert response.json()['known_host'] == f'[mirror.example.invalid]:2222 ssh-ed25519 {encoded}'
         assert calls[-1][-1] == 'mirror.example.invalid'
+
+
+def test_migration_blocks_enable_and_web_apply_but_allows_diagnostics(installation, monkeypatch):
+    managed, setup = installation
+    guard = managed.root / 'migration-pending'
+    guard.touch()
+    monkeypatch.setenv('GITMIRROR_MIGRATION_GUARD', str(guard))
+    with TestClient(managed_app(managed), base_url='http://localhost') as client:
+        assert client.get('/api/setup').json()['migration_pending'] is True
+        enabled = {**setup, 'schedule': {**setup['schedule'], 'enabled': True}}
+        assert client.post('/api/setup', json=enabled).status_code == 400
+        outside = [{**setup['destinations'][0], 'path': str(managed.root.parent / 'legacy-storage')}]
+        assert client.post('/api/setup', json={**setup, 'destinations': outside}).status_code == 400
+        assert managed.active() is None
+        assert client.post('/api/setup', json=setup).status_code == 200
+    with TestClient(managed_app(managed), base_url='http://localhost') as client:
+        assert client.post('/api/managed/check', json={}).status_code == 401
+        header = login(client)
+        assert client.post('/api/managed/check', headers=header, json={'ssh': 1}).status_code == 400
+        assert client.post('/api/sync', headers=header, json={'apply': True, 'confirmation': 'SYNC ALL'}).status_code == 409
+        settings = gitmirror.load_config(managed.active().config)
+        with pytest.raises(gitmirror.SyncError, match='paused'):
+            gitmirror.execute_sync(settings, apply=True)
+
+
+def test_official_managed_cli_checks_recorded_guards_without_service_environment(tmp_path, monkeypatch):
+    etc = tmp_path / 'etc'
+    work = tmp_path / 'work'
+    etc.mkdir()
+    monkeypatch.setattr(gitmirror, 'MANAGED_SYSTEM_STATE', work)
+    monkeypatch.setattr(gitmirror, 'MANAGED_SYSTEM_ETC', etc)
+    monkeypatch.delenv('GITMIRROR_MIGRATION_GUARD', raising=False)
+    monkeypatch.delenv('GITMIRROR_MAINTENANCE_GUARD', raising=False)
+    monkeypatch.delenv('GITMIRROR_LEGACY_LOCK_RECORD', raising=False)
+    settings = {'storage': {'path': work}}
+    (etc / 'migration-pending').touch()
+    with pytest.raises(gitmirror.SyncError, match='paused'):
+        gitmirror.execute_sync(settings, apply=True)
+    assert not work.exists()
+    (etc / 'migration-pending').unlink()
+    (etc / 'legacy').mkdir()
+    with pytest.raises(gitmirror.SyncError, match='recorded legacy flock is missing'):
+        with gitmirror.legacy_sync_interlock(settings):
+            pytest.fail('Missing legacy interlock must block application writes')
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux flock')
+def test_legacy_interlock_honors_busy_and_replaced_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    lock = tmp_path / 'legacy'
+    lock.touch()
+    lock_info = lock.stat()
+    record = tmp_path / 'legacy-lock'
+    record.write_text(f'{lock}\n{lock_info.st_dev} {lock_info.st_ino}\n')
+    monkeypatch.setenv('GITMIRROR_LEGACY_LOCK_RECORD', str(record))
+    with lock.open('rb') as entry:
+        fcntl.flock(entry, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(gitmirror.SyncError, match='busy'):
+            with gitmirror.legacy_sync_interlock():
+                pytest.fail('The old and new jobs acquired the same lock')
+    with gitmirror.legacy_sync_interlock():
+        pass
+    lock.rename(tmp_path / 'previous-lock')
+    lock.touch()
+    with pytest.raises(gitmirror.SyncError, match='inode changed'):
+        with gitmirror.legacy_sync_interlock():
+            pytest.fail('The inode changed without interrupting sync')

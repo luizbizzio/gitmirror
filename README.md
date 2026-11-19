@@ -144,47 +144,11 @@ visibility and last observed status, with details per destination.
 
 ### Guided Linux installation
 
-Use the installer on a Debian-based host with systemd and Python 3.11 or newer
-available from its package manager. From the downloaded and extracted GitMirror
-source, run one command:
-
-```sh
-bash install.sh
-```
-
-The installer requests administrator access, checks which system dependencies
-are missing, and asks before installing them. Pass `--yes` to explicitly approve
-missing dependency installation without the prompt. It installs GitMirror in
-`/opt/gitmirror`, creates a restricted account and config directory under
-`/var/lib/gitmirror`, and enables the dashboard and scheduler at boot. A working
-installation requires an explicit migration before rerunning the installer.
-
-Open the URL printed when it finishes and enter the one-time setup code. Set an
-admin password, add provider accounts and tokens, choose the repositories,
-configure remote destinations or managed local backup directories and set the
-schedule. The browser displays the service's public key so you can register it
-with each provider. Paste published OpenSSH host keys or enter a provider's
-published SHA256 fingerprint to verify and add the key in the browser.
-External disks and NAS paths must already be mounted and writable by the
-service account. Managed local directories are created for you.
-
-The installer defaults to loopback. On a headless server, choose a reachable
-hostname or IPv4 address with `bash install.sh --lan rpi5.local`. This enables
-HTTPS and prints the locally generated certificate's fingerprint. Match that
-fingerprint before trusting the certificate in your browser. Set `--port`
-to use a different TCP port.
-
-The scheduler stays idle during setup and starts applied syncs when you enable
-them in the browser. Settings can change accounts, tokens, destinations, retention,
-the repository list, the interval and the administrator password. A save validates
-the entire configuration, preserves the prior revision and reloads the service.
-Admin passwords use salted scrypt hashes. Provider tokens reside in private files
-and the browser leaves credential fields blank when editing. If editing a token
-or moving to another provider account, enter the new token. The CLI remains
-available at `/opt/gitmirror/venv/bin/gitmirror` for advanced use.
-
-The guided installer is separate from the native Python and Docker deployment
-options below. Raspberry Pi OS ARM64 still needs hardware validation.
+The managed installer and browser setup are documented in the [installation and
+maintenance guide](INSTALL.md). It describes the pending release command, verified
+release artifacts, localhost and LAN HTTPS, staged migration, upgrades, rollback
+and uninstall. Package and systemd support target Debian 12+ and Raspberry Pi OS
+ARM64. Use the standalone installation below for Windows or Docker.
 
 ### Activity and monitoring
 

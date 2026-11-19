@@ -1973,19 +1973,77 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, ide
     return 0 if failures == 0 else 1
 
 
+MANAGED_SYSTEM_STATE = Path('/var/lib/gitmirror-managed/work')
+MANAGED_SYSTEM_ETC = Path('/etc/gitmirror-managed')
+
+
 def execute_sync(settings, *, apply=False, only=None, platform='all', full_lfs=False, identifiers=None,
                  activity=None):
     if not apply:
         return run(settings, only=only, platform=platform, identifiers=identifiers, activity=activity)
     storage = settings['storage']['path']
+    if managed_writes_blocked(settings):
+        raise SyncError('Managed synchronization is paused for migration or maintenance')
     storage.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(storage / '.gitmirror.lock'), timeout=0):
-            return run(settings, apply=True, only=only, platform=platform, full_lfs=full_lfs,
-                       identifiers=identifiers, activity=activity)
+            if managed_writes_blocked(settings):
+                raise SyncError('Managed synchronization is paused for migration or maintenance')
+            with legacy_sync_interlock(settings):
+                return run(settings, apply=True, only=only, platform=platform, full_lfs=full_lfs,
+                           identifiers=identifiers, activity=activity)
     except Timeout:
         print('Another GitMirror process is running; no changes made.', file=sys.stderr)
         return 2
+
+
+def managed_guard_exists(variable, settings=None):
+    if settings and settings['storage']['path'] == MANAGED_SYSTEM_STATE:
+        filename = 'migration-pending' if variable == 'GITMIRROR_MIGRATION_GUARD' else 'maintenance-pending'
+        if (MANAGED_SYSTEM_ETC / filename).exists():
+            return True
+    value = os.getenv(variable)
+    return bool(value and Path(value).exists())
+
+
+def managed_writes_blocked(settings=None):
+    return (managed_guard_exists('GITMIRROR_MIGRATION_GUARD', settings)
+            or managed_guard_exists('GITMIRROR_MAINTENANCE_GUARD', settings))
+
+
+@contextmanager
+def legacy_sync_interlock(settings=None):
+    configured = os.getenv('GITMIRROR_LEGACY_LOCK_RECORD')
+    if settings and settings['storage']['path'] == MANAGED_SYSTEM_STATE:
+        record = MANAGED_SYSTEM_ETC / 'legacy-lock'
+        if (MANAGED_SYSTEM_ETC / 'legacy').exists() and not record.is_file():
+            raise SyncError('The recorded legacy flock is missing; synchronization is blocked')
+    else:
+        record = Path(configured) if configured else None
+    if record is None or not record.is_file():
+        yield
+        return
+    if not sys.platform.startswith('linux'):
+        raise SyncError('The legacy flock migration interlock requires Linux')
+    import fcntl
+
+    try:
+        path, identity = record.read_text('utf-8').splitlines()
+        expected = tuple(map(int, identity.split()))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError) as exc:
+        raise SyncError('Cannot read the preserved legacy flock; synchronization is blocked') from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != expected:
+            raise SyncError('Legacy flock inode changed; synchronization is blocked')
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise SyncError('Legacy flock is busy or unavailable; synchronization is blocked') from exc
+        yield
+    finally:
+        os.close(descriptor)
 
 
 # Read-only diagnostics
@@ -2294,7 +2352,7 @@ class ObservedOutput:
 class DashboardOperation:
     def __init__(self, journal, identifier, settings, operation, mode, origin):
         self.journal, self.id, self.origin = journal, identifier, origin
-        self.values = dashboard_secret_values(settings) if operation == 'sync' else ()
+        self.values = dashboard_secret_values(settings) if operation in ('sync', 'doctor') else ()
         self.log_changed = 0
         self.last_error = None
         self.seen, self.unavailable = set(), set()
@@ -2705,6 +2763,9 @@ class ManagedInstallation:
         schedule = payload.get('schedule')
         if not isinstance(schedule, dict) or type(schedule.get('enabled')) is not bool:
             raise ConfigError('Choose whether to enable the schedule')
+        migration = managed_guard_exists('GITMIRROR_MIGRATION_GUARD')
+        if migration and schedule['enabled']:
+            raise ConfigError('Complete migration cutover before enabling the schedule')
         repositories = payload.get('repositories', [])
         raw = {'version': 2, 'source': source, 'destinations': destinations, 'storage': {'path': str(self.work)},
                'schedule': {'enabled': schedule['enabled'], 'interval_hours': schedule.get('interval_hours')},
@@ -2742,6 +2803,8 @@ class ManagedInstallation:
             salt, verifier = self.credentials(active)
         private_text(revision.path / 'admin.json', json.dumps({'salt': salt.hex(), 'password': verifier.hex()}))
         volumes = {key: spec for key, spec in settings['destinations'].items() if spec['provider'] == 'local'}
+        if migration and any(spec['path'] != self.volumes / key for key, spec in volumes.items()):
+            raise ConfigError('Staged migration uses managed local backup directories only')
         for key, spec in volumes.items():
             if spec['path'] == self.volumes / key:
                 spec['path'].mkdir(mode=0o700, exist_ok=True)
@@ -2768,7 +2831,7 @@ def managed_scheduler(installation):
             settings = load_config(current.config) if current else None
             journal = DashboardJournal(settings) if settings else None
             due = time.time()
-        if not settings or not settings['schedule'].get('enabled', False):
+        if not settings or not settings['schedule'].get('enabled', False) or managed_writes_blocked(settings):
             time.sleep(8)
             continue
         if time.time() < due:
@@ -2781,6 +2844,29 @@ def managed_scheduler(installation):
         observe_dashboard_operation(settings, 'sync', 'apply', 'scheduled', None, [],
                                     lambda activity: execute_sync(settings, apply=True, activity=activity), enabled=True)
         due = time.time() + settings['schedule']['interval_hours'] * 3600
+
+
+def validate_managed(installation, *, preflight=False):
+    revision = installation.active()
+    if not revision:
+        if preflight:
+            raise SyncError('Complete the staged dashboard setup before cutover')
+        return 0
+    settings = load_config(revision.config)
+    if settings['storage']['path'] != installation.work:
+        raise SyncError('The managed configuration does not use its isolated work directory')
+    installation.credentials(revision)
+    for spec in (settings['source'], *settings['destinations'].values()):
+        if spec['provider'] != 'local':
+            token(spec)
+    if not revision.ssh_config.is_file():
+        raise SyncError('Managed SSH configuration is missing')
+    if not preflight:
+        return 0
+    os.environ['GITMIRROR_MANAGED_SSH_CONFIG'] = str(revision.ssh_config)
+    with tempfile.TemporaryDirectory(prefix='migration-check-', dir=installation.work) as scratch:
+        settings['storage']['path'] = Path(scratch)
+        return run(settings, apply=False)
 
 
 # Optional self-hosted dashboard
@@ -2974,7 +3060,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         @app.get('/api/setup')
         def setup_status():
             return {'required': pending_setup, 'public_key': managed.public_key() if pending_setup else None,
-                    'revision': revision.identifier if revision else None}
+                    'revision': revision.identifier if revision else None,
+                    'migration_pending': managed_guard_exists('GITMIRROR_MIGRATION_GUARD', settings)}
 
         async def save_settings(data, *, initial=False):
             try:
@@ -3024,7 +3111,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         @app.get('/api/managed/settings')
         def managed_settings(request: _GitMirrorWebRequest):
             auth(request)
-            return {**managed.settings(revision), 'revision': revision.identifier}
+            return {**managed.settings(revision), 'revision': revision.identifier,
+                    'migration_pending': managed_guard_exists('GITMIRROR_MIGRATION_GUARD', settings)}
 
         @app.post('/api/managed/settings')
         async def update_settings(request: _GitMirrorWebRequest):
@@ -3065,6 +3153,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 'schedule_hours': settings['schedule']['interval_hours'],
                 'storage': {'path': str(settings['storage']['path']), 'free': free},
                 'web': {'allow_actions': allow_actions, 'restore_enabled': bool(restore_dir), 'managed': bool(managed),
+                        'writes_paused': managed_writes_blocked(settings),
                         'secure': bool(public_origin or request.url.scheme == 'https')},
                 'inventory_at': checked, 'total_repositories': None if repositories is None else len(repositories),
                 'successful': summary.get('succeeded', {}).get('total', 0),
@@ -3245,6 +3334,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             raise HTTPException(400, 'An explicit sync mode is required')
         repository, targets = repo_name(data), selected(data)
         applied = data['apply']
+        if applied and managed_writes_blocked(settings):
+            raise HTTPException(409, 'Applied synchronization is paused for migration or maintenance')
         required = 'SYNC' if repository else 'SYNC ALL'
         if applied and data.get('confirmation') != required:
             raise HTTPException(400, f'Type {required} to confirm this applied sync')
@@ -3255,6 +3346,21 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         for target in targets:
             args.extend(('--destination', target))
         return await asyncio.to_thread(start, 'sync', mode, repository, targets, args)
+
+    @app.post('/api/managed/check')
+    async def check_connections(request: _GitMirrorWebRequest):
+        require_action(request)
+        if managed is None:
+            raise HTTPException(404, 'Managed installation is unavailable')
+        data = await body(request)
+        repository = repo_name(data)
+        ssh = data.get('ssh', True)
+        if type(ssh) is not bool:
+            raise HTTPException(400, 'Choose API or API and SSH verification')
+        args = ['doctor', '--ssh' if ssh else '--network', '--monitor']
+        if repository:
+            args.append(f'--only={repository}')
+        return await asyncio.to_thread(start, 'doctor', 'check', repository, [], args)
 
     @app.post('/api/backups/verify')
     async def verify(request: _GitMirrorWebRequest):
@@ -3418,6 +3524,11 @@ def main(argv=None):
     provision.add_argument('--state-dir', required=True)
     scheduler = sub.add_parser('managed-scheduler', help='Run the managed installation scheduler')
     scheduler.add_argument('--state-dir', required=True)
+    for name, help_text in (
+            ('managed-validate', 'Check a managed configuration without connecting to providers'),
+            ('managed-preflight', 'Exercise the staged managed configuration in a temporary dry-run')):
+        managed_check = sub.add_parser(name, help=help_text)
+        managed_check.add_argument('--state-dir', required=True)
 
     initialization = sub.add_parser('init-backup', help='Initialize a configured local backup volume')
     add_destination_selector(initialization)
@@ -3443,6 +3554,7 @@ def main(argv=None):
     health.add_argument('--network', action='store_true', help='Check provider credentials and API access')
     health.add_argument('--ssh', action='store_true', help='Check provider credentials and SSH Git read access')
     health.add_argument('--only', help='Repository to sample for the SSH check')
+    health.add_argument('--monitor', action='store_true', help='Record diagnostics in dashboard activity')
     add_destination_selector(health, providers=True)
     for name in ('sync', 'run'):
         command = sub.add_parser(name)
@@ -3475,9 +3587,16 @@ def main(argv=None):
             return 0
         if args.command == 'managed-scheduler':
             return managed_scheduler(ManagedInstallation(args.state_dir))
+        if args.command in ('managed-validate', 'managed-preflight'):
+            return validate_managed(ManagedInstallation(args.state_dir), preflight=args.command == 'managed-preflight')
         if args.command == 'doctor':
-            return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform,
-                          identifiers=args.destination)
+            def diagnose(activity):
+                return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform,
+                              identifiers=args.destination)
+            if not args.monitor:
+                return diagnose(None)
+            return observe_dashboard_operation(load_config(args.config), 'doctor', 'check', 'cli', args.only,
+                                              args.destination, diagnose, enabled=True)
         cfg = load_config(args.config)
         if args.command == 'validate':
             print(f'Config valid: {Path(args.config).expanduser()}')
