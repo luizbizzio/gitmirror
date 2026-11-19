@@ -135,8 +135,11 @@ gitmirror --config config.yml run --apply
 
 ## Optional self-hosted web dashboard
 
-The dashboard is optional. The CLI works without FastAPI and Uvicorn. The dashboard
-shows source inventory, applied sync outcomes, the next observed scheduler cycle,
+The dashboard is optional. The CLI works without FastAPI and Uvicorn. The web
+interface uses a compact admin layout inspired by Pi-hole. On a new managed install,
+you can inspect its empty dashboard and settings before clicking **Setup** in the
+top bar. Private operations and repository information remain protected until login.
+After setup, the dashboard shows source inventory, applied sync outcomes, the next observed scheduler cycle,
 work and backup storage, and integrity per backup generation. An available volume
 can contain unverified backups. Verification reports the last observed check; use
 Verify to recheck the selected generation. The repository view filters by name,
