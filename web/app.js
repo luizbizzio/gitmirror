@@ -30,6 +30,46 @@ let csrf = "", view = "overview", snapshot = null, stream = null, refreshTimer =
 let repositories = [], targetSignature = "", currentRun = "", restoreSelection = null, targets = [];
 let loading = false, refreshPending = false, logRequest = 0, busy = false;
 let previewMode = false, initialSetupData = null;
+const mobileNavigation = window.matchMedia("(max-width: 760px)");
+let compactNavigation = false;
+
+function routeFromUrl() {
+  const route = window.location.hash.slice(1);
+  return Object.hasOwn(pages, route) ? route : "overview";
+}
+
+function updateNavigationControl() {
+  const mobile = mobileNavigation.matches;
+  const open = $("#shell").classList.contains("mobile-nav-open");
+  $("#nav-toggle").setAttribute("aria-expanded", String(mobile ? open : !compactNavigation));
+  $("#nav-toggle").setAttribute("aria-label", mobile
+    ? (open ? "Close navigation" : "Open navigation")
+    : (compactNavigation ? "Expand navigation" : "Collapse navigation"));
+  $("#sidebar-backdrop").hidden = !mobile || !open;
+}
+
+function closeMobileNavigation() {
+  $("#shell").classList.remove("mobile-nav-open");
+  updateNavigationControl();
+}
+
+function initializeNavigation() {
+  try { compactNavigation = window.localStorage.getItem("gitmirror-sidebar") === "compact"; } catch { /* optional */ }
+  $("#shell").classList.toggle("nav-collapsed", compactNavigation && !mobileNavigation.matches);
+  updateNavigationControl();
+}
+
+function toggleNavigation() {
+  if (mobileNavigation.matches) {
+    $("#shell").classList.toggle("mobile-nav-open");
+  } else {
+    compactNavigation = !compactNavigation;
+    $("#shell").classList.toggle("nav-collapsed", compactNavigation);
+    try { window.localStorage.setItem("gitmirror-sidebar", compactNavigation ? "compact" : "expanded"); }
+    catch { /* storage may be disabled */ }
+  }
+  updateNavigationControl();
+}
 
 function notify(message, error = false) {
   const node = $("#notice");
@@ -49,6 +89,7 @@ function signOut() {
   stream = null;
   clearInterval(refreshTimer);
   refreshTimer = null;
+  closeMobileNavigation();
   $("#shell").hidden = true;
   $("#login").hidden = false;
   for (const dialog of all("dialog[open]")) dialog.close();
@@ -78,22 +119,27 @@ async function api(path, { data, method = "GET" } = {}) {
 const post = (path, data) => api(path, {method: "POST", data});
 function report(error) { notify(error.message, true); }
 
-function openView(name) {
+function openView(name, {updateUrl = true} = {}) {
   if (!Object.hasOwn(pages, name)) return;
   view = name;
-  for (const item of all("nav [data-view]")) {
+  for (const item of all("#main-navigation [data-view]")) {
     if (item.dataset.view === view) item.setAttribute("aria-current", "page");
     else item.removeAttribute("aria-current");
   }
   for (const page of all(".content > section")) page.hidden = page.id !== `view-${view}`;
   $("#page-title").textContent = pages[view];
   $("#topbar-location").textContent = pages[view];
+  document.title = `${pages[view]} | GitMirror`;
+  if (updateUrl && window.location.hash !== `#${view}`) {
+    window.history.pushState(null, "", `#${view}`);
+  }
+  closeMobileNavigation();
   if (previewMode) {
     renderPreviewView();
-    return;
+  } else {
+    renderContext();
+    refresh().catch(report);
   }
-  renderContext();
-  refresh().catch(report);
 }
 
 function renderContext() {
@@ -191,7 +237,8 @@ function enterPreview(data) {
   $("#system-state").innerHTML = '<span class="status-dot"></span> Setup required';
   $("#system-detail").textContent = "Sync is disabled until configuration";
   connected("Interface online");
-  openView("overview");
+  initializeNavigation();
+  openView(routeFromUrl(), {updateUrl: false});
 }
 
 function showInitialSetup() {
@@ -420,7 +467,8 @@ async function boot() {
   $("#top-setup").textContent = "Settings";
   $("#system-state").innerHTML = '<span class="status-dot ready"></span> Connected';
   $("#system-detail").textContent = "Dashboard authenticated";
-  openView("overview");
+  initializeNavigation();
+  openView(routeFromUrl(), {updateUrl: false});
   connect();
 }
 
@@ -437,6 +485,22 @@ async function afterStart(job) {
   openView("activity");
   notify("Operation queued.");
 }
+
+$("#nav-toggle").addEventListener("click", toggleNavigation);
+$("#sidebar-backdrop").addEventListener("click", closeMobileNavigation);
+window.addEventListener("popstate", () => {
+  if (!$("#shell").hidden) openView(routeFromUrl(), {updateUrl: false});
+});
+window.addEventListener("hashchange", () => {
+  if (!$("#shell").hidden && routeFromUrl() !== view) openView(routeFromUrl(), {updateUrl: false});
+});
+mobileNavigation.addEventListener("change", () => {
+  $("#shell").classList.toggle("nav-collapsed", compactNavigation && !mobileNavigation.matches);
+  closeMobileNavigation();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeMobileNavigation();
+});
 
 document.addEventListener("click", (event) => {
   const target = event.target.closest("button");
@@ -605,6 +669,26 @@ function openConfiguration(initial, data) {
   const wrapper = initial ? $("#setup-editor") : $("#settings-editor");
   wrapper.replaceChildren($("#configuration-template").content.cloneNode(true));
   const form = wrapper.querySelector("form");
+  const sectionNames = ["Administrator", "Source", "Destinations", "SSH keys", "Schedule"];
+  const sections = [...form.querySelectorAll(":scope > article.panel")];
+  const index = document.createElement("nav");
+  index.className = "configuration-nav";
+  index.setAttribute("aria-label", "Configuration sections");
+  for (const [position, section] of sections.entries()) {
+    section.classList.add("configuration-section");
+    const link = document.createElement("button");
+    link.type = "button";
+    link.className = "configuration-jump";
+    link.textContent = sectionNames[position];
+    link.addEventListener("click", () => {
+      for (const item of index.querySelectorAll("button")) item.removeAttribute("aria-current");
+      link.setAttribute("aria-current", "step");
+      section.scrollIntoView({behavior: "smooth", block: "start"});
+    });
+    if (position === 0) link.setAttribute("aria-current", "step");
+    index.append(link);
+  }
+  form.prepend(index);
   form.querySelector(".setup-code").hidden = !initial;
   form.querySelector(".current-password").hidden = initial;
   form.elements.code.required = initial;
