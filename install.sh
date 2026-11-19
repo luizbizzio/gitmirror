@@ -118,7 +118,8 @@ development_source() {
         fail 'Could not identify the downloaded Git commit'
     [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail 'Invalid development commit ID'
     tag="dev-${commit:0:12}"
-    (cd "$temp/checkout" && tar --no-recursion -czf "$temp/release.tar.gz" "${files[@]}") ||
+    (cd "$temp/checkout" && tar --sort=name --mtime='@0' --owner=0 --group=0 \
+        --numeric-owner --no-recursion -czf "$temp/release.tar.gz" "${files[@]}") ||
         fail 'Could not create the development package'
     checksum=$(sha256sum "$temp/release.tar.gz" | awk '{print $1}')
     verify_archive "$temp/release.tar.gz" "$checksum" "$temp/source"
