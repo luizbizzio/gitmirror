@@ -64,7 +64,10 @@ def test_authentication_revocation_expiration_and_headers(web_setup):
     app = app_for(web_setup, session_ttl=2)
     with TestClient(app, base_url='https://localhost') as client:
         assert client.get('/').status_code == 200
-        assert client.get('/assets/app.js').status_code == 200
+        script = client.get('/assets/app.js')
+        assert script.status_code == 200
+        assert client.get('/api/setup').status_code == 404
+        assert 'if (response.status === 404)' in script.text
         assert client.get('/assets/../gitmirror.py').status_code == 404
         for path in ('overview', 'session', 'backups', 'repositories', 'events'):
             assert client.get(f'/api/{path}').status_code == 401
