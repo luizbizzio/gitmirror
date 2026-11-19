@@ -20,10 +20,28 @@ services:
       - "127.0.0.1:8787:8787"
     volumes:
       - ./config.yml:/config/config.yml:ro
-      - ./docker/web-password:/config/web-password:ro
+      - type: bind
+        source: ./docker/web-password
+        target: /config/web-password
+        read_only: true
+        bind:
+          create_host_path: false
       - gitmirror-data:/data
+      - gitmirror-restores:/restores
       - ./docker/ssh:/home/gitmirror/.ssh:ro
-    command: ["--config", "/config/config.yml", "web", "--host", "0.0.0.0", "--allow-lan", "--port", "8787", "--password-file", "/config/web-password"]
+    command:
+      - --config
+      - /config/config.yml
+      - web
+      - --host
+      - 0.0.0.0
+      - --allow-lan
+      - --allow-insecure-http
+      - --password-file
+      - /config/web-password
+      - --restore-dir
+      - /restores
 
 volumes:
   gitmirror-data:
+  gitmirror-restores:

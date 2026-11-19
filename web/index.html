@@ -4,67 +4,126 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>GitMirror · Dashboard</title>
+  <title>GitMirror</title>
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
-  <div id="login" class="login-screen" hidden>
-    <form id="login-form" class="login-card">
-      <div class="mark large">G</div>
+  <noscript>Enable JavaScript to use the GitMirror dashboard.</noscript>
+  <main id="login" class="login" hidden>
+    <form id="login-form" class="panel login-card">
+      <span class="brand-mark" aria-hidden="true">↟</span>
       <h1>GitMirror</h1>
-      <p>Sign in to your local backup dashboard.</p>
+      <p>Sign in to manage your mirrors and backups.</p>
       <label for="login-password">Dashboard password</label>
-      <input id="login-password" type="password" autocomplete="current-password" required autofocus>
-      <button class="primary" type="submit">Sign in</button>
-      <div id="login-error" class="form-error" role="alert"></div>
+      <input id="login-password" type="password" autocomplete="current-password" maxlength="1024" required>
+      <button class="button primary" type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
     </form>
-  </div>
+  </main>
   <div id="shell" class="shell" hidden>
     <aside class="sidebar">
-      <div class="identity"><div class="mark">G</div><div><strong>GitMirror</strong><small>Control Center</small></div></div>
-      <div class="side-caption">WORKSPACE</div>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">↟</span><strong>GitMirror</strong></div>
       <nav aria-label="Main navigation">
-        <button class="nav-item active" data-view="overview"><span class="nav-icon">◫</span> Overview</button>
-        <button class="nav-item" data-view="repositories"><span class="nav-icon">⑂</span> Repositories</button>
-        <button class="nav-item" data-view="destinations"><span class="nav-icon">◇</span> Destinations</button>
-        <button class="nav-item" data-view="backups"><span class="nav-icon">▤</span> Backups</button>
-        <button class="nav-item" data-view="activity"><span class="nav-icon">▦</span> Activity</button>
-        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span> Settings</button>
+        <button data-view="overview"><span aria-hidden="true">▤</span>Overview</button>
+        <button data-view="repositories"><span aria-hidden="true">⑂</span>Repositories</button>
+        <button data-view="destinations"><span aria-hidden="true">◇</span>Destinations</button>
+        <button data-view="backups"><span aria-hidden="true">⬡</span>Backups</button>
+        <button data-view="activity"><span aria-hidden="true">≡</span>Activity</button>
+        <button data-view="settings"><span aria-hidden="true">⚙</span>Settings</button>
       </nav>
-      <div class="sidebar-bottom"><span class="online-dot"></span><span>Self-hosted · Local first</span><button id="logout" title="Sign out">↪</button></div>
+      <button id="logout" class="button secondary">Sign out</button>
     </aside>
     <main class="main">
       <header class="topbar">
-        <div class="breadcrumb"><span>GitMirror</span><span class="slash">/</span><strong id="section-name">Overview</strong></div>
-        <div class="top-actions"><span id="heartbeat" class="connection-state"><span class="online-dot"></span> Connected</span><span id="time-now"></span></div>
+        <span id="connection" class="connection">Connecting</span>
+        <button id="refresh" class="button secondary">Refresh</button>
       </header>
       <div class="content">
-        <div class="page-heading"><div><div class="eyebrow">REPOSITORY PROTECTION</div><h1 id="page-title">Overview</h1><p id="page-subtitle">Monitor your mirrors and local backups.</p></div><button id="refresh-button" class="outline">↻ Refresh</button></div>
-        <div id="notice" class="notice" hidden role="status"></div>
-        <section id="view-overview" class="view">
-          <div id="stats" class="stats-grid"></div>
-          <div class="two-col">
-            <article class="panel"><div class="panel-head"><div><h2>Synchronization</h2><p>Run the same GitMirror CLI safely</p></div><span id="engine-state" class="pill">Idle</span></div>
-              <form id="sync-form" class="sync-form">
-                <div class="field-row"><div><label for="sync-repo">Repository</label><input id="sync-repo" placeholder="All repositories (optional)" maxlength="100"></div><div><label for="sync-mode">Mode</label><select id="sync-mode"><option value="dry">Dry-run</option><option value="apply">Apply changes</option></select></div></div>
-                <label for="sync-target">Destination</label><select id="sync-target"><option value="">All configured destinations</option></select>
-                <div id="sync-confirm-wrap" hidden><label for="sync-confirm">Type the confirmation shown below</label><input id="sync-confirm" placeholder="SYNC or SYNC ALL" autocomplete="off"><p class="hint">Required before applying changes. A full run can modify every selected mirror.</p></div>
-                <div class="form-footer"><span id="actions-help">Manual actions are disabled by the server.</span><button id="run-button" class="primary" type="submit">Start dry-run</button></div>
-              </form>
+        <header class="page-heading"><h1 id="page-title">Overview</h1><p id="page-context"></p></header>
+        <p id="notice" class="notice" role="status" hidden></p>
+        <section id="view-overview">
+          <dl id="stats" class="stats"></dl>
+          <div class="grid">
+            <article class="panel">
+              <header><h2>Active operations</h2><span id="active-count" class="pill"></span></header>
+              <div id="active-list"></div>
             </article>
-            <article class="panel"><div class="panel-head"><div><h2>Latest activity</h2><p>Last runs started from the web dashboard</p></div><button class="text-button" data-go="activity">View all</button></div><div id="recent-runs"></div></article>
+            <article class="panel">
+              <header><h2>Local backup health</h2><button data-go="backups" class="link">Open backups</button></header>
+              <div id="health"></div>
+            </article>
           </div>
-          <article class="panel"><div class="panel-head"><div><h2>Live output</h2><p>Latest dashboard-triggered GitMirror job</p></div><span id="live-status" class="pill">No run</span></div><pre id="live-log" class="terminal">No run selected. Start a dry-run to see output here.</pre></article>
+          <div class="grid">
+            <article class="panel">
+              <header><h2>Recent errors</h2></header>
+              <div id="errors"></div>
+            </article>
+            <article class="panel">
+              <header><h2>Recent activity</h2><button data-go="activity" class="link">View all</button></header>
+              <div id="recent"></div>
+            </article>
+          </div>
         </section>
-        <section id="view-repositories" class="view" hidden><article class="panel"><div class="panel-head"><div><h2>Source repositories</h2><p>Read-only inventory from the configured provider</p></div><button id="load-repositories" class="outline">Load from source</button></div><div id="repositories-list" class="empty-state">Click “Load from source” to securely query the provider API.</div></article></section>
-        <section id="view-destinations" class="view" hidden><div id="destinations-list" class="tile-grid"></div></section>
-        <section id="view-backups" class="view" hidden><div id="backups-list" class="tile-grid"></div><p class="footnote">Backup and restore operations are managed by the CLI. The web dashboard is read-only for these operations.</p></section>
-        <section id="view-activity" class="view" hidden><article class="panel"><div class="panel-head"><div><h2>Run history</h2><p>Jobs started through this web service</p></div></div><div id="activity-table"></div></article></section>
-        <section id="view-settings" class="view" hidden><article class="panel"><div class="panel-head"><div><h2>Current configuration</h2><p>Read-only view. Tokens are never shown.</p></div></div><div id="settings-list"></div><p class="hint">Edit the YAML configuration to change source, destinations, schedule or retention. Web-based configuration changes are intentionally not included in this first release.</p></article></section>
+        <section id="view-repositories" hidden>
+          <article class="panel">
+            <header><h2>Source inventory</h2><button id="discover" class="button secondary">Read source inventory</button></header>
+            <p id="inventory-time" class="muted"></p>
+            <div class="filters">
+              <label>Search <input id="repo-search" type="search" placeholder="Repository name"></label>
+              <label>Visibility <select id="repo-filter"><option value="">All</option><option>public</option><option>private</option><option>internal</option></select></label>
+              <label>Sync status <select id="status-filter"><option value="">All</option><option value="succeeded">Succeeded</option><option value="failed">Failed or blocked</option><option value="unobserved">Unobserved</option></select></label>
+            </div>
+            <div id="repositories" class="table-wrap"></div>
+          </article>
+          <article class="panel">
+            <header><h2>Manual synchronization</h2></header>
+            <form id="sync-form" class="action-form">
+              <label>Repository<input id="sync-repo" maxlength="100" placeholder="All repositories"></label>
+              <label>Mode<select id="sync-mode"><option value="dry">Dry-run</option><option value="apply">Apply changes</option></select></label>
+              <fieldset id="sync-targets"><legend>Destinations</legend><p>All configured destinations.</p></fieldset>
+              <label id="sync-confirm-label" hidden><span id="sync-required"></span><input id="sync-confirm" autocomplete="off"></label>
+              <div class="form-footer"><p id="actions-help"></p><button id="sync-submit" class="button primary">Start dry-run</button></div>
+            </form>
+          </article>
+        </section>
+        <section id="view-destinations" hidden><div id="destinations" class="grid"></div></section>
+        <section id="view-backups" hidden><div id="backups"></div></section>
+        <section id="view-activity" hidden>
+          <article class="panel">
+            <header><h2>Run history</h2>
+              <label>Origin <select id="activity-filter"><option value="">All</option><option value="web">Web</option><option value="cli">CLI</option><option value="cron">Cron</option><option value="scheduled">Scheduler</option></select></label>
+            </header>
+            <div id="activity" class="table-wrap"></div>
+          </article>
+          <article class="panel" id="log-panel" hidden>
+            <header><h2>Run output</h2><span id="log-status" class="pill"></span></header>
+            <p id="log-progress"></p>
+            <div id="log-results" class="table-wrap"></div>
+            <pre id="log" tabindex="0" aria-label="GitMirror log"></pre>
+          </article>
+        </section>
+        <section id="view-settings" hidden>
+          <article class="panel"><header><h2>Configuration</h2></header><div id="settings"></div></article>
+        </section>
       </div>
-      <footer class="footer">GitMirror · Private by design <span>Web dashboard preview</span></footer>
     </main>
   </div>
+  <dialog id="details-dialog">
+    <div class="dialog-head"><h2 id="details-title">Repository details</h2><button data-close="details-dialog" class="button secondary">Close</button></div>
+    <div id="details-content"></div>
+  </dialog>
+  <dialog id="restore-dialog">
+    <div class="dialog-head"><h2>Restore backup</h2><button data-close="restore-dialog" class="button secondary">Cancel</button></div>
+    <form id="restore-form" class="action-form">
+      <p id="restore-summary"></p>
+      <label>New directory name<input id="restore-name" required maxlength="100" autocomplete="off" placeholder="restored.git"></label>
+      <label class="check"><input id="restore-archive" type="checkbox">Include historical refs and their LFS data</label>
+      <label>Type RESTORE to confirm<input id="restore-confirm" required autocomplete="off"></label>
+      <p>The restored repository is written to the server’s configured restore directory. Existing paths are protected.</p>
+      <p id="restore-error" class="error" role="alert"></p>
+      <button class="button primary">Restore</button>
+    </form>
+  </dialog>
 </body>
 </html>
