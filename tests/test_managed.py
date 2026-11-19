@@ -179,6 +179,9 @@ def test_unconfigured_dashboard_has_preview_without_opening_private_apis(install
         assert 'if (previewMode || !csrf) return;' in script.text
         assert 'style="height:' not in script.text
         assert '.sidebar-status' in styles.text
+        assert '<meta name="color-scheme" content="dark">' in html.text
+        assert 'color-scheme: dark;' in styles.text
+        assert '--background: #101820;' in styles.text
         assert setup['code'] not in html.text
         assert setup['source']['token'] not in html.text
         assert client.get('/api/overview').status_code == 401
