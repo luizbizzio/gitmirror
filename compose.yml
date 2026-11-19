@@ -1,0 +1,15 @@
+services:
+  gitmirror:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yml:/config/config.yml:ro
+      - gitmirror-data:/data
+      # Mount SSH files prepared for the container account.
+      # Include verified known_hosts. Never use StrictHostKeyChecking=no.
+      - ./docker/ssh:/home/gitmirror/.ssh:ro
+    command: ["--config", "/config/config.yml", "run"]
+
+volumes:
+  gitmirror-data:

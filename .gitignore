@@ -1,0 +1,16 @@
+.env
+config.yml
+config.local.yml
+config.rpi5.yml
+*.token
+.secrets/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+gitmirror-data/
+docker/ssh/*
+!docker/ssh/.gitkeep

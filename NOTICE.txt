@@ -1,0 +1,1 @@
+Development note: GitMirror 0.1.0a1 is an initial package conversion of the proven github_resilient_mirror_v3.py engine. No live Git service tests were run on this package. Do not replace a working production installation yet.

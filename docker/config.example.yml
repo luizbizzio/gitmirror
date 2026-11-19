@@ -1,0 +1,17 @@
+version: 1
+source:
+  provider: github
+  owner: your-github-user
+  token_env: GITHUB_TOKEN
+destinations:
+  gitlab:
+    token_env: GITLAB_TOKEN
+  codeberg:
+    owner: your-codeberg-user
+    token_env: CODEBERG_TOKEN
+storage:
+  path: /data
+schedule:
+  interval_hours: 12
+retry:
+  delays_seconds: [3, 8, 20]

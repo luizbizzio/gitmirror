@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitmirror-resilient"
+version = "0.1.0a1"
+description = "Resilient Git mirroring across GitHub, GitLab and Codeberg"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["PyYAML>=6,<7", "filelock>=3,<4"]
+keywords = ["git", "backup", "mirror", "github", "gitlab", "codeberg"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+gitmirror = "gitmirror:main"
+
+[tool.setuptools]
+py-modules = ["gitmirror"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

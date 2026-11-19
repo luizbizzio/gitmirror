@@ -1,0 +1,14 @@
+.git
+.env
+config.yml
+config.local.yml
+config.rpi5.yml
+*.token
+.secrets/
+docker/ssh/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+gitmirror-data/
+dist/
+build/
