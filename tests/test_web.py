@@ -43,7 +43,7 @@ def test_web_authentication_and_security(web_setup):
     settings, config, assets = web_setup
     app = gitmirror.create_web_app(settings, config, password='long-secret-password',
                                    assets_dir=assets)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         assert client.get('/').status_code == 200
         assert client.get('/assets/app.js').status_code == 200
         assert client.get('/assets/../gitmirror.py').status_code == 404
@@ -68,7 +68,7 @@ def test_bad_host_rejected_and_login_rate_limited(web_setup):
     settings, config, assets = web_setup
     app = gitmirror.create_web_app(settings, config, password='long-secret-password',
                                    assets_dir=assets)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         assert client.get('/api/session', headers={'host': 'attacker.example'}).status_code == 400
         for _ in range(5):
             assert client.post('/api/login', json={'password': 'incorrect'}).status_code == 401
@@ -90,7 +90,7 @@ def test_web_write_requests_require_csrf_confirmation_and_permission(web_setup, 
     monkeypatch.setattr(gitmirror.subprocess, 'Popen', fake_popen)
     app = gitmirror.create_web_app(settings, config, password='long-secret-password',
                                    allow_actions=True, assets_dir=assets)
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://localhost") as client:
         csrf = login(client)
         assert client.post('/api/sync', json={'apply': False}).status_code == 403
         wrong_origin = client.post('/api/sync',
