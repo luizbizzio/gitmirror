@@ -128,14 +128,15 @@ function renderActivityChart(runs = []) {
   const maximum = Math.max(1, ...days.map((day) => day.successful + day.failed));
   const total = days.reduce((sum, day) => sum + day.successful + day.failed, 0);
   $("#chart-summary").textContent = total ? `${total} completed run${total === 1 ? "" : "s"}` : "No completed runs";
-  $("#activity-chart").innerHTML = days.map((day) => {
-    const good = day.successful / maximum * 100;
-    const bad = day.failed / maximum * 100;
-    return `<div class="chart-day" aria-label="${escape(day.name)}: ${day.successful} successful, ${day.failed} failed">
-      <div class="chart-column"><span class="chart-bar failed-bar" style="height:${bad}%"></span>
-      <span class="chart-bar success-bar" style="height:${good}%"></span></div>
-      <span class="chart-label">${escape(day.name)}</span></div>`;
-  }).join("");
+  $("#activity-chart").innerHTML = days.map((day) => `<div class="chart-day"
+    aria-label="${escape(day.name)}: ${day.successful} successful, ${day.failed} failed">
+      <div class="chart-column"><span class="chart-bar failed-bar"></span>
+      <span class="chart-bar success-bar"></span></div>
+      <span class="chart-label">${escape(day.name)}</span></div>`).join("");
+  all("#activity-chart .chart-day").forEach((node, index) => {
+    node.querySelector(".success-bar").style.height = `${days[index].successful / maximum * 100}%`;
+    node.querySelector(".failed-bar").style.height = `${days[index].failed / maximum * 100}%`;
+  });
 }
 
 function renderPreviewView() {
