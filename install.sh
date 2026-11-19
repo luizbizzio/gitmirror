@@ -20,11 +20,15 @@ fail() { printf 'GitMirror: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 GitMirror installer and maintenance
-  install  [--port PORT] [--lan HOST_OR_IPV4]
-  status | check | upgrade | rollback | uninstall
-  install and upgrade accept --tag vX.Y.Z and --yes (approve missing apt dependencies).
-  A trusted offline release needs --artifact FILE --sha256 HEX --tag vX.Y.Z.
-  Confirmation phrases are separate from --yes. See the installation guide.
+  (no command)  Install if absent, otherwise update the managed installation
+  install [--port PORT] [--lan HOST_OR_IPV4]
+  upgrade | status | check | rollback | uninstall
+  --dev           Use current development main instead of a published release
+  --tag vX.Y.Z    Select an immutable stable release
+  --artifact FILE --sha256 HEX --tag vX.Y.Z   Install a trusted offline archive
+  --yes           Approve installing missing apt dependencies
+  Without a published stable release, interactive runs can choose main.
+  Updates keep configuration, backups and service settings. See INSTALL.md.
 EOF
 }
 
@@ -95,8 +99,32 @@ verify_archive() {
     tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$source"
 }
 
+development_source() {
+    local temp=$1 commit
+    [[ -z "$artifact" && -z "$checksum" && -z "$tag" ]] ||
+        fail 'Development snapshots cannot be combined with release tags or offline artifacts'
+    command -v git >/dev/null || fail 'Development installation requires Git'
+    printf 'Fetching the current GitMirror main branch (development version).\n'
+    git -c protocol.version=2 clone --quiet --depth=1 --branch main \
+        https://github.com/luizbizzio/gitmirror.git "$temp/checkout" ||
+        fail 'Could not clone the GitMirror development branch'
+    commit=$(git -C "$temp/checkout" rev-parse HEAD) ||
+        fail 'Could not identify the downloaded Git commit'
+    [[ "$commit" =~ ^[a-f0-9]{40}$ ]] || fail 'Invalid development commit ID'
+    tag="dev-${commit:0:12}"
+    (cd "$temp/checkout" && tar --no-recursion -czf "$temp/release.tar.gz" "${files[@]}") ||
+        fail 'Could not create the development package'
+    checksum=$(sha256sum "$temp/release.tar.gz" | awk '{print $1}')
+    verify_archive "$temp/release.tar.gz" "$checksum" "$temp/source"
+    printf 'Verified local package from main commit %s (SHA-256 %s)\n' "$commit" "$checksum"
+}
+
 release_source() {
-    local temp=$1 release pin checked_digest expected_url metadata
+    local temp=$1 release pin checked_digest expected_url metadata http_code
+    if ((development)); then
+        development_source "$temp"
+        return
+    fi
     if [[ -n "$artifact" ]]; then
         [[ -f "$artifact" && "$checksum" =~ ^[a-f0-9]{64}$ && -n "$tag" ]] ||
             fail 'Offline artifacts require an existing file, a SHA-256 pin and a release tag'
@@ -105,7 +133,18 @@ release_source() {
         [[ -z "$checksum" ]] || fail 'Use --sha256 with --artifact'
         release="$release_api/latest"
         [[ -z "$tag" ]] || release="$release_api/tags/$tag"
-        download_https "$release" "$temp/release.json" || fail 'Unable to fetch a release from GitHub'
+        http_code=$(curl -q --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --tlsv1.2 --max-redirs 5 --connect-timeout 10 --max-time 90 --max-filesize 8388608 \
+            --write-out '%{http_code}' --output "$temp/release.json" "$release") ||
+            fail 'Unable to check GitHub releases'
+        if [[ "$http_code" == 404 && -z "$tag" ]]; then
+            printf 'No published stable release exists.\n'
+            confirm DEV 'Continue with the changing development main branch? This is not an immutable release.'
+            development_source "$temp"
+            return
+        fi
+        [[ "$http_code" == 200 ]] ||
+            fail "GitHub releases returned HTTP $http_code (not installing unverified code)"
         metadata=$(jq -er --arg asset "$asset" '
             select(.immutable == true and .draft == false and .prerelease == false)
             | .tag_name as $tag
@@ -125,14 +164,30 @@ release_source() {
     printf 'Verified %s (%s)\n' "$tag" "$checksum"
 }
 
+select_action() {
+    if [[ "$action" != auto ]]; then
+        return
+    fi
+    if [[ -f "$app/current/version" ]]; then
+        action=upgrade
+    elif [[ -e "$app" || -L "$app" || -e "$state" || -L "$state" ||
+            -e "$etc" || -L "$etc" || -e "$unit_dir/$web" || -L "$unit_dir/$web" ||
+            -e "$unit_dir/$scheduler" || -L "$unit_dir/$scheduler" ]]; then
+        fail 'A partial or retained managed installation exists; refusing to overwrite it'
+    else
+        action=install
+    fi
+}
+
 main() {
-    action=install
+    action=auto
     tag= checksum= artifact= confirmation= lan=
-    approve=0 port=8787
+    approve=0 development=0 port=8787
     case "${1:-}" in install|upgrade|rollback|uninstall|status|check) action=$1; shift;; esac
     while (($#)); do
         case "$1" in
             --yes) approve=1; shift; continue ;;
+            --dev) development=1; shift; continue ;;
             --help|-h) usage; exit 0 ;;
         esac
         (($# >= 2)) || fail "Missing value for $1"
@@ -144,12 +199,16 @@ main() {
         shift 2
     done
     [[ -z "$tag" || "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Use a stable release tag such as v1.2.3'
+    if ((development)) && [[ -n "$tag" || -n "$artifact" || -n "$checksum" ]]; then
+        fail 'Use either --dev or a specific stable/offline release, not both'
+    fi
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1024 && 10#$port <= 65535)) || fail 'Use a port from 1024 to 65535'
     port=$((10#$port))
     [[ -z "$lan" || "$lan" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || fail 'Use a LAN hostname or IPv4 address'
     require_platform
     exec 9>/run/lock/gitmirror-managed-install.lock
     flock -n 9 || fail 'Another GitMirror installation or maintenance operation is active'
+    select_action
     case "$action" in
         status)
             if [[ -f "$app/current/version" ]]; then
@@ -185,7 +244,7 @@ main() {
     trap 'rm -rf -- "$temporary"' EXIT
     release_source "$temporary"
     if [[ "$action" == check ]]; then
-        printf 'Available verified release: %s\n' "$tag"
+        printf 'Available verified package: %s\n' "$tag"
         return 0
     fi
     source "$temporary/source/packaging/lifecycle.sh"
