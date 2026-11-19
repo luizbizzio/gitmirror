@@ -247,8 +247,10 @@
       </article>
       <article class="panel">
         <header><h2>SSH keys</h2></header>
-        <p>Add this public key to the source and each remote destination account. Give it write access only where GitMirror pushes.</p>
+        <p>In each provider’s account settings, add the public key below under SSH keys. Give it write access only where GitMirror pushes.</p>
         <pre data-public-key></pre>
+        <label class="check"><input name="ssh_key_added" type="checkbox">I added this public key to each remote account.</label>
+        <p>Use <strong>Verify connections</strong> with SSH enabled in Settings to verify Git access after saving.</p>
         <div class="action-form">
           <label>SSH hostname<input name="ssh_host" placeholder="codeberg.org" autocomplete="off"></label>
           <label>Port<input name="ssh_port" type="number" min="1" max="65535" value="22"></label>

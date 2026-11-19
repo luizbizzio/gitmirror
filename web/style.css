@@ -186,6 +186,12 @@ legend { color: var(--muted); font-size: .9rem; padding: 0 5px; }
 .configuration .target-fields fieldset { margin-bottom: 12px; }
 .configuration pre { margin: 9px 0 12px; min-height: 0; }
 .target-head { display: flex; justify-content: end; }
+.account-connection { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 4px; }
+.account-heading, .account-actions { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+.account-heading, .account-connection .data { margin: 0 0 8px; }
+.account-actions, .account-connection details, .account-connection label { margin: 7px 0; }
+.account-connection code, .account-connection dd, [data-account-message] { overflow-wrap: anywhere; }
+.account-connection [hidden] { display: none; }
 .check { display: inline-flex; align-items: center; gap: 8px; margin: 3px 10px 6px 0; }
 .check input { flex: 0 0 auto; }
 .data { display: grid; grid-template-columns: minmax(130px, 1fr) minmax(0, 2fr); gap: 8px 18px; margin: 4px 0; }

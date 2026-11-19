@@ -87,9 +87,90 @@ forwarding.
 
 ## Setup in the browser
 
-Open the printed URL to view the dashboard and read the available settings before configuration. The empty state is a preview, not live repository data. Select **Setup** in the top-right corner and enter the one-time code. Set the administrator password, provider accounts and tokens, local disks and remote destinations, repository names, schedule and retention. Register the public key shown by the dashboard in the provider's account UI. The dashboard can match a host key against the provider's published SSH fingerprint. **Settings → Verify connections** checks API authentication and can sample an SSH read. This check does not establish push permissions. Select **Start scheduled applied synchronizations** when ready.
+Open the printed URL and select **Setup**. Enter the one-time code and choose the administrator password, source, destinations, repositories and schedule. For each remote account, choose **Connect account** if its OAuth app is registered, or **Configure manually (API token)**. Add the dashboard’s SSH public key to each account and verify each server’s host key against its published fingerprint. **Settings → Verify connections** can check the API and sample an SSH read. Enable scheduled applied synchronization after checking access.
 
 A managed local destination gets its own directory automatically. External disks and NAS paths must already be mounted and writable by the service account. The advanced CLI is available at `/opt/gitmirror-managed/current/venv/bin/gitmirror`.
+
+## Register OAuth apps for browser authorization
+
+Open the managed dashboard at the HTTPS address your browser will use every time,
+for example `https://rpi5:8787`. The provider redirects the browser to that address
+after approval. The Raspberry Pi can stay on your LAN. Use a certificate trusted
+by your browser. When TLS terminates at a reverse proxy, preserve the configured
+Host and omit callback query strings from reverse-proxy access logs.
+
+| Provider | Register the app and grant access |
+| --- | --- |
+| GitHub | Create a **GitHub App** with expiring user tokens and **Device Flow** enabled. Leave the webhook inactive. Copy the **Client ID** and install the app on the account being connected. For a source, grant Metadata read and select the repositories GitMirror should see. For a destination, grant Administration write and install for all repositories so GitMirror can create new ones. GitHub App installation permissions and the signed-in user’s access both apply. |
+| GitLab | In **Applications**, register an app with the exact GitLab callback below. Enable `read_api` for a source and `api` for a destination. For device approval, use a public application on GitLab 17.9 or later and allow the `device_code` grant. If the instance lacks device approval or refreshable device credentials, use browser approval. |
+| Codeberg | In **Settings → Applications**, register a public OAuth2 application for the exact Codeberg callback below. Forgejo OAuth grants broad account access. Confirm that grant in GitMirror, or choose a scoped manual API token. |
+| Gitea | On each Gitea 1.x instance starting with 1.23, register a public OAuth2 application under **Settings → Applications** for the exact Gitea callback below. GitMirror requests User read plus Repository read for sources, and User read plus Repository write for destinations. |
+
+See the provider documentation for [GitHub Apps](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app), [GitLab OAuth](https://docs.gitlab.com/api/oauth2/), [Forgejo OAuth](https://forgejo.org/docs/latest/user/authentication/oauth2-provider/) and [Gitea OAuth](https://docs.gitea.com/development/oauth2-provider/).
+
+Create `/var/lib/gitmirror-managed/oauth-apps.json` outside the repository.
+Restrict the file to mode `0600` and make it readable by the GitMirror service
+user. Replace each example Client ID with the provider-issued value and omit
+registrations you will not use.
+
+```json
+[
+  {
+    "provider": "github",
+    "client_id": "YOUR_GITHUB_APP_CLIENT_ID"
+  },
+  {
+    "provider": "gitlab",
+    "client_id": "YOUR_GITLAB_APPLICATION_ID",
+    "redirect_uri": "https://rpi5:8787/api/managed/oauth/gitlab/callback",
+    "device": true
+  },
+  {
+    "provider": "codeberg",
+    "client_id": "YOUR_CODEBERG_APPLICATION_ID",
+    "redirect_uri": "https://rpi5:8787/api/managed/oauth/codeberg/callback"
+  },
+  {
+    "provider": "gitea",
+    "api_url": "https://gitea.example.net/api/v1",
+    "client_id": "YOUR_GITEA_APPLICATION_ID",
+    "redirect_uri": "https://rpi5:8787/api/managed/oauth/gitea/callback"
+  }
+]
+```
+
+For a confidential browser client, add `client_secret` to its private
+registration. GitHub Device Flow does not require one. A confidential GitLab
+client uses browser approval. For self-managed GitLab, set its exact HTTPS
+`api_url` ending in `/api/v4`. For private Gitea or GitLab servers, specify
+approved RFC 1918 or IPv6 ULA addresses explicitly, for example
+`"private_ips": ["192.168.10.20"]`. Use exact addresses and certificates trusted by
+the service’s TLS trust store. GitMirror pins connections to approved DNS
+answers and rejects redirects. The repository SSH hostname must match the
+registered server. Set `ssh_port` if the server advertises a port other than 22.
+Verify its host key separately. Each self-hosted instance needs its own registration.
+
+In the dashboard, choose the provider and API URL, then **Connect account**.
+For device approval, leave the configuration tab open and use the short code
+on the provider’s verification page. For browser approval, the registered
+callback must match the URI displayed in the account card exactly. A connected
+card means that the provider confirmed the account and repository API access.
+Write permissions and SSH Git access still depend on the account, app and keys.
+If you abandon setup after granting access, disconnect the draft connection
+before closing the editor or revoke the grant with the provider.
+
+Managed profiles store OAuth connection references. The service keeps access
+and refresh tokens in a private state directory and renews them for applied CLI
+and scheduled runs. A dry-run or `doctor` uses an existing valid access token.
+When it needs renewal, use **Check access** in Settings or run an applied sync.
+**Disconnect** erases GitMirror’s credentials and requests revocation on
+GitHub or GitLab. On Codeberg and Gitea, or if the revocation request fails,
+revoke the grant under **Manage permissions**. Reconnect or switch explicitly
+to a manual token to resume sync.
+
+Existing manual profiles need no migration. Older GitMirror versions cannot
+validate an OAuth profile. Switch back to manual tokens in Settings before
+rolling back to a version without OAuth.
 
 ## Replacing an experimental installation
 

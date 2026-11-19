@@ -22,7 +22,7 @@ GitMirror backs up Git history, branches, tags and Git LFS from GitHub, GitLab, 
 
 ## Requirements
 
-Python 3.11 or newer, Git, Git LFS and OpenSSH. Set up an API token and SSH access for the source and for each selected remote destination. A local destination needs storage access and uses the source credentials only.
+Python 3.11 or newer, Git, Git LFS and OpenSSH. Each remote account needs API authorization and SSH access. A local destination needs storage access and uses the source credentials only.
 
 ## Install
 
@@ -86,7 +86,7 @@ paths. Organization and group namespaces have not been validated.
 
 #### Self-hosted Gitea
 
-Choose **Gitea** in Setup or Settings. Enter the account, API token and the full
+Choose **Gitea** in Setup or Settings. For manual API authorization, enter the account, API token and the full
 HTTPS API URL, for example `https://git.example.com/api/v1`. If your server
 uses a subpath, include it before `/api/v1`. The same fields work in v2 YAML.
 
@@ -199,6 +199,26 @@ It preserves managed configuration, backups and service settings and supports
 rollback and uninstall. Old experimental cron jobs
 must be stopped separately before managed synchronization is enabled. Package and systemd support target Debian 12+ and Raspberry Pi OS
 ARM64. Use the standalone installation below for Windows or Docker.
+
+### Connect provider accounts in the browser
+
+In the managed HTTPS dashboard, **Setup** and **Settings** offer **Connect account**
+for GitHub, GitLab, Codeberg and Gitea. Register an OAuth app for each provider or
+self-hosted instance before using this option. GitHub uses GitHub App device
+approval. GitLab supports browser approval and can offer device approval.
+Codeberg and Gitea use browser approval. The dashboard address can stay
+private to your network. See [OAuth app registration](INSTALL.md#register-oauth-apps-for-browser-authorization).
+
+The account card shows the approved identity, token expiry and the latest
+successful authorization check. GitMirror stores and renews OAuth credentials
+for applied runs. Use **Reconnect** for expired or revoked grants and
+**Disconnect** to remove the current credentials. The SSH step still needs
+an authorized public key and a verified server host key. An API check cannot
+establish Git push access.
+
+**Configure manually (API token)** remains available. Standalone YAML
+configurations, Windows and the bundled standalone Compose service continue
+to use API tokens.
 
 ### Activity and monitoring
 

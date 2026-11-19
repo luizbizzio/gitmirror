@@ -3,6 +3,7 @@ config.yml
 config.local.yml
 config.rpi5.yml
 *.token
+oauth-apps.json
 .secrets/
 __pycache__/
 .pytest_cache/

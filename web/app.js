@@ -752,7 +752,194 @@ document.addEventListener("visibilitychange", () => {
 const providerLabels = {github: "GitHub", gitlab: "GitLab", codeberg: "Codeberg", gitea: "Gitea", local: "Local backup"};
 const providerLabel = (id) => Object.hasOwn(providerLabels, id) ? providerLabels[id] : id;
 
-function providerInput(spec = {}, destination = false) {
+const accountCards = new WeakMap();
+const oauthPath = "/api/managed/oauth";
+const accountDate = (value) => value ? new Date(value * 1000).toLocaleString() : "—";
+
+function accountCard(fieldset, spec, destination, setupData) {
+  const card = fieldset.querySelector(".account-connection");
+  const control = (name) => fieldset.querySelector('[name="' + name + '"]');
+  const element = (name) => card.querySelector("[data-account-" + name + "]");
+  const [provider, owner, apiUrl, token] = ["provider", "owner", "api_url", "token"].map(control);
+  const [connect, disconnect, check, manual, browser, device, launch, cancel, copy, permissions] =
+    ["connect", "disconnect", "check", "manual", "browser", "device", "launch", "cancel", "copy", "permissions"].map(element);
+  const context = () => ({provider: provider.value, api_url: apiUrl.value.trim() || null,
+    owner: owner.value.trim(), role: destination ? "destination" : "source", code: setupData()});
+  const states = {connected: "Connected", refresh_due: "Renewal due", disconnected: "Disconnected",
+    reconnect_required: "Reconnect required"};
+  let connection = spec.connection;
+  let manualMode = !connection && Boolean(spec.owner);
+  let options, flow, busy = false;
+
+  function render() {
+    const remote = provider.value !== "local";
+    const active = Boolean(connection && !manualMode);
+    const grant = flow && ["starting", "awaiting", "working"].includes(flow.status);
+    card.hidden = !remote;
+    token.closest("label").hidden = !manualMode;
+    token.disabled = !remote || !manualMode;
+    provider.disabled = active || busy || !!grant;
+    apiUrl.readOnly = owner.readOnly = active || busy || !!grant;
+    element("name").textContent = providerLabel(provider.value);
+    element("status").textContent = active ? states[connection.status] ?? "Check required" :
+      manualMode ? "Manual API token" : "Account not connected";
+    element("metadata").hidden = !active;
+    if (active) {
+      element("account").textContent = connection.account;
+      element("expiry").textContent = accountDate(connection.expires_at);
+      element("checked").textContent = accountDate(connection.last_checked);
+    }
+    connect.textContent = active ? "Reconnect" : "Connect account";
+    connect.disabled = busy || !!grant || location.protocol !== "https:";
+    disconnect.hidden = !active || connection.status === "disconnected";
+    check.hidden = !active || !["connected", "refresh_due"].includes(connection.status);
+    for (const button of [disconnect, check, manual]) button.disabled = busy || !!grant;
+    manual.textContent = manualMode ? "Use browser authorization" : "Configure manually (API token)";
+    const permissionsUrl = options?.permissions_url ?? (active ? connection.permissions_url : null);
+    permissions.hidden = !permissionsUrl;
+    if (permissionsUrl) permissions.href = permissionsUrl;
+    const callback = options?.callback || (provider.value !== "github" && location.protocol === "https:" ?
+      location.origin + oauthPath + "/" + provider.value + "/callback" : null);
+    element("callback").hidden = !callback;
+    element("redirect").textContent = callback || "";
+    browser.hidden = !!grant || !options?.methods?.includes("browser");
+    device.hidden = !!grant || !options?.methods?.includes("device");
+    browser.disabled = device.disabled = busy;
+    element("consent").hidden = !!grant || !options?.full_access;
+    element("grant").hidden = !grant;
+    launch.hidden = !flow?.url;
+    if (flow?.url) {
+      launch.href = flow.url;
+      launch.textContent = flow.method === "device" ? "Open provider verification page" : "Open provider authorization page";
+    }
+    element("code").textContent = flow?.user_code || "";
+    copy.hidden = !flow?.user_code || !navigator.clipboard;
+    element("deadline").textContent = flow?.expires_at ? "Approval expires " + accountDate(flow.expires_at) : "";
+    cancel.disabled = busy;
+  }
+
+  async function action(task) {
+    busy = true;
+    element("message").textContent = "";
+    render();
+    try { await task(); }
+    catch (error) { element("message").textContent = error.message; }
+    finally { busy = false; render(); }
+  }
+
+  async function monitor(identifier) {
+    try {
+      while (fieldset.isConnected && flow?.flow === identifier) {
+        await new Promise((resolve) => setTimeout(resolve, 1800));
+        if (!fieldset.isConnected || flow?.flow !== identifier) return;
+        const result = await post(oauthPath + "/flow/" + identifier + "/status");
+        if (flow?.flow !== identifier) return;
+        flow = result;
+        if (result.status === "connected") {
+          connection = result.connection;
+          owner.value = connection.account;
+          apiUrl.value = connection.api_url;
+          token.value = "";
+          manualMode = false;
+          options = flow = null;
+          element("message").textContent = "Provider API access checked. Complete SSH setup for Git transfers.";
+          render();
+          return;
+        }
+        if (result.status === "failed" || result.status === "cancelled") {
+          flow = null;
+          element("message").textContent = result.message;
+          render();
+          return;
+        }
+        render();
+      }
+    } catch (error) {
+      if (flow?.flow !== identifier) return;
+      flow = null;
+      element("message").textContent = error.message;
+      render();
+    }
+  }
+
+  connect.addEventListener("click", () => action(async () => {
+    options = null;
+    try { options = await post(oauthPath + "/options", context()); }
+    finally {
+      if (!options?.methods?.length) element("callback").open = true;
+    }
+    const message = !options.methods.length ? "Register the exact HTTPS callback displayed below." :
+      provider.value === "github" ? "Install the GitHub App on this account and grant repository permissions." :
+      options.scopes ? "Requested API permissions " + options.scopes : "Review the provider’s access request.";
+    element("message").textContent = message;
+  }));
+  function start(method) {
+    action(async () => {
+      flow = await post(oauthPath + "/start", {...context(), method,
+        ...(connection && !manualMode ? {connection: connection.id} : {}),
+        full_access_confirmed: element("confirm").checked});
+      monitor(flow.flow);
+    });
+  }
+  browser.addEventListener("click", () => start("browser"));
+  device.addEventListener("click", () => start("device"));
+  cancel.addEventListener("click", () => action(async () => {
+    const id = flow.flow;
+    const result = await post(oauthPath + "/flow/" + id + "/cancel");
+    flow = null;
+    element("message").textContent = result.message || "Approval already completed. Check the account connection.";
+    if (result.connection) {
+      connection = result.connection;
+      owner.value = connection.account;
+      apiUrl.value = connection.api_url;
+      token.value = "";
+      manualMode = false;
+    }
+  }));
+  copy.addEventListener("click", () => action(async () => {
+    await navigator.clipboard.writeText(flow.user_code);
+    element("message").textContent = "User code copied.";
+  }));
+  disconnect.addEventListener("click", () => {
+    if (!window.confirm("Disconnect this account? Syncs using this connection will stop until it is reconnected.")) return;
+    action(async () => {
+      const result = await post(oauthPath + "/connection/" + connection.id + "/disconnect", {code: setupData()});
+      connection = result.connection;
+      element("message").textContent = result.message;
+    });
+  });
+  check.addEventListener("click", () => action(async () => {
+    const result = await post(oauthPath + "/connection/" + connection.id + "/check", {code: setupData()});
+    connection = result.connection;
+    element("message").textContent = result.message;
+  }));
+  manual.addEventListener("click", () => {
+    manualMode = !manualMode;
+    if (!manualMode) {
+      token.value = "";
+      if (connection) {
+        provider.value = connection.provider;
+        apiUrl.value = connection.api_url;
+        owner.value = connection.account;
+      }
+    }
+    options = null;
+    element("message").textContent = manualMode ? "Enter an API token, or keep your existing manual credential if it applies." : "";
+    render();
+  });
+  for (const input of [provider, owner, apiUrl]) input.addEventListener("input", () => {
+    options = null;
+    element("confirm").checked = false;
+    element("message").textContent = "";
+    render();
+  });
+  if (location.protocol !== "https:") element("message").textContent = "Browser authorization requires HTTPS.";
+  accountCards.set(fieldset, {render, connection: () => manualMode ? null : connection,
+    method: () => manualMode ? "token" : "oauth", pending: () => busy || Boolean(flow)});
+  render();
+}
+
+function providerInput(spec = {}, destination = false, setupData) {
   const fieldset = document.createElement("fieldset");
   const choices = Object.entries(providerLabels).filter(([id]) => destination || id !== "local");
   fieldset.innerHTML = `
@@ -766,6 +953,37 @@ function providerInput(spec = {}, destination = false) {
       <label><span data-api-label>API URL (optional)</span><input name="api_url" type="url" autocomplete="off" placeholder="Provider default"></label>
       <label>API token<input name="token" type="password" autocomplete="new-password" maxlength="4096"></label>
     </div>
+    <section class="account-connection" aria-label="Provider account">
+      <div class="account-heading"><strong data-account-name></strong><span class="muted" data-account-status></span></div>
+      <dl class="data" data-account-metadata hidden>
+        <dt>Account</dt><dd data-account-account></dd>
+        <dt>Token expiry</dt><dd data-account-expiry></dd>
+        <dt>Last successful authorization check</dt><dd data-account-checked></dd>
+      </dl>
+      <div class="account-actions">
+        <button type="button" class="button secondary" data-account-connect>Connect account</button>
+        <button type="button" class="link" data-account-check hidden>Check access</button>
+        <button type="button" class="link" data-account-disconnect hidden>Disconnect</button>
+        <a data-account-permissions target="_blank" rel="noopener noreferrer" hidden>Manage permissions</a>
+        <button type="button" class="link" data-account-manual>Configure manually (API token)</button>
+      </div>
+      <details data-account-callback hidden><summary>App registration and callback URI</summary><code data-account-redirect></code></details>
+      <label class="check" data-account-consent hidden><input type="checkbox" data-account-confirm>
+        I approve Codeberg OAuth’s account-wide access.</label>
+      <div class="account-actions">
+        <button type="button" class="button secondary" data-account-device hidden>Start device approval</button>
+        <button type="button" class="button secondary" data-account-browser hidden>Start browser approval</button>
+      </div>
+      <div data-account-grant hidden>
+        <div class="account-actions">
+          <a data-account-launch target="_blank" rel="noopener noreferrer"></a>
+          <code data-account-code></code><button type="button" class="link" data-account-copy>Copy code</button>
+          <button type="button" class="link" data-account-cancel>Cancel approval</button>
+        </div>
+        <small data-account-deadline></small>
+      </div>
+      <div class="muted" role="status" aria-live="polite" data-account-message></div>
+    </section>
     <div class="action-form local-section">
       <label>Backup directory<input name="path" placeholder="Use managed backup directory"></label>
       <label>Minimum generations to keep<input name="keep" type="number" min="1" step="1" placeholder="Keep all"></label>
@@ -782,6 +1000,7 @@ function providerInput(spec = {}, destination = false) {
     control("days").value = spec.retention.days ?? "";
     control("automatic").checked = spec.retention.automatic;
   }
+  accountCard(fieldset, spec, destination, setupData);
   function syncFields() {
     const local = control("provider").value === "local";
     const localFields = fieldset.querySelector(".local-section");
@@ -796,6 +1015,7 @@ function providerInput(spec = {}, destination = false) {
     control("api_url").placeholder = gitea ? "https://git.example.com/api/v1" : "Provider default";
     fieldset.querySelector("[data-api-label]").textContent = gitea ? "Gitea API URL" : "API URL (optional)";
     control("keep").required = local && (control("days").value !== "" || control("automatic").checked);
+    accountCards.get(fieldset).render();
   }
   fieldset.addEventListener("input", syncFields);
   fieldset.addEventListener("change", syncFields);
@@ -818,6 +1038,10 @@ function readProvider(fieldset) {
     clean.owner = control("owner").value.trim();
     clean.api_url = control("api_url").value.trim() || null;
     clean.token = control("token").value.trim();
+    const card = accountCards.get(fieldset);
+    const connection = card.connection();
+    clean.auth_method = card.method();
+    if (connection) clean.oauth_id = connection.id;
   }
   return clean;
 }
@@ -870,9 +1094,11 @@ function openConfiguration(initial, data) {
   form.elements.repositories.value = (data.repositories ?? []).join("\n");
   form.elements.known_hosts.value = data.known_hosts ?? "";
   form.querySelector("[data-public-key]").textContent = data.public_key;
-  form.querySelector(".source-fields").append(providerInput(data.source));
+  const setupCode = () => form.elements.code.value.trim();
+  const sourceCard = providerInput(data.source, false, setupCode);
+  form.querySelector(".source-fields").append(sourceCard);
   const destinations = form.querySelector(".target-fields");
-  const addTarget = (dest) => destinations.append(providerInput(dest, true));
+  const addTarget = (dest) => destinations.append(providerInput(dest, true, setupCode));
   for (const dest of data.destinations ?? [{id: "local", provider: "local"}]) addTarget(dest);
   form.querySelector(".add-target").addEventListener("click", () => addTarget({}));
   form.querySelector(".verify-host").addEventListener("click", async (event) => {
@@ -943,8 +1169,16 @@ function openConfiguration(initial, data) {
       });
       if (current === sections.length) {
         const values = [
-          ["Source", form.querySelector(".source-fields [name=provider]").value],
-          ["Destinations", String(destinations.querySelectorAll("fieldset").length)],
+          ...[sourceCard, ...destinations.querySelectorAll("fieldset")].map((card, i) => {
+            const spec = readProvider(card);
+            const connection = accountCards.get(card).connection();
+            const label = i ? "Destination " + (spec.id || i) : "Source";
+            if (spec.provider === "local") return [label, providerLabel(spec.provider)];
+            return [label, providerLabel(spec.provider) + " · " + spec.owner + " · " +
+              (connection ? connection.status === "connected" ? "API authorized" : "API check required" : "Manual API token")];
+          }),
+          ["SSH public key", form.elements.ssh_key_added.checked ? "Installation confirmed by administrator" : "Install the public key before syncing"],
+          ["SSH host keys", form.elements.known_hosts.value.trim() ? "Entries supplied. SSH authentication still needs a connection check." : "Verification required"],
           ["Schedule interval", `${form.elements.hours.value} hours`],
           ["Automatic synchronization", form.elements.enabled.checked ? "Enabled" : "Disabled"],
         ];
@@ -997,6 +1231,10 @@ function openConfiguration(initial, data) {
     event.preventDefault();
     const submit = form.querySelector("button[type=submit]");
     const error = form.querySelector("[data-config-error]");
+    if ([sourceCard, ...destinations.querySelectorAll("fieldset")].some((card) => accountCards.get(card).pending())) {
+      error.textContent = "Finish or cancel provider approval before saving.";
+      return;
+    }
     submit.disabled = true;
     error.textContent = "";
     const configuration = {
@@ -1066,4 +1304,9 @@ $("#check-connections").addEventListener("submit", async (event) => {
     trigger.disabled = false;
   }
 });
-startDashboard().catch(signOut);
+const oauthReturn = location.hash;
+if (["#oauth-connected", "#oauth-failed"].includes(oauthReturn)) history.replaceState(null, "", "/");
+startDashboard().then(() => {
+  if (oauthReturn === "#oauth-connected") notify("Account authorized. Return to your configuration tab.");
+  if (oauthReturn === "#oauth-failed") notify("Authorization failed or expired. Return to your configuration tab.", true);
+}).catch(signOut);

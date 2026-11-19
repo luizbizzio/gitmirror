@@ -10,6 +10,8 @@ import datetime as dt
 import errno
 import fnmatch
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,9 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import sqlite3
+import ssl
 import stat
 import subprocess
 import sys
@@ -57,9 +61,14 @@ def _mapping(data, name):
     return data
 
 
-def _token_source(cfg, label):
+def _token_source(cfg, label, *, managed=False):
     if 'token' in cfg:
         raise ConfigError(f'{label}: plaintext token in config is not supported; use token_env or token_file')
+    if 'oauth_id' in cfg:
+        if (not managed or any(k in cfg for k in ('token_env', 'token_file'))
+                or not oauth_id(cfg['oauth_id'])):
+            raise ConfigError(f'{label}: OAuth connections must be configured in the managed dashboard')
+        return
     keys = [k for k in ('token_env', 'token_file') if k in cfg]
     if len(keys) != 1 or not isinstance(cfg[keys[0]], str) or not cfg[keys[0]].strip():
         raise ConfigError(f'{label}: specify exactly one token_env or token_file')
@@ -78,8 +87,8 @@ def _url(value, name):
     return value.rstrip('/')
 
 
-def provider_config(spec, label, *, owner_optional=False):
-    cfg = dict(_mapping(spec, label))
+def provider_config(spec, label, *, owner_optional=False, oauth_root=None, role='source'):
+    cfg = {k: v for k, v in _mapping(spec, label).items() if k not in ('_oauth_root', '_oauth_role')}
     provider = cfg.get('provider')
     if not isinstance(provider, str) or provider not in PROVIDER_APIS:
         raise ConfigError(f'{label}.provider must be github, gitlab, codeberg or gitea')
@@ -87,11 +96,13 @@ def provider_config(spec, label, *, owner_optional=False):
     if not (owner_optional and owner is None):
         if not isinstance(owner, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', owner) or owner in ('.', '..'):
             raise ConfigError(f'{label}.owner must be a provider account name')
-    _token_source(cfg, label)
+    _token_source(cfg, label, managed=oauth_root is not None)
     base = _url(cfg.get('api_url', PROVIDER_APIS[provider]), f'{label}.api_url')
     if provider == 'gitea' and not urlparse(base).path.endswith('/api/v1'):
         raise ConfigError(f'{label}.api_url must include Gitea’s /api/v1 path')
     cfg['api_url'] = base
+    if 'oauth_id' in cfg:
+        cfg.update(_oauth_root=oauth_root, _oauth_role=role)
     return cfg
 
 
@@ -136,7 +147,9 @@ def load_config(path):
     version = raw.get('version')
     if type(version) is not int or version not in (1, 2):
         raise ConfigError('version must be 1 or 2')
-    source = provider_config(raw.get('source'), 'source')
+    oauth_root = (file.parents[2] if version == 2 and file.name == 'config.yml'
+                  and file.parent.parent.name == 'configurations' and oauth_id(file.parent.name) else None)
+    source = provider_config(raw.get('source'), 'source', oauth_root=oauth_root)
     entries = raw.get('destinations')
     if version == 1:
         if source['provider'] != 'github':
@@ -174,7 +187,8 @@ def load_config(path):
             cfg = {'provider': 'local', 'path': local_path,
                    'retention': retention_config(cfg.get('retention'), f'{label}.retention')}
         else:
-            cfg = provider_config(cfg, label, owner_optional=version == 1 and platform == 'gitlab')
+            cfg = provider_config(cfg, label, owner_optional=version == 1 and platform == 'gitlab',
+                                  oauth_root=oauth_root, role='destination')
             account = platform, cfg['api_url'], (cfg.get('owner') or '').casefold()
             if account == (source['provider'], source['api_url'], source['owner'].casefold()):
                 raise ConfigError('The source account cannot also be a destination on the same host')
@@ -201,7 +215,9 @@ def load_config(path):
                    for repo in include)
             or len({repo.casefold() for repo in include}) != len(include)):
         raise ConfigError('repositories must be a list of distinct repository names')
-    return {'version': version, 'source': source, 'destinations': dests,
+    oauth_ssh = {'_oauth_ssh': file.parent / 'ssh.config'} if any(
+        'oauth_id' in cfg for cfg in (source, *dests.values())) else {}
+    return {'version': version, 'source': source, 'destinations': dests, **oauth_ssh,
             'storage': {'path': work_path}, 'retry': retry, 'schedule': schedule, 'repositories': include}
 
 
@@ -241,7 +257,7 @@ def configure_runtime(settings, *, apply):
                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'):
         SSH_ENV.pop(key, None)
     ssh = 'ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=yes -o UpdateHostKeys=no'
-    managed_ssh = SSH_ENV.get('GITMIRROR_MANAGED_SSH_CONFIG')
+    managed_ssh = str(settings.get('_oauth_ssh') or SSH_ENV.get('GITMIRROR_MANAGED_SSH_CONFIG') or '')
     if managed_ssh:
         ssh += f' -F {shlex.quote(managed_ssh)}'
     if apply:
@@ -282,6 +298,833 @@ def token(spec):
     return value
 
 
+# Browser-authorized provider credentials
+
+OAUTH_DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code'
+OAUTH_REAUTHORIZE = 'Provider authorization expired or was revoked. Reconnect the account.'
+OAUTH_PRIVATE_NETWORKS = tuple(map(ipaddress.ip_network, ('10.0.0.0/8', '172.16.0.0/12',
+                                                          '192.168.0.0/16', 'fc00::/7')))
+
+
+class OAuthError(SyncError):
+    pass
+
+
+class OAuthNetworkError(OAuthError):
+    pass
+
+
+class OAuthRevoked(OAuthError):
+    pass
+
+
+def oauth_id(value):
+    return isinstance(value, str) and re.fullmatch('[a-f0-9]{32}', value) is not None
+
+
+def oauth_api_url(provider, value):
+    if not isinstance(provider, str) or provider not in PROVIDER_APIS:
+        raise OAuthError('Choose a hosting provider')
+    if value is None or value == '':
+        value = PROVIDER_APIS[provider]
+    try:
+        value = _url(value, 'OAuth API URL')
+    except ConfigError:
+        raise OAuthError('Use the registered HTTPS API URL') from None
+    parts = urlparse(value)
+    origin = urlsplit_origin(f'https://{parts.netloc.lower()}')
+    if (not origin or parts.hostname.endswith('.') or '%' in parts.path
+            or re.fullmatch(r'(?:/[A-Za-z0-9_.-]+)*', parts.path) is None
+            or any(part in ('.', '..') for part in parts.path.split('/'))):
+        raise OAuthError('Use the registered HTTPS API URL')
+    host = f'[{parts.hostname}]' if ':' in parts.hostname else parts.hostname
+    authority = f'{host}:{parts.port}' if parts.port not in (None, 443) else host
+    base = f'https://{authority}{parts.path}'
+    if provider in ('github', 'codeberg'):
+        if base != PROVIDER_APIS[provider]:
+            raise OAuthError('This provider supports browser authorization only at its public service')
+    elif not parts.path.endswith('/api/v4' if provider == 'gitlab' else '/api/v1'):
+        raise OAuthError('Use the registered API URL including its version path')
+    return base
+
+
+def oauth_private_file(path):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid not in (os.geteuid(), 0)):
+            raise OAuthError('OAuth files must be regular files restricted to their owner (chmod 600)')
+        data = stream.read(262145)
+    if len(data) > 262144:
+        raise OAuthError('OAuth storage file exceeds the size limit')
+    try:
+        return json.loads(data)
+    except (ValueError, RecursionError):
+        raise OAuthError('OAuth storage contains invalid JSON') from None
+
+
+def oauth_secret(value, *, limit=32768):
+    return isinstance(value, str) and 0 < len(value) <= limit and value.isascii() and all(
+        33 <= ord(char) <= 126 for char in value)
+
+
+@dataclass(frozen=True)
+class OAuthApp:
+    provider: str
+    base: str
+    client_id: str
+    secret: str = field(repr=False)
+    redirect: str = ''
+    device: bool = False
+    private_ips: frozenset = frozenset()
+    ssh_port: int = 22
+
+    @property
+    def issuer(self):
+        if self.provider == 'github':
+            return 'https://github.com'
+        if self.provider == 'codeberg':
+            return 'https://codeberg.org'
+        return self.base.rsplit('/api/', 1)[0]
+
+    @property
+    def callback_path(self):
+        return f'/api/managed/oauth/{self.provider}/callback'
+
+    @property
+    def token_url(self):
+        suffix = '/oauth/token' if self.provider == 'gitlab' else '/login/oauth/access_token'
+        return self.issuer + suffix
+
+    @property
+    def permissions_url(self):
+        suffix = {'github': '/settings/installations', 'gitlab': '/-/user_settings/applications'}.get(
+            self.provider, '/user/settings/applications')
+        return self.issuer + suffix
+
+    def scopes(self, role):
+        if self.provider == 'github':
+            return 'offline_access'
+        if self.provider == 'gitlab':
+            return 'read_api' if role == 'source' else 'api'
+        if self.provider == 'gitea':
+            return 'read:user read:repository' if role == 'source' else 'read:user write:repository'
+        return ''
+
+    @property
+    def ssh_endpoint(self):
+        return urlparse(self.issuer).hostname, self.ssh_port
+
+
+def oauth_registration(data):
+    if not isinstance(data, dict):
+        raise OAuthError('Invalid OAuth application registration')
+    provider = data.get('provider')
+    base = oauth_api_url(provider, data.get('api_url'))
+    client, secret = data.get('client_id'), data.get('client_secret', '')
+    redirect, device = data.get('redirect_uri', ''), data.get('device', provider == 'github')
+    allowed, port = data.get('private_ips', []), data.get('ssh_port', 22)
+    if (not isinstance(client, str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,256}', client)
+            or (secret != '' and not oauth_secret(secret, limit=1024)) or type(device) is not bool
+            or type(port) is not int or not 1 <= port <= 65535 or not isinstance(allowed, list)
+            or len(allowed) > 16 or not isinstance(redirect, str)):
+        raise OAuthError('Invalid OAuth application registration')
+    try:
+        ip_set = frozenset(ipaddress.ip_address(value) for value in allowed if isinstance(value, str))
+    except ValueError:
+        raise OAuthError('OAuth private address policy must use exact IP addresses') from None
+    if (any(not isinstance(value, str) for value in allowed)
+            or any(not any(ip in network for network in OAUTH_PRIVATE_NETWORKS) for ip in ip_set)
+            or ((ip_set or port != 22) and base == PROVIDER_APIS[provider])):
+        raise OAuthError('Private IP and nonstandard SSH port exceptions are for approved self-hosted instances')
+    app = OAuthApp(provider, base, client, secret, redirect, device, ip_set, port)
+    if provider == 'github':
+        if not device or redirect:
+            raise OAuthError('GitHub Apps use device authorization and require Device Flow to be enabled')
+    elif ((device and (provider != 'gitlab' or secret))
+          or (not redirect and not device)
+          or (redirect and (not redirect.endswith(app.callback_path)
+                            or not (origin := urlsplit_origin(redirect.removesuffix(app.callback_path)))
+                            or origin.scheme != 'https'))):
+        raise OAuthError('Register the exact HTTPS callback and use a public GitLab client for device authorization')
+    return app
+
+
+def oauth_app(root, provider, value):
+    if os.name == 'nt':
+        raise OAuthError('Browser authorization requires a managed host with private POSIX storage. Use an API token here.')
+    base = oauth_api_url(provider, value)
+    try:
+        registrations = oauth_private_file(root / 'oauth-apps.json')
+    except FileNotFoundError:
+        raise OAuthError('No OAuth app registered. Ask the server administrator to configure oauth-apps.json.') from None
+    except OSError:
+        raise OAuthError('Cannot read the OAuth application registry') from None
+    if not isinstance(registrations, list) or len(registrations) > 100:
+        raise OAuthError('OAuth application registry must contain a list of registrations')
+    matches = []
+    for data in registrations:
+        app = oauth_registration(data)
+        if (app.provider, app.base) == (provider, base):
+            matches.append(app)
+    if len(matches) != 1:
+        raise OAuthError('Register exactly one OAuth app for this provider and HTTPS API URL')
+    return matches[0]
+
+
+class OAuthHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a checked address without another DNS lookup of the provider hostname."""
+
+    def __init__(self, host, port, private_ips):
+        super().__init__(host, port, timeout=12, context=ssl.create_default_context())
+        self.private_ips = private_ips
+
+    def connect(self):
+        addresses = list(dict.fromkeys(
+            ipaddress.ip_address(result[4][0])
+            for result in socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)))
+        if not addresses or any(
+            ip not in self.private_ips and (not ip.is_global or ip.is_multicast or ip.is_reserved)
+            for ip in addresses
+        ):
+            raise OAuthError('Provider DNS returned an address outside the approved OAuth network policy')
+        deadline = time.monotonic() + self.timeout
+        for index, ip in enumerate(addresses):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                raw = socket.create_connection((str(ip), self.port), min(remaining, 5))
+            except OSError:
+                if index == len(addresses) - 1:
+                    raise
+            else:
+                break
+        try:
+            raw.settimeout(max(0.1, deadline - time.monotonic()))
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+            self.sock.settimeout(self.timeout)
+        except BaseException:
+            raw.close()
+            raise
+
+
+def oauth_http(url, *, private_ips=frozenset(), method='GET', headers=None, form=None, payload=None):
+    """HTTPS without proxies or redirects. Provider errors never include remote payloads."""
+    parts = urlparse(url)
+    if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password or parts.fragment:
+        raise OAuthError('Invalid OAuth request URL')
+    headers = dict(headers or {}, Accept='application/json')
+    body = None
+    if form is not None:
+        method, body = 'POST', urllib.parse.urlencode(form).encode('ascii')
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    elif payload is not None:
+        body = json.dumps(payload).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    path = (parts.path or '/') + (f'?{parts.query}' if parts.query else '')
+    try:
+        with closing(OAuthHTTPSConnection(parts.hostname, parts.port or 443, private_ips)) as connection:
+            connection.request(method, path, body, headers)
+            with connection.getresponse() as response:
+                status = response.status
+                if 300 <= status < 400:
+                    raise OAuthError('OAuth and provider API redirects are blocked')
+                raw = response.read((8 << 20) + 1)
+    except (OSError, http.client.HTTPException, ValueError):
+        raise OAuthNetworkError('Secure provider connection failed') from None
+    if len(raw) > (8 << 20):
+        raise OAuthError('Provider response exceeded the size limit')
+    try:
+        parsed = json.loads(raw) if raw else None
+    except (ValueError, RecursionError):
+        if status < 400:
+            raise OAuthError('Provider returned an invalid OAuth or API response') from None
+        parsed = None
+    return status, parsed
+
+
+def oauth_token_response(status, data):
+    # Use only known error categories. Some endpoints echo credentials in descriptions.
+    if status >= 500 or status in (408, 429):
+        raise OAuthNetworkError('Provider temporarily unavailable. Try again.')
+    error = data.get('error') if isinstance(data, dict) else None
+    if status != 200 or error:
+        return {'invalid_token': 'invalid_grant', 'bad_refresh_token': 'invalid_grant',
+                'token_expired': 'expired_token'}.get(error, error) if isinstance(error, str) else 'provider_error'
+    return None
+
+
+def oauth_tokens(data, previous=None):
+    now = time.time()
+    previous = previous or {}
+    access = data.get('access_token') if isinstance(data, dict) else None
+    refresh = data.get('refresh_token', previous.get('refresh_token')) if isinstance(data, dict) else None
+    lifetime = data.get('expires_in') if isinstance(data, dict) else None
+    refresh_lifetime = data.get('refresh_token_expires_in') if isinstance(data, dict) else None
+    if (not oauth_secret(access) or not oauth_secret(refresh)
+            or not isinstance(data.get('token_type'), str) or data['token_type'].lower() != 'bearer'
+            or type(lifetime) is not int or not 0 < lifetime <= 366 * 86400
+            or (refresh_lifetime is not None
+                and (type(refresh_lifetime) is not int or not 0 < refresh_lifetime <= 5 * 366 * 86400))):
+        raise OAuthError('Provider did not issue usable expiring credentials and a refresh token')
+    refresh_expiry = (now + refresh_lifetime if refresh_lifetime else
+                      previous.get('refresh_expires_at') if refresh == previous.get('refresh_token') else None)
+    return {'access_token': access, 'refresh_token': refresh, 'expires_at': now + lifetime,
+            'refresh_expires_at': refresh_expiry, 'refresh_at': now + lifetime - min(75, lifetime / 5)}
+
+
+def oauth_directory(root, *, create=False):
+    directory = root / 'oauth'
+    if os.name == 'nt':
+        raise OAuthError('OAuth credential storage requires private POSIX permissions')
+    if create:
+        directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.geteuid():
+        raise OAuthError('OAuth credential directory must be service-owned and private (chmod 700)')
+    return directory
+
+
+def oauth_file(root, identifier, *, create=False):
+    if not oauth_id(identifier):
+        raise OAuthError('Unknown OAuth connection')
+    return oauth_directory(root, create=create) / f'{identifier}.json'
+
+
+def oauth_record(root, identifier):
+    try:
+        result = oauth_private_file(oauth_file(root, identifier))
+    except FileNotFoundError:
+        raise OAuthError('OAuth account is disconnected. Reconnect or configure an API token.') from None
+    except OSError:
+        raise OAuthError('Cannot read private OAuth credentials') from None
+    if (not isinstance(result, dict) or result.get('status') not in ('connected', 'reconnect_required', 'disconnected')
+            or not isinstance(result.get('account'), str) or not isinstance(result.get('client_id'), str)
+            or type(result.get('account_id')) is not int or not isinstance(result.get('api_url'), str)
+            or not isinstance(result.get('provider'), str) or result.get('role') not in ('source', 'destination')
+            or type(result.get('last_checked')) not in (int, float)
+            or (result['status'] == 'connected'
+                and (type(result.get('expires_at')) not in (int, float)
+                     or type(result.get('refresh_at')) not in (int, float)
+                     or type(result.get('refresh_expires_at')) not in (type(None), int, float)
+                     or not oauth_secret(result.get('access_token'))))):
+        raise OAuthError('OAuth credential record is invalid')
+    return result
+
+
+def store_oauth(path, record):
+    temporary = path.with_name(f'.{path.stem}.{uuid.uuid4().hex}.tmp')
+    try:
+        private_text(temporary, json.dumps(record))
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    except OSError:
+        raise OAuthError('Cannot write private OAuth credentials') from None
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def oauth_binding(record, app, role, owner=None):
+    if ((record.get('provider'), record.get('api_url'), record.get('role')) != (app.provider, app.base, role)
+            or (owner is not None and record.get('account', '').casefold() != owner.casefold())):
+        raise OAuthError('OAuth connection belongs to a different provider, instance, account or role')
+
+
+def oauth_public(record, identifier):
+    state = record['status']
+    now = time.time()
+    if state == 'connected' and (
+            record.get('identity_pending') or now >= record['expires_at']
+            or (record.get('refresh_expires_at') and now >= record['refresh_expires_at'])):
+        state = ('refresh_due' if record.get('refresh_token') and
+                 (not record.get('refresh_expires_at') or now < record['refresh_expires_at']) else 'reconnect_required')
+    return {'id': identifier, 'status': state, 'account': record['account'],
+            'provider': record['provider'], 'api_url': record['api_url'], 'role': record['role'],
+            'expires_at': record.get('expires_at'), 'last_checked': record.get('last_checked')}
+
+
+def oauth_without_tokens(record, status):
+    keys = ('provider', 'api_url', 'role', 'account', 'account_id', 'client_id', 'last_checked')
+    return {**{key: record[key] for key in keys}, 'status': status}
+
+
+def oauth_headers(app, access):
+    headers = {'Authorization': f'Bearer {access}'}
+    if app.provider == 'github':
+        headers['X-GitHub-Api-Version'] = '2022-11-28'
+    return headers
+
+
+def oauth_account(app, access):
+    status, user = oauth_http(f'{app.base}/user', headers=oauth_headers(app, access), private_ips=app.private_ips)
+    if status == 401:
+        raise OAuthRevoked(OAUTH_REAUTHORIZE)
+    if status == 403:
+        raise OAuthError('Provider refused access to the authorized account')
+    key = 'username' if app.provider == 'gitlab' else 'login'
+    login = user.get(key) if isinstance(user, dict) else None
+    if (status != 200 or not isinstance(login, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', login)
+            or login in ('.', '..') or type(user.get('id')) is not int or user['id'] <= 0):
+        raise OAuthError('Cannot verify the provider account')
+    return login, user['id']
+
+
+def oauth_exchange(app, **parameters):
+    return oauth_http(app.token_url, private_ips=app.private_ips, form={
+        'client_id': app.client_id,
+        **({'client_secret': app.secret} if app.secret and app.provider != 'github' else {}),
+        **parameters})
+
+
+def oauth_gitlab_scope(app, role, account_id, data, access):
+    scope = data.get('scope')
+    if scope is None:
+        status, info = oauth_http(f'{app.issuer}/oauth/token/info', private_ips=app.private_ips,
+                                  headers=oauth_headers(app, access))
+        application = info.get('application') if isinstance(info, dict) else None
+        if (status != 200 or not isinstance(application, dict) or application.get('uid') != app.client_id
+                or info.get('resource_owner_id') != account_id or not isinstance(info.get('scope'), list)):
+            raise OAuthError('GitLab did not confirm the OAuth application and scope')
+        granted = info['scope']
+    else:
+        granted = scope.split() if isinstance(scope, str) else []
+    if app.scopes(role) not in granted:
+        raise OAuthError('GitLab did not grant the scope required for this account')
+
+
+def oauth_access(root, identifier, app, role, owner, *, refresh):
+    def checked_record():
+        record = oauth_record(root, identifier)
+        oauth_binding(record, app, role, owner)
+        if (record.get('client_id') != app.client_id or record.get('status') != 'connected'
+                or not oauth_secret(record.get('access_token'))):
+            raise OAuthError(OAUTH_REAUTHORIZE)
+        return record
+
+    record = checked_record()
+    if time.time() < record['refresh_at'] and not record.get('identity_pending'):
+        return record['access_token']
+    if not refresh:
+        if time.time() < record['expires_at'] and not record.get('identity_pending'):
+            return record['access_token']
+        raise OAuthError('OAuth credentials need renewal. Check the connection in Settings or run an applied sync.')
+    path = oauth_file(root, identifier)
+    try:
+        with FileLock(str(path.with_suffix('.lock')), timeout=25):
+            record = checked_record()
+            now = time.time()
+            if now >= record['refresh_at']:
+                expiration = record.get('refresh_expires_at')
+                if not oauth_secret(record.get('refresh_token')) or (expiration is not None and expiration <= now):
+                    store_oauth(path, oauth_without_tokens(record, 'reconnect_required'))
+                    raise OAuthError(OAUTH_REAUTHORIZE)
+                status, data = oauth_exchange(app, grant_type='refresh_token', refresh_token=record['refresh_token'])
+                error = oauth_token_response(status, data)
+                if error in ('invalid_grant', 'expired_token', 'invalid_client', 'incorrect_client_credentials'):
+                    store_oauth(path, oauth_without_tokens(record, 'reconnect_required'))
+                    raise OAuthError(OAUTH_REAUTHORIZE)
+                if error:
+                    raise OAuthError('Provider rejected OAuth renewal. Check the registered application or reconnect.')
+                record.update(oauth_tokens(data, previous=record), identity_pending=True)
+                # Rotation may already have invalidated the old pair. Save the new pair before the identity read.
+                store_oauth(path, record)
+            if record.get('identity_pending'):
+                try:
+                    account, account_id = oauth_account(app, record['access_token'])
+                except OAuthRevoked:
+                    store_oauth(path, oauth_without_tokens(record, 'reconnect_required'))
+                    raise
+                if account.casefold() != owner.casefold() or account_id != record.get('account_id'):
+                    store_oauth(path, oauth_without_tokens(record, 'reconnect_required'))
+                    raise OAuthError('Provider returned credentials for a different account. Reconnect the account.')
+                if app.provider == 'gitlab':
+                    oauth_gitlab_scope(app, role, account_id, {}, record['access_token'])
+                record.update(identity_pending=False, last_checked=time.time())
+                store_oauth(path, record)
+            return record['access_token']
+    except Timeout:
+        raise OAuthError('OAuth credential renewal is busy. Try again.') from None
+
+
+@dataclass(frozen=True, repr=False)
+class OAuthCredential:
+    root: Path
+    identifier: str
+    app: OAuthApp
+    role: str
+    owner: str
+    refresh: bool
+
+    def revoke_locally(self, access):
+        if self.refresh:
+            path = oauth_file(self.root, self.identifier)
+            with FileLock(str(path.with_suffix('.lock')), timeout=25):
+                record = oauth_record(self.root, self.identifier)
+                if record.get('access_token') == access:
+                    store_oauth(path, oauth_without_tokens(record, 'reconnect_required'))
+
+    def request(self, url, headers, method, payload):
+        if not url.startswith(self.app.base + '/'):
+            raise OAuthError('Provider API URL differs from the OAuth connection')
+        access = oauth_access(self.root, self.identifier, self.app, self.role, self.owner, refresh=self.refresh)
+        status, data = oauth_http(url, headers={**headers, **oauth_headers(self.app, access)}, method=method,
+                                  payload=payload, private_ips=self.app.private_ips)
+        if status == 401:
+            self.revoke_locally(access)
+            raise OAuthError(OAUTH_REAUTHORIZE)
+        return status, data
+
+    def check_account(self):
+        access = oauth_access(self.root, self.identifier, self.app, self.role, self.owner, refresh=self.refresh)
+        try:
+            account, account_id = oauth_account(self.app, access)
+        except OAuthRevoked:
+            self.revoke_locally(access)
+            raise
+        path = oauth_file(self.root, self.identifier)
+        if self.refresh:
+            with FileLock(str(path.with_suffix('.lock')), timeout=25):
+                record = oauth_record(self.root, self.identifier)
+                if account.casefold() != self.owner.casefold() or record.get('account_id') != account_id:
+                    raise OAuthError('OAuth account identity changed. Reconnect the account.')
+                if record.get('access_token') == access:
+                    store_oauth(path, {**record, 'last_checked': time.time()})
+        elif (account.casefold() != self.owner.casefold()
+              or oauth_record(self.root, self.identifier).get('account_id') != account_id):
+            raise OAuthError('OAuth account identity changed. Reconnect the account.')
+
+    def check_ssh(self, url):
+        if not valid_ssh_url(url):
+            raise OAuthError('Provider did not return a valid SSH repository URL')
+        if url.startswith('ssh://'):
+            parts = urlparse(url)
+            endpoint = parts.hostname, parts.port or 22
+        else:
+            host_and_path = url.split('@', 1)[1]
+            host = host_and_path.split(']:', 1)[0][1:] if host_and_path.startswith('[') else host_and_path.split(':', 1)[0]
+            endpoint = host.casefold(), 22
+        if endpoint != self.app.ssh_endpoint:
+            raise OAuthError('Repository SSH host or port differs from the registered provider instance')
+
+
+def github_installation(owner, role, request):
+    for page in range(1, 101):
+        status, data = request(f'/user/installations?per_page=100&page={page}')
+        items = data.get('installations') if isinstance(data, dict) else None
+        if status != 200 or not isinstance(items, list):
+            break
+        for item in items:
+            account = item.get('account') if isinstance(item, dict) else None
+            if (not isinstance(account, dict) or not isinstance(account.get('login'), str)
+                    or account['login'].casefold() != owner.casefold() or item.get('suspended_at')):
+                continue
+            permissions = item.get('permissions') or {}
+            if (type(item.get('id')) is int and item['id'] > 0 and isinstance(permissions, dict)
+                    and permissions.get('metadata') in ('read', 'write')
+                    and (role == 'source' or (permissions.get('administration') == 'write'
+                                             and item.get('repository_selection') == 'all'))):
+                return item['id']
+        if len(items) < 100:
+            break
+    raise OAuthError('GitHub App installation or repository permissions are missing for this account')
+
+
+def oauth_repository_access(app, role, account, access):
+    def read(path):
+        return oauth_http(app.base + path, private_ips=app.private_ips, headers=oauth_headers(app, access))
+
+    if app.provider == 'github':
+        installation = github_installation(account, role, read)
+        status, data = read(f'/user/installations/{installation}/repositories?per_page=1')
+        repos = data.get('repositories') if isinstance(data, dict) else None
+        if role == 'source' and not repos:
+            raise OAuthError('No repositories are authorized. Check the GitHub App installation and repository selection.')
+    elif app.provider == 'gitlab':
+        status, repos = read('/projects?owned=true&per_page=1')
+    else:
+        status, repos = read('/user/repos?limit=1')
+    if status != 200 or not isinstance(repos, list):
+        raise OAuthError('Provider did not confirm repository API access. Check app scopes and account permissions.')
+
+
+@dataclass(repr=False)
+class OAuthFlow:
+    app: OAuthApp
+    role: str
+    browser: str
+    session: str
+    origin: str
+    owner: str
+    connection: str
+    method: str
+    end: float
+    identifier: str = field(default_factory=lambda: uuid.uuid4().hex)
+    status: str = 'starting'
+    state: str = ''
+    verifier: str = ''
+    device_code: str = ''
+    user_code: str = ''
+    url: str = ''
+    expires_at: float | None = None
+    interval: int = 5
+    next_poll: float = 0
+    message: str = ''
+    result: dict | None = None
+
+    def finish(self, state, message=''):
+        self.status, self.message = state, message
+        self.state = self.verifier = self.device_code = self.user_code = self.url = ''
+
+    def public(self):
+        return {'flow': self.identifier, 'status': self.status, 'method': self.method,
+                'url': self.url or None, 'user_code': self.user_code or None,
+                'expires_at': self.expires_at, 'message': self.message, 'connection': self.result}
+
+
+class OAuthFlows:
+    """Short-lived grants remain in memory and are bound to one browser and local authorization."""
+
+    def __init__(self, installation, authorized):
+        self.installation = installation
+        self.authorized = authorized
+        self.flows = {}
+        self.lock = threading.Lock()
+
+    def get(self, identifier, browser, session, origin):
+        flow = self.flows.get(identifier)
+        if (flow is None or (flow.browser, flow.session, flow.origin) != (browser, session, origin)
+                or not self.authorized(flow.session)):
+            raise OAuthError('Authorization is unavailable. Start a new connection.')
+        if time.monotonic() >= flow.end and flow.status in ('starting', 'awaiting', 'working'):
+            flow.finish('failed', 'Approval expired. Start a new connection.')
+        return flow
+
+    def start(self, flow):
+        with self.lock:
+            now = time.monotonic()
+            self.flows = {key: item for key, item in self.flows.items() if item.end + 600 > now}
+            for item in self.flows.values():
+                if item.end <= now and item.status in ('starting', 'awaiting', 'working'):
+                    item.finish('failed', 'Approval expired. Start a new connection.')
+            if len(self.flows) >= 128 or sum(
+                    item.status in ('starting', 'awaiting', 'working') and item.end > now
+                    for item in self.flows.values()) >= 12:
+                raise OAuthError('Too many pending connections. Cancel one or wait for approval to expire.')
+            if any(item.connection == flow.connection and item.status in ('starting', 'awaiting', 'working')
+                   and item.end > now for item in self.flows.values()):
+                raise OAuthError('This account already has a pending connection')
+            self.flows[flow.identifier] = flow
+        try:
+            if flow.app.provider == 'gitea':
+                status, data = oauth_http(f'{flow.app.base}/version', private_ips=flow.app.private_ips)
+                version = data.get('version') if isinstance(data, dict) else None
+                match = re.match(r'^1\.(\d+)\.\d+(?:\+|$)', version) if isinstance(version, str) else None
+                if status != 200 or not match or int(match[1]) < 23:
+                    raise OAuthError('Browser authorization requires a Gitea 1.x release with granular scopes (1.23+)')
+            if flow.method == 'device':
+                self.start_device(flow)
+            else:
+                self.start_browser(flow)
+        except (OAuthError, OSError) as exc:
+            with self.lock:
+                flow.finish('failed', str(exc) if isinstance(exc, OAuthError) else 'Cannot start provider authorization')
+            raise
+        with self.lock:
+            return flow.public()
+
+    def start_device(self, flow):
+        app = flow.app
+        suffix, verify = (('/login/device/code', '/login/device') if app.provider == 'github'
+                          else ('/oauth/authorize_device', '/oauth/device'))
+        status, data = oauth_http(app.issuer + suffix, private_ips=app.private_ips,
+                                  form={'client_id': app.client_id, 'scope': app.scopes(flow.role)})
+        if oauth_token_response(status, data):
+            message = ('GitLab device approval is unavailable. Try browser approval or check the application grants.'
+                       if app.provider == 'gitlab' else 'GitHub device approval failed. Check the App Client ID and enable Device Flow.')
+            raise OAuthError(message)
+        if not isinstance(data, dict):
+            raise OAuthError('Provider returned invalid device approval details')
+        url = data.get('verification_uri')
+        code, user_code, lifetime = data.get('device_code'), data.get('user_code'), data.get('expires_in')
+        interval = data.get('interval', 5)
+        if (url != app.issuer + verify or not oauth_secret(code, limit=2048)
+                or not isinstance(user_code, str) or not re.fullmatch(r'[A-Za-z0-9-]{4,32}', user_code)
+                or code == user_code or type(lifetime) is not int or not 0 < lifetime <= 3600
+                or type(interval) is not int or not 1 <= interval <= 3600):
+            raise OAuthError('Provider returned invalid device approval details')
+        with self.lock:
+            if flow.status != 'starting':
+                return
+            flow.status, flow.device_code, flow.user_code, flow.url = 'awaiting', code, user_code, url
+            now = time.monotonic()
+            flow.interval, flow.end = interval, min(flow.end, now + lifetime)
+            flow.next_poll, flow.expires_at = now + interval, time.time() + max(0, flow.end - now)
+
+    def start_browser(self, flow):
+        app = flow.app
+        verifier = secrets.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode('ascii')).digest()).decode().rstrip('=')
+        state = secrets.token_urlsafe(32)
+        path = '/oauth/authorize' if app.provider == 'gitlab' else '/login/oauth/authorize'
+        query = {'client_id': app.client_id, 'redirect_uri': app.redirect, 'response_type': 'code',
+                 'state': state, 'code_challenge': challenge, 'code_challenge_method': 'S256'}
+        if scopes := app.scopes(flow.role):
+            query['scope'] = scopes
+        with self.lock:
+            if flow.status != 'starting':
+                return
+            flow.status, flow.verifier, flow.state = 'awaiting', verifier, state
+            flow.url = app.issuer + path + '?' + urllib.parse.urlencode(query)
+            flow.expires_at = time.time() + max(0, flow.end - time.monotonic())
+
+    def poll(self, identifier, browser, session, origin):
+        with self.lock:
+            flow = self.get(identifier, browser, session, origin)
+            if flow.method != 'device' or flow.status != 'awaiting' or time.monotonic() < flow.next_poll:
+                return flow.public()
+            code = flow.device_code
+            flow.status = 'working'
+        try:
+            status, data = oauth_exchange(flow.app, grant_type=OAUTH_DEVICE_GRANT, device_code=code)
+            error = 'slow_down' if status == 429 else oauth_token_response(status, data)
+            if error in ('authorization_pending', 'slow_down'):
+                hint = data.get('interval') if isinstance(data, dict) else None
+                self.defer(flow, error == 'slow_down', hint)
+            elif error:
+                self.fail(flow, {
+                    'expired_token': 'Approval expired. Start a new connection.',
+                    'access_denied': 'The provider did not receive consent.',
+                }.get(error, 'Device approval failed. Check the registration and permissions or retry in the browser.'))
+            else:
+                self.complete(flow, data)
+        except OAuthNetworkError:
+            self.defer(flow, True)
+        except (OAuthError, OSError, Timeout) as exc:
+            self.fail(flow, str(exc) if isinstance(exc, OAuthError) else 'Account storage is busy or unavailable. Try again.')
+        with self.lock:
+            return flow.public()
+
+    def defer(self, flow, slow, hint=None):
+        with self.lock:
+            if flow.status != 'working':
+                return
+            if time.monotonic() >= flow.end:
+                flow.finish('failed', 'Approval expired. Start a new connection.')
+                return
+            if slow:
+                flow.interval += 5
+            if type(hint) is int and 1 <= hint <= 3600:
+                flow.interval = max(flow.interval, hint)
+            flow.next_poll = time.monotonic() + flow.interval
+            flow.status = 'awaiting'
+
+    def callback(self, provider, query, browser, origin):
+        state = query.get('state')
+        if not isinstance(state, str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', state):
+            return False
+        with self.lock:
+            flow = next((item for item in self.flows.values() if item.state and
+                         secrets.compare_digest(item.state, state)), None)
+            if (not flow or flow.app.provider != provider or (flow.browser, flow.origin) != (browser, origin)
+                    or not self.authorized(flow.session) or flow.status != 'awaiting'):
+                return False
+            if time.monotonic() >= flow.end:
+                flow.finish('failed', 'Approval expired. Start a new connection.')
+                return False
+            verifier = flow.verifier
+            flow.state = flow.verifier = flow.url = ''
+            flow.status = 'working'
+        try:
+            if ('error' in query or not oauth_secret(query.get('code'), limit=2048)
+                    or ('iss' in query and query['iss'] != flow.app.issuer)):
+                raise OAuthError('The provider declined approval or returned an invalid response')
+            status, data = oauth_exchange(flow.app, grant_type='authorization_code', code=query['code'],
+                                          redirect_uri=flow.app.redirect, code_verifier=verifier)
+            if oauth_token_response(status, data):
+                raise OAuthError('Provider rejected the authorization code. Check the callback URI and try again.')
+            self.complete(flow, data)
+        except (OAuthError, OSError, Timeout) as exc:
+            self.fail(flow, str(exc) if isinstance(exc, OAuthError) else 'Account storage is busy or unavailable. Try again.')
+        return flow.status == 'connected'
+
+    def fail(self, flow, message):
+        with self.lock:
+            if flow.status == 'working':
+                flow.finish('failed', message)
+
+    def complete(self, flow, data):
+        app = flow.app
+        try:
+            record = oauth_tokens(data)
+        except OAuthError:
+            if app.provider == 'gitlab' and flow.method == 'device':
+                raise OAuthError('GitLab device approval did not issue refreshable credentials. Try browser approval.') from None
+            raise
+        account, account_id = oauth_account(app, record['access_token'])
+        if app.provider == 'gitlab':
+            oauth_gitlab_scope(app, flow.role, account_id, data, record['access_token'])
+        if flow.owner and flow.owner.casefold() != account.casefold():
+            raise OAuthError('Signed in to a different provider account. Reconnect with the configured account.')
+        oauth_repository_access(app, flow.role, account, record['access_token'])
+        with self.lock:
+            if (flow.status != 'working' or time.monotonic() >= flow.end or not self.authorized(flow.session)):
+                if flow.status == 'working':
+                    flow.finish('failed', 'Approval expired. Start a new connection.')
+                return
+            path = oauth_file(self.installation.root, flow.connection, create=True)
+            with FileLock(str(self.installation.work / '.gitmirror.lock'), timeout=0):
+                if not self.authorized(flow.session):
+                    flow.finish('failed', 'Dashboard authorization changed. Start a new connection.')
+                    return
+                with FileLock(str(path.with_suffix('.lock')), timeout=0):
+                    if path.exists():
+                        old = oauth_record(self.installation.root, flow.connection)
+                        oauth_binding(old, app, flow.role, account)
+                        if old['account_id'] != account_id:
+                            raise OAuthError('The provider account identity changed. Verify your login and app.')
+                    store_oauth(path, {**record, 'status': 'connected', 'provider': app.provider, 'role': flow.role,
+                                      'api_url': app.base, 'account': account, 'account_id': account_id,
+                                      'client_id': app.client_id, 'last_checked': time.time()})
+            flow.result = self.installation.oauth_status(flow.connection)
+            flow.finish('connected')
+
+    def cancel(self, identifier, browser, session, origin):
+        with self.lock:
+            flow = self.get(identifier, browser, session, origin)
+            if flow.status != 'connected':
+                flow.finish('cancelled', 'Connection cancelled.')
+            return flow.public()
+
+    def disconnect(self, identifier):
+        with self.lock:
+            for flow in self.flows.values():
+                if flow.connection == identifier and flow.status in ('starting', 'awaiting', 'working'):
+                    flow.finish('cancelled', 'Connection cancelled.')
+        path = oauth_file(self.installation.root, identifier)
+        with FileLock(str(self.installation.work / '.gitmirror.lock'), timeout=0):
+            with FileLock(str(path.with_suffix('.lock')), timeout=0):
+                record = oauth_record(self.installation.root, identifier)
+                store_oauth(path, oauth_without_tokens(record, 'disconnected'))
+        try:
+            app = oauth_app(self.installation.root, record['provider'], record['api_url'])
+            tokens = [record[key] for key in ('refresh_token', 'access_token') if oauth_secret(record.get(key))]
+            if app.client_id == record['client_id'] and tokens:
+                if app.provider == 'github':
+                    status, _ = oauth_http(f'{app.base}/credentials/revoke', method='POST', payload={'credentials': tokens})
+                    if status == 202:
+                        return 'Provider revocation requested.'
+                elif app.provider == 'gitlab':
+                    client = {'client_id': app.client_id, **({'client_secret': app.secret} if app.secret else {})}
+                    statuses = [oauth_http(f'{app.issuer}/oauth/revoke', private_ips=app.private_ips,
+                                           form={**client, 'token': token})[0] for token in tokens]
+                    if all(status == 200 for status in statuses):
+                        return 'Provider revocation requested.'
+        except OAuthError:
+            pass
+        return 'Credentials removed here. Revoke the grant in the provider’s application settings.'
+
+
 def retry_notice(target, attempt, delay, reason):
     print(f'    RETRY {attempt}/{len(RETRY_DELAYS)} in {delay}s [{target}]: {reason}', flush=True)
     time.sleep(delay)
@@ -313,9 +1156,15 @@ def api(url, headers, method='GET', payload=None):
     data = None if payload is None else json.dumps(payload).encode('utf-8')
     h = dict(headers, Accept='application/json', **({'Content-Type':'application/json'} if data is not None else {}))
     retryable = method == 'GET'
+    credential = h.pop('_oauth', None)
     for attempt in range(len(RETRY_DELAYS) + 1):
-        req = urllib.request.Request(url, data=data, headers=h, method=method)
         try:
+            if credential:
+                status, response = credential.request(url, h, method, payload)
+                if status >= 400:
+                    raise urllib.error.HTTPError(url, status, 'Provider API request failed', {}, None)
+                return status, response
+            req = urllib.request.Request(url, data=data, headers=h, method=method)
             with API_OPENER.open(req, timeout=45) as res:
                 raw = res.read()
                 return res.status, json.loads(raw) if raw else None
@@ -327,7 +1176,7 @@ def api(url, headers, method='GET', payload=None):
                 retry_notice('API', attempt + 1, RETRY_DELAYS[attempt], f'HTTP {e.code}')
                 continue
             raise SyncError(f'Provider API returned HTTP {e.code}') from e
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OAuthNetworkError) as e:
             if retryable and attempt < len(RETRY_DELAYS):
                 retry_notice('API', attempt + 1, RETRY_DELAYS[attempt], type(e).__name__)
                 continue
@@ -679,8 +1528,13 @@ class Provider:
         return PROVIDER_LABELS[self.kind]
 
     @classmethod
-    def from_config(cls, spec):
+    def from_config(cls, spec, *, refresh=True):
         kind = spec['provider']
+        if 'oauth_id' in spec:
+            root = spec['_oauth_root']
+            app = oauth_app(root, kind, spec['api_url'])
+            credential = OAuthCredential(root, spec['oauth_id'], app, spec['_oauth_role'], spec['owner'], refresh)
+            return cls(kind, app.base, spec['owner'], {'_oauth': credential})
         secret = token(spec)
         if kind == 'gitlab':
             headers = {'PRIVATE-TOKEN': secret}
@@ -691,6 +1545,11 @@ class Provider:
         return cls(kind, spec['api_url'], spec.get('owner'), headers)
 
     def authenticate(self):
+        if credential := self.headers.get('_oauth'):
+            credential.check_account()
+            if self.kind == 'github' and credential.role == 'destination':
+                github_installation(self.owner, credential.role, lambda path: api(self.base + path, self.headers))
+            return self
         status, info = api(f'{self.base}/user', self.headers)
         field = 'username' if self.kind == 'gitlab' else 'login'
         login = info.get(field) if isinstance(info, dict) else None
@@ -731,6 +1590,8 @@ class Provider:
         if (type(info.get('id')) is not int or info['id'] <= 0
                 or not all(isinstance(value, str) and value for value in (owner, name, url))):
             raise SyncError(f'{self.label} repository identity changed or is invalid')
+        if credential := self.headers.get('_oauth'):
+            credential.check_ssh(url)
         branch = info.get('default_branch')
         if self.kind == 'gitea':
             if not valid_ssh_url(url):
@@ -758,9 +1619,15 @@ class Provider:
             'github': '/user/repos?affiliation=owner&visibility=all&per_page=100',
             'gitlab': '/projects?owned=true&statistics=true&per_page=100',
         }.get(self.kind, '/user/repos?limit=50')
+        github_oauth = self.kind == 'github' and '_oauth' in self.headers
+        if github_oauth:
+            installation = github_installation(self.owner, 'source', lambda path: api(self.base + path, self.headers))
+            query = f'/user/installations/{installation}/repositories?per_page=100'
         seen = set()
         for page in range(1, 101):
             status, items = api(f'{self.base}{query}&page={page}', self.headers)
+            if github_oauth and isinstance(items, dict):
+                items = items.get('repositories')
             if status != 200 or not isinstance(items, list):
                 raise SyncError(f'{self.label} returned an invalid repository list')
             for item in items:
@@ -839,6 +1706,8 @@ class Provider:
                 visibility = None
         if not isinstance(url, str) or not url or visibility not in ('private', 'public', 'internal'):
             raise SyncError(f'Cannot verify {self.kind} destination URL or visibility for {name}')
+        if credential := self.headers.get('_oauth'):
+            credential.check_ssh(url)
         if created and visibility != 'private':
             raise SyncError(f'New {self.kind} destination is not confirmed private for {name}')
         default_branch = obj.get('default_branch')
@@ -1975,8 +2844,8 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, ide
         if shutil.which(executable) is None:
             raise SyncError(f'Missing executable: {executable}')
     platforms = selected_platforms(settings, platform, identifiers)
-    source = Provider.from_config(settings['source'])
-    if source.kind == 'gitea':
+    source = Provider.from_config(settings['source'], refresh=apply)
+    if source.kind == 'gitea' or 'oauth_id' in settings['source']:
         source = source.authenticate()
     providers = {}
     volumes = {}
@@ -1993,7 +2862,7 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, ide
                 mounted.add(volume[0])
                 volumes[target] = (path, volume)
                 continue
-            provider = Provider.from_config(spec).authenticate()
+            provider = Provider.from_config(spec, refresh=apply).authenticate()
             if apply and provider.kind == 'gitlab':
                 with protection_scope(settings, spec):
                     recover_all_gl_permissions(provider.headers)
@@ -2187,7 +3056,7 @@ def doctor(config, *, network=False, ssh=False, only=None, platform='all', ident
 def doctor_network(settings, platforms, ssh, only, report):
     def connect(spec, name):
         try:
-            provider = Provider.from_config(spec)
+            provider = Provider.from_config(spec, refresh=False)
         except (SyncError, ValueError):
             report('ERROR', f'{name} credentials', 'configured token is missing or unreadable')
             return None
@@ -2354,7 +3223,13 @@ def redact_dashboard_log(message, values=()):
 def dashboard_secret_values(settings):
     values = set()
     for spec in (settings['source'], *settings['destinations'].values()):
-        if spec['provider'] != 'local':
+        if 'oauth_id' in spec:
+            try:
+                record = oauth_record(spec['_oauth_root'], spec['oauth_id'])
+                values.update(record[key] for key in ('access_token', 'refresh_token') if oauth_secret(record.get(key)))
+            except OAuthError:
+                pass
+        elif spec['provider'] != 'local':
             try:
                 values.update(token(spec).splitlines())
             except (SyncError, UnicodeError):
@@ -2729,8 +3604,14 @@ class ManagedInstallation:
 
     def settings(self, revision):
         raw = yaml.safe_load(revision.config.read_text('utf-8'))
-        return {'source': dashboard_destination(raw['source'], 'source'),
-                'destinations': [dashboard_destination(spec, spec['id']) for spec in raw['destinations']],
+        def describe(spec, identifier):
+            result = dashboard_destination(spec, identifier)
+            if 'oauth_id' in spec:
+                result['connection'] = self.oauth_status(spec['oauth_id'], spec)
+            return result
+
+        return {'source': describe(raw['source'], 'source'),
+                'destinations': [describe(spec, spec['id']) for spec in raw['destinations']],
                 'schedule': raw['schedule'], 'repositories': raw.get('repositories', []),
                 'known_hosts': (revision.path / 'known_hosts').read_text('utf-8'),
                 'public_key': self.public_key()}
@@ -2750,6 +3631,23 @@ class ManagedInstallation:
                 or not secrets.compare_digest(code.encode('utf-8'), expected.encode('utf-8'))):
             raise PermissionError('Incorrect setup code')
 
+    def oauth_status(self, identifier, spec=None):
+        if spec:
+            result = {'id': identifier, 'status': 'reconnect_required', 'account': spec['owner'],
+                      'provider': spec['provider'], 'api_url': spec['api_url']}
+        try:
+            record = oauth_record(self.root, identifier)
+            result = oauth_public(record, identifier)
+            app = oauth_app(self.root, record['provider'], record['api_url'])
+            result.update(permissions_url=app.permissions_url, ssh_host=app.ssh_endpoint[0], ssh_port=app.ssh_port)
+            if record['client_id'] != app.client_id:
+                result['status'] = 'reconnect_required'
+        except (OAuthError, ValueError, TypeError, KeyError):
+            if spec is None:
+                raise OAuthError('Cannot read OAuth connection. Check the application registration.') from None
+            result['status'] = 'reconnect_required'
+        return result
+
     def provider(self, row, label, old, revision):
         if not isinstance(row, dict) or not isinstance(row.get('provider'), str):
             raise ConfigError(f'{label} requires a provider')
@@ -2766,8 +3664,27 @@ class ManagedInstallation:
         credential = row.get('token', '')
         if not isinstance(credential, str) or len(credential) > 4096 or any(c.isspace() for c in credential):
             raise ConfigError(f'{label} needs a single-line API token')
+        role = 'source' if label == 'source' else 'destination'
+        connection = row.get('oauth_id')
+        if (not connection and row.get('auth_method') != 'token' and not credential and old):
+            connection = old.get('oauth_id')
+        if connection:
+            if credential or row.get('auth_method') == 'token':
+                raise ConfigError(f'{label} must use exactly one authorization method')
+            try:
+                app = oauth_app(self.root, provider, clean['api_url'])
+                record = oauth_record(self.root, connection)
+                oauth_binding(record, app, role)
+                if (not isinstance(clean.get('owner'), str) or
+                        clean['owner'].casefold() != record['account'].casefold()):
+                    raise OAuthError('OAuth account differs from the configured owner')
+                if record['status'] != 'connected' and (not old or connection != old.get('oauth_id')):
+                    raise OAuthError(OAUTH_REAUTHORIZE)
+            except OAuthError as exc:
+                raise ConfigError(f'{label}: {exc}') from exc
+            return {**clean, 'owner': record['account'], 'api_url': app.base, 'oauth_id': connection}
         if (not credential and old and all(clean.get(key) == old.get(key)
-                                          for key in ('provider', 'owner', 'api_url'))):
+                                          for key in ('provider', 'owner', 'api_url')) and 'oauth_id' not in old):
             credential = token(old)
         if not credential:
             raise ConfigError(f'{label} requires an API token')
@@ -2865,6 +3782,15 @@ class ManagedInstallation:
                            check=True, timeout=10, capture_output=True)
         except (OSError, subprocess.SubprocessError) as exc:
             raise ConfigError('SSH known_hosts file must contain valid host keys') from exc
+        for spec in (settings['source'], *settings['destinations'].values()):
+            if 'oauth_id' in spec:
+                app = oauth_app(self.root, spec['provider'], spec['api_url'])
+                host, port = app.ssh_endpoint
+                entry = host if port == 22 else f'[{host}]:{port}'
+                match = subprocess.run(['ssh-keygen', '-F', entry, '-f', str(revision.path / 'known_hosts')],
+                                       timeout=10, capture_output=True)
+                if match.returncode:
+                    raise ConfigError(f'Add a verified SSH host key for {entry} before saving')
         ssh_options = [('IdentityFile', self.identity), ('UserKnownHostsFile', revision.path / 'known_hosts')]
         for _, path in ssh_options:
             if any(c in str(path) for c in '"%\n\r'):
@@ -2929,7 +3855,7 @@ def validate_managed(installation):
         raise SyncError('The managed configuration does not use its private work directory')
     installation.credentials(revision)
     for spec in (settings['source'], *settings['destinations'].values()):
-        if spec['provider'] != 'local':
+        if spec['provider'] != 'local' and 'oauth_id' not in spec:
             token(spec)
     if not revision.ssh_config.is_file():
         raise SyncError('Managed SSH configuration is missing')
@@ -2943,7 +3869,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                    managed=None, revision=None, reload_config=None):
     try:
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+        from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
         from starlette.background import BackgroundTask
     except ImportError as exc:
         raise SyncError('Web dashboard requires: pip install "gitmirror-resilient[web]"') from exc
@@ -3135,6 +4061,170 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         return response
 
     if managed:
+        oauth_cookie = '__Host-gm_oauth'
+
+        def oauth_authorized(key):
+            try:
+                current_revision = managed.active()
+            except SyncError:
+                return False
+            if current_revision != revision:
+                return False
+            if pending_setup:
+                return key == ''
+            with auth_lock:
+                current = sessions.get(key)
+                return bool(current and current[0] > time.monotonic())
+
+        flows = OAuthFlows(managed, oauth_authorized)
+        app.state.oauth_flows = flows
+
+        def oauth_origin(request):
+            host = request.headers.get('host', '')
+            origin = public_origin or f'{request.url.scheme}://{host}'
+            parsed = urlsplit_origin(origin)
+            if not parsed or parsed.scheme != 'https' or parsed.netloc.lower() != host.lower():
+                raise HTTPException(403, 'Open the dashboard at its configured HTTPS address for browser authorization')
+            return origin
+
+        def oauth_browser(request, *, create=False):
+            value = request.cookies.get(oauth_cookie, '')
+            if re.fullmatch(r'[A-Za-z0-9_-]{43}', value):
+                return value
+            if create:
+                return secrets.token_urlsafe(32)
+            raise HTTPException(403, 'Start authorization in this browser')
+
+        def oauth_actor(request, data=None, *, start=False):
+            if not pending_setup:
+                auth(request, csrf=True)
+                key = request.cookies.get(cookie, '')
+                if not oauth_authorized(key):
+                    raise HTTPException(409, 'Dashboard configuration changed. Reload and sign in again.')
+                return key
+            if start:
+                ip, stamp = reserve_attempt(request)
+                try:
+                    managed.authorize_setup(data.get('code'))
+                    with auth_lock:
+                        attempts[ip].remove(stamp)
+                        if not attempts[ip]:
+                            del attempts[ip]
+                        global_attempts.remove(stamp)
+                except PermissionError:
+                    raise HTTPException(403, 'Incorrect setup code') from None
+                except (SyncError, OSError, UnicodeError):
+                    raise HTTPException(409, 'Initial setup is unavailable') from None
+                finally:
+                    login_slots.release()
+            return ''
+
+        def oauth_selection(data):
+            app = oauth_app(managed.root, data.get('provider'), data.get('api_url'))
+            role = data.get('role')
+            if role not in ('source', 'destination'):
+                raise OAuthError('Choose a source or destination account')
+            return app, role
+
+        @app.post('/api/managed/oauth/options')
+        async def oauth_options(request: _GitMirrorWebRequest):
+            origin, data = oauth_origin(request), await body(request)
+            oauth_actor(request, data, start=True)
+            try:
+                registration, role = await asyncio.to_thread(oauth_selection, data)
+            except OAuthError as exc:
+                raise HTTPException(422, str(exc)) from None
+            methods = ['device'] if registration.device else []
+            callback = origin + registration.callback_path
+            if registration.redirect == callback:
+                methods.append('browser')
+            return {'methods': methods, 'callback': callback if registration.provider != 'github' else None,
+                    'permissions_url': registration.permissions_url, 'scopes': registration.scopes(role),
+                    'full_access': registration.provider == 'codeberg'}
+
+        @app.post('/api/managed/oauth/start')
+        async def oauth_start(request: _GitMirrorWebRequest):
+            origin, data = oauth_origin(request), await body(request)
+            actor = oauth_actor(request, data, start=True)
+            browser = oauth_browser(request, create=True)
+            try:
+                registration, role = await asyncio.to_thread(oauth_selection, data)
+                method = data.get('method')
+                if ((method == 'device' and not registration.device)
+                        or (method == 'browser' and registration.redirect != origin + registration.callback_path)
+                        or method not in ('device', 'browser')):
+                    raise OAuthError('This method is unavailable. Verify the app registration and exact callback URI.')
+                if registration.provider == 'codeberg' and data.get('full_access_confirmed') is not True:
+                    raise OAuthError('Confirm the account-wide access requested by Codeberg OAuth')
+                owner = data.get('owner') or ''
+                identifier = data.get('connection')
+                if not isinstance(owner, str) or (owner and not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', owner)):
+                    raise OAuthError('Enter a valid provider account name')
+                if identifier is not None:
+                    record = await asyncio.to_thread(oauth_record, managed.root, identifier)
+                    oauth_binding(record, registration, role, owner or None)
+                    owner = record['account']
+                else:
+                    identifier = uuid.uuid4().hex
+                flow = OAuthFlow(registration, role, browser, actor, origin, owner, identifier, method,
+                                 time.monotonic() + (900 if method == 'device' else 600))
+                result = await asyncio.to_thread(flows.start, flow)
+            except (OAuthError, OSError) as exc:
+                raise HTTPException(422, str(exc) if isinstance(exc, OAuthError) else 'OAuth storage unavailable') from None
+            response = JSONResponse(result)
+            response.set_cookie(oauth_cookie, browser, secure=True, httponly=True, samesite='lax',
+                                max_age=1800, path='/')
+            return response
+
+        @app.get('/api/managed/oauth/{provider}/callback')
+        def oauth_callback(provider: str, request: _GitMirrorWebRequest):
+            origin = oauth_origin(request)
+            params = request.query_params
+            accepted = False
+            if all(len(params.getlist(key)) <= 1 for key in ('state', 'code', 'error', 'iss')):
+                accepted = flows.callback(provider, params, request.cookies.get(oauth_cookie, ''), origin)
+            return RedirectResponse('/#oauth-' + ('connected' if accepted else 'failed'), status_code=303)
+
+        @app.post('/api/managed/oauth/flow/{identifier}/{operation}')
+        def oauth_progress(identifier: str, operation: str, request: _GitMirrorWebRequest):
+            origin, browser = oauth_origin(request), oauth_browser(request)
+            actor = oauth_actor(request)
+            try:
+                if operation == 'status':
+                    return flows.poll(identifier, browser, actor, origin)
+                if operation == 'cancel':
+                    return flows.cancel(identifier, browser, actor, origin)
+            except OAuthError as exc:
+                raise HTTPException(409, str(exc)) from None
+            raise HTTPException(404, 'Unknown OAuth operation')
+
+        @app.post('/api/managed/oauth/connection/{identifier}/{operation}')
+        async def oauth_manage(identifier: str, operation: str, request: _GitMirrorWebRequest):
+            _, data = oauth_origin(request), await body(request)
+            oauth_actor(request, data, start=True)
+
+            def manage():
+                if operation == 'disconnect':
+                    message = flows.disconnect(identifier)
+                    return {'connection': managed.oauth_status(identifier), 'message': message}
+                if operation == 'check':
+                    record = oauth_record(managed.root, identifier)
+                    registration = oauth_app(managed.root, record['provider'], record['api_url'])
+                    credential = OAuthCredential(managed.root, identifier, registration, record['role'],
+                                                 record['account'], refresh=True)
+                    credential.check_account()
+                    access = oauth_access(managed.root, identifier, registration, credential.role, credential.owner,
+                                          refresh=True)
+                    oauth_repository_access(registration, credential.role, credential.owner, access)
+                    return {'connection': managed.oauth_status(identifier), 'message': 'Provider API access checked.'}
+                raise HTTPException(404, 'Unknown OAuth operation')
+
+            try:
+                return await asyncio.to_thread(manage)
+            except (OAuthError, OSError, Timeout) as exc:
+                raise HTTPException(409, str(exc) if isinstance(exc, OAuthError) else
+                                    'Account storage is busy. Wait for the sync to finish and retry.') from None
+
         @app.get('/api/setup')
         def setup_status():
             return {'required': pending_setup, 'public_key': managed.public_key() if pending_setup else None,
