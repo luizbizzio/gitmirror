@@ -99,6 +99,12 @@ verify_archive() {
     tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$source"
 }
 
+fetch_release_metadata() {
+    curl -q --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --tlsv1.2 --max-redirs 5 --connect-timeout 10 --max-time 90 --max-filesize 8388608 \
+        --write-out '%{http_code}' --output "$2" "$1"
+}
+
 development_source() {
     local temp=$1 commit
     [[ -z "$artifact" && -z "$checksum" && -z "$tag" ]] ||
@@ -121,7 +127,7 @@ development_source() {
 
 release_source() {
     local temp=$1 release pin checked_digest expected_url metadata http_code
-    if ((development)); then
+    if ((${development:-0})); then
         development_source "$temp"
         return
     fi
@@ -133,9 +139,7 @@ release_source() {
         [[ -z "$checksum" ]] || fail 'Use --sha256 with --artifact'
         release="$release_api/latest"
         [[ -z "$tag" ]] || release="$release_api/tags/$tag"
-        http_code=$(curl -q --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --tlsv1.2 --max-redirs 5 --connect-timeout 10 --max-time 90 --max-filesize 8388608 \
-            --write-out '%{http_code}' --output "$temp/release.json" "$release") ||
+        http_code=$(fetch_release_metadata "$release" "$temp/release.json") ||
             fail 'Unable to check GitHub releases'
         if [[ "$http_code" == 404 && -z "$tag" ]]; then
             printf 'No published stable release exists.\n'
