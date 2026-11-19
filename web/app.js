@@ -250,8 +250,10 @@ function renderStorageChart(chartId, noteId, records, options = {}) {
   legend.className = "donut-legend";
   slices.forEach((item, index) => {
     const row = document.createElement("li");
+    const percent = (item.bytes / total * 100).toFixed(1);
     row.innerHTML = `<span class="legend-swatch"></span><span class="legend-name" title="${escape(item.name)}">${escape(item.name)}</span>
-      <strong class="legend-value">${escape(size(item.bytes))}</strong>`;
+      <strong class="legend-value">${escape(size(item.bytes))}</strong>
+      <span class="legend-percent">${percent}%</span>`;
     row.querySelector(".legend-swatch").style.backgroundColor = storageColors[index];
     legend.append(row);
   });
