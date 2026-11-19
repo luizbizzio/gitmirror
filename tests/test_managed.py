@@ -179,7 +179,7 @@ def test_unconfigured_dashboard_has_preview_without_opening_private_apis(install
         assert 'id="backup-storage-chart"' in html.text
         assert 'id="repository-onboarding"' in html.text
         assert 'id="activity-panel"' in html.text
-        assert 'class="setup-wizard"' in script.text
+        assert 'form.classList.add("setup-wizard")' in script.text
         assert 'renderStorageChart(' in script.text
         assert 'warmupInventory()' in script.text
         assert 'configuration-jump' in script.text
