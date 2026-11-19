@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_FILES = [
     'INSTALL.md', 'LICENSE', 'NOTICE.txt', 'README.md', 'gitmirror.py', 'install.sh',
     'packaging/lifecycle.sh', 'pyproject.toml', 'web/app.js',
-    'web/index.html', 'web/style.css',
+    'web/index.html', 'web/style.css', 'web/fonts/LICENSE.md',
+    'web/fonts/source-sans-pro-regular.woff2', 'web/fonts/source-sans-pro-semibold.woff2', 'web/fonts/source-sans-pro-bold.woff2', 'web/fonts/source-sans-pro-italic.woff2',
 ]
 
 
