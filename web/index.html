@@ -10,6 +10,7 @@
 </head>
 <body>
   <svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
     <symbol id="icon-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></symbol>
     <symbol id="icon-repos" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10v3a6 6 0 0 1-6 6H8"/></symbol>
     <symbol id="icon-dest" viewBox="0 0 24 24"><path d="M4 8h16m-4-4 4 4-4 4M20 16H4m4-4-4 4 4 4"/></symbol>
@@ -40,30 +41,34 @@
     </form>
   </main>
   <div id="shell" class="shell" hidden>
-    <aside class="sidebar">
+    <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
       <div class="brand"><span class="brand-symbol" aria-hidden="true">G</span><strong>GitMirror</strong></div>
       <div class="sidebar-status" aria-live="polite">
         <span class="sidebar-status-caption">SYSTEM STATUS</span>
         <strong id="system-state"><span class="status-dot"></span> Configuration required</strong>
         <small id="system-detail">No source or backup destinations configured</small>
       </div>
-      <nav aria-label="Main navigation">
+      <nav id="main-navigation" aria-label="Main navigation">
         <div class="nav-heading">OVERVIEW</div>
-        <button data-view="overview"><svg class="nav-icon" aria-hidden="true"><use href="#icon-dashboard"></use></svg>Dashboard</button>
-        <button data-view="repositories"><svg class="nav-icon" aria-hidden="true"><use href="#icon-repos"></use></svg>Repositories</button>
-        <button data-view="destinations"><svg class="nav-icon" aria-hidden="true"><use href="#icon-dest"></use></svg>Destinations</button>
-        <button data-view="backups"><svg class="nav-icon" aria-hidden="true"><use href="#icon-backups"></use></svg>Backups</button>
+        <button type="button" data-view="overview" aria-label="Dashboard" title="Dashboard"><svg class="nav-icon" aria-hidden="true"><use href="#icon-dashboard"></use></svg><span class="nav-label">Dashboard</span></button>
+        <div class="nav-heading">MIRRORING</div>
+        <button type="button" data-view="repositories" aria-label="Repositories" title="Repositories"><svg class="nav-icon" aria-hidden="true"><use href="#icon-repos"></use></svg><span class="nav-label">Repositories</span></button>
+        <button type="button" data-view="destinations" aria-label="Destinations" title="Destinations"><svg class="nav-icon" aria-hidden="true"><use href="#icon-dest"></use></svg><span class="nav-label">Destinations</span></button>
+        <button type="button" data-view="backups" aria-label="Backups" title="Backups"><svg class="nav-icon" aria-hidden="true"><use href="#icon-backups"></use></svg><span class="nav-label">Backups</span></button>
         <div class="nav-heading">SYSTEM</div>
-        <button data-view="activity"><svg class="nav-icon" aria-hidden="true"><use href="#icon-activity"></use></svg>Activity log</button>
-        <button data-view="settings"><svg class="nav-icon" aria-hidden="true"><use href="#icon-settings"></use></svg>Settings</button>
+        <button type="button" data-view="activity" aria-label="Activity log" title="Activity log"><svg class="nav-icon" aria-hidden="true"><use href="#icon-activity"></use></svg><span class="nav-label">Activity log</span></button>
+        <button type="button" data-view="settings" aria-label="Settings" title="Settings"><svg class="nav-icon" aria-hidden="true"><use href="#icon-settings"></use></svg><span class="nav-label">Settings</span></button>
       </nav>
       <div class="sidebar-footer"><span>GitMirror</span><span id="sidebar-version">Web administration</span>
         <button id="logout" class="button secondary" hidden>Sign out</button>
       </div>
     </aside>
+    <button id="sidebar-backdrop" class="sidebar-backdrop" type="button" aria-label="Close navigation" hidden></button>
     <main class="main">
       <header class="topbar">
-        <div class="topbar-title"><span class="topbar-product">GitMirror</span><span class="topbar-divider">/</span><span id="topbar-location">Dashboard</span></div>
+        <div class="topbar-title">
+          <button id="nav-toggle" type="button" class="nav-toggle" aria-label="Collapse navigation" aria-controls="main-navigation" aria-expanded="true" title="Toggle navigation"><svg class="nav-toggle-icon" aria-hidden="true"><use href="#icon-menu"></use></svg></button>
+          <span class="topbar-product">GitMirror</span><span class="topbar-divider">/</span><span id="topbar-location">Dashboard</span></div>
         <div class="topbar-actions">
           <span id="connection" class="connection">Connecting</span>
           <button id="refresh" class="button secondary">Refresh</button>
@@ -71,7 +76,10 @@
         </div>
       </header>
       <div class="content">
-        <header class="page-heading"><h1 id="page-title">Dashboard</h1><p id="page-context"></p></header>
+        <header class="page-heading">
+          <div><h1 id="page-title">Dashboard</h1><p id="page-context"></p></div>
+          <span class="page-heading-meta">Git repositories &amp; backups</span>
+        </header>
         <p id="notice" class="notice" role="status" hidden></p>
         <section id="view-overview">
           <div id="setup-banner" class="setup-banner" hidden>
@@ -143,7 +151,7 @@
           </article>
         </section>
         <section id="view-settings" hidden>
-          <div id="settings-preview" class="settings-preview" hidden>
+          <div id="settings-preview" class="settings-preview settings-grid" hidden>
             <article class="panel"><header><h2>System configuration</h2><span class="pill">Not configured</span></header>
               <div class="setting-overview">
                 <div><strong>Source</strong><p>GitHub, GitLab or Codeberg</p></div>
