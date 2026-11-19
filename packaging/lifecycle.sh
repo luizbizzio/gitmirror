@@ -236,9 +236,18 @@ switch_release() {
 upgrade() {
     local installed newest
     installed=$(cat "$app/current/version")
-    [[ "$installed" != "$tag" ]] || fail "$tag is already installed"
-    newest=$(printf '%s\n%s\n' "$installed" "$tag" | sort -V | tail -n 1)
-    [[ "$newest" == "$tag" ]] || fail 'Use rollback to activate a previous release'
+    if [[ "$installed" == "$tag" ]]; then
+        printf 'GitMirror is already up to date (%s).\n' "$tag"
+        return 0
+    fi
+    # Development snapshots are identified by the checked-out commit, not SemVer.
+    # Stable releases remain monotonic; replacing a development snapshot with a
+    # stable release is permitted. Explicit rollback uses its own command.
+    if [[ "$installed" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ &&
+          "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        newest=$(printf '%s\n%s\n' "$installed" "$tag" | sort -V | tail -n 1)
+        [[ "$newest" == "$tag" ]] || fail 'Use rollback to activate a previous release'
+    fi
     confirm UPGRADE "Upgrade from $installed to $tag and restart the managed services."
     build_release
     switch_release "$candidate"
