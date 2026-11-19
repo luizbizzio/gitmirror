@@ -64,7 +64,8 @@ a { color: var(--blue-dark); }
 .sidebar nav button[aria-current="page"] {
   background: #344653; color: #fff; box-shadow: inset 3px 0 0 #68acd0;
 }
-.nav-icon { width: 20px; text-align: center; font-size: 1.12rem; line-height: 1; color: #b0c3ce; }
+.icon-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
+.nav-icon { flex: 0 0 18px; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; color: #b0c3ce; }
 .sidebar-footer {
   margin-top: auto; padding: 18px; border-top: 1px solid #3a4650; display: grid; gap: 3px;
   color: #bbc8d0; font-size: .79rem;
