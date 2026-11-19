@@ -143,8 +143,7 @@ release_source() {
         http_code=$(fetch_release_metadata "$release" "$temp/release.json") ||
             fail 'Unable to check GitHub releases'
         if [[ "$http_code" == 404 && -z "$tag" ]]; then
-            printf 'No published stable release exists.\n'
-            confirm DEV 'Continue with the changing development main branch? This is not an immutable release.'
+            printf 'No published stable release exists. Using the current main branch (development code).\n'
             development_source "$temp"
             return
         fi
