@@ -71,15 +71,96 @@ def test_metadata_pins_immutable_stable_asset(tmp_path, fault):
     result = shell('''
         tag= checksum= artifact=
         mkdir output
-        download_https() {
-            if [[ "$1" == "$release_api/latest" ]]; then cp metadata.json "$2";
-            else cp bundle.tar.gz "$2"; fi
+        fetch_release_metadata() {
+            cp metadata.json "$2"
+            printf '200'
         }
+        download_https() { cp bundle.tar.gz "$2"; }
         release_source output
         [[ "$tag" == v1.2.3 ]]
     ''', tmp_path)
     assert (result.returncode == 0) is (fault is None), result.stderr
     assert (tmp_path / 'output/source').exists() is (fault is None)
+
+
+def test_automatic_install_upgrade_selection_does_not_overwrite_partial_state(tmp_path):
+    result = shell("""
+        app="$PWD/app" state="$PWD/state" etc="$PWD/etc" unit_dir="$PWD/units"
+        web=web.service scheduler=scheduler.service
+        mkdir -p "$unit_dir"
+        action=auto
+        select_action
+        [[ "$action" == install ]]
+        mkdir -p "$app/current"
+        printf 'v0.0.3\\n' > "$app/current/version"
+        action=auto
+        select_action
+        [[ "$action" == upgrade ]]
+    """, tmp_path)
+    assert result.returncode == 0, result.stderr
+    partial = tmp_path / 'partial'
+    partial.mkdir()
+    failed = shell("""
+        app="$PWD/app" state="$PWD/state" etc="$PWD/etc" unit_dir="$PWD/units"
+        web=web.service scheduler=scheduler.service
+        mkdir -p "$app"
+        action=auto
+        select_action
+    """, partial)
+    assert failed.returncode != 0
+    assert 'refusing to overwrite' in failed.stderr
+
+
+def test_automatic_fallback_requires_explicit_development_confirmation(tmp_path):
+    result = shell("""
+        tag= checksum= artifact= development=0 confirmation=
+        mkdir output
+        fetch_release_metadata() { printf '404'; }
+        confirm() { [[ "$1" == DEV ]]; return 1; }
+        release_source output
+    """, tmp_path)
+    assert result.returncode != 0
+    assert 'No published stable release exists' in result.stdout
+    assert not (tmp_path / 'output/source').exists()
+
+
+def test_dev_source_packages_allowlisted_files_and_identifies_commit(tmp_path):
+    if not shutil.which('git'):
+        pytest.skip('git required')
+    project = tmp_path / 'fixture-repo'
+    project.mkdir()
+    for name in ARCHIVE_FILES:
+        dest = project / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, dest)
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(project)], check=True)
+    subprocess.run(['git', '-C', str(project), '-c', 'user.name=Test',
+                    '-c', 'user.email=test@example.invalid', 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(project), '-c', 'user.name=Test',
+                    '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+    actual = subprocess.check_output(['git', '-C', str(project), 'rev-parse', 'HEAD'], text=True).strip()
+    script = """
+        tag= checksum= artifact=
+        mkdir output
+        git() {
+            if [[ "$1" == -c && "$3" == clone ]]; then
+                command git clone --quiet "$FIXTURE" "${@: -1}"
+            else
+                command git "$@"
+            fi
+        }
+        development_source output
+        [[ "$tag" == "dev-${EXPECTED:0:12}" ]]
+        [[ "$checksum" =~ ^[a-f0-9]{64}$ ]]
+        [[ -f output/source/gitmirror.py ]]
+        [[ ! -e output/source/.git ]]
+        [[ "$(tar -tzf output/release.tar.gz | wc -l)" == "${#files[@]}" ]]
+    """
+    env = {**os.environ, 'PROJECT': str(ROOT), 'FIXTURE': str(project), 'EXPECTED': actual}
+    result = subprocess.run(['bash', '-c',
+                             'GITMIRROR_INSTALL_LIBRARY=1; source "$PROJECT/install.sh"; ' + script],
+                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
 
 
 def test_dependencies_require_approval_and_install_only_missing(tmp_path):
