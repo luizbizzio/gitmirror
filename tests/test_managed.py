@@ -1,6 +1,8 @@
 """Guided setup tests with synthetic passwords, tokens and SSH keys."""
 import base64
 import hashlib
+import io
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -164,7 +166,6 @@ def test_official_managed_cli_checks_recorded_guards_without_service_environment
     monkeypatch.setattr(gitmirror, 'MANAGED_SYSTEM_ETC', etc)
     monkeypatch.delenv('GITMIRROR_MIGRATION_GUARD', raising=False)
     monkeypatch.delenv('GITMIRROR_MAINTENANCE_GUARD', raising=False)
-    monkeypatch.delenv('GITMIRROR_LEGACY_LOCK_RECORD', raising=False)
     settings = {'storage': {'path': work}}
     (etc / 'migration-pending').touch()
     with pytest.raises(gitmirror.SyncError, match='paused'):
@@ -172,30 +173,61 @@ def test_official_managed_cli_checks_recorded_guards_without_service_environment
     assert not work.exists()
     (etc / 'migration-pending').unlink()
     (etc / 'legacy').mkdir()
-    with pytest.raises(gitmirror.SyncError, match='recorded legacy flock is missing'):
-        with gitmirror.legacy_sync_interlock(settings):
-            pytest.fail('Missing legacy interlock must block application writes')
+    assert gitmirror.managed_writes_blocked(settings)
+    (etc / 'migration-state').write_text('blocked\nLost power while cron was parked\n')
+    assert gitmirror.managed_writes_blocked(settings)
+    (etc / 'migration-state').write_text('complete\nOriginal cron parked\n')
+    assert not gitmirror.managed_writes_blocked(settings)
+    (etc / 'migration-pending').touch()
+    assert gitmirror.managed_writes_blocked(settings)
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux flock')
-def test_legacy_interlock_honors_busy_and_replaced_lock(tmp_path, monkeypatch):
+def test_cutover_flock_honors_live_inode_and_can_lease_a_recreated_file(tmp_path, monkeypatch, capsys):
     import fcntl
 
     lock = tmp_path / 'legacy'
     lock.touch()
-    lock_info = lock.stat()
-    record = tmp_path / 'legacy-lock'
-    record.write_text(f'{lock}\n{lock_info.st_dev} {lock_info.st_ino}\n')
-    monkeypatch.setenv('GITMIRROR_LEGACY_LOCK_RECORD', str(record))
+    expected = lock.stat().st_ino
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
     with lock.open('rb') as entry:
         fcntl.flock(entry, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(gitmirror.SyncError, match='busy'):
-            with gitmirror.legacy_sync_interlock():
-                pytest.fail('The old and new jobs acquired the same lock')
-    with gitmirror.legacy_sync_interlock():
-        pass
+        with pytest.raises(gitmirror.SyncError, match='old job holds'):
+            gitmirror.hold_legacy_flock(lock)
     lock.rename(tmp_path / 'previous-lock')
     lock.touch()
-    with pytest.raises(gitmirror.SyncError, match='inode changed'):
-        with gitmirror.legacy_sync_interlock():
-            pytest.fail('The inode changed without interrupting sync')
+    gitmirror.hold_legacy_flock(lock)
+    assert int(capsys.readouterr().out.split()[1]) != expected
+    pipe = tmp_path / 'named-pipe'
+    os.mkfifo(pipe)
+    with pytest.raises(gitmirror.SyncError, match='regular file'):
+        gitmirror.hold_legacy_flock(pipe)
+    link = tmp_path / 'link'
+    link.symlink_to(lock)
+    with pytest.raises(gitmirror.SyncError, match='without following links'):
+        gitmirror.hold_legacy_flock(link)
+
+
+@pytest.mark.parametrize('arguments', [
+    b'/usr/bin/python3\x00-u\x00/home/rpi5/bin/gitmirror.py\x00--apply',
+    b'/usr/bin/flock\x00-n\x00/tmp/gitmirror.lock\x00/usr/bin/python3\x00-u\x00/home/rpi5/bin/gitmirror.py',
+    b'/bin/sh\x00-c\x00/usr/bin/flock -n /tmp/gitmirror.lock /usr/bin/python3 -u /home/rpi5/bin/gitmirror.py --apply',
+    b'python3\x00-u\x00./gitmirror.py\x00--apply',
+])
+def test_known_legacy_process_blocks_application_without_reading_the_tmp_lock(tmp_path, arguments):
+    record = tmp_path / 'target'
+    record.write_text('/home/rpi5/bin/gitmirror.py\n')
+    proc = tmp_path / 'proc'
+    (proc / 'self').mkdir(parents=True)
+    mountinfo = proc / 'self/mountinfo'
+    mountinfo.write_text('44 24 0:16 / /proc rw,nosuid - proc proc rw\n')
+    process = proc / '123456789'
+    process.mkdir()
+    (process / 'cmdline').write_bytes(arguments)
+    with pytest.raises(gitmirror.SyncError, match='process 123456789'):
+        gitmirror.assert_legacy_job_inactive(record, proc=proc)
+    (process / 'cmdline').write_bytes(b'/opt/gitmirror-managed/current/venv/bin/python3\x00/elsewhere/gitmirror.py')
+    gitmirror.assert_legacy_job_inactive(record, proc=proc)
+    mountinfo.write_text('44 24 0:16 / /proc rw,nosuid - proc proc rw,hidepid=2\n')
+    with pytest.raises(gitmirror.SyncError, match='hides other users'):
+        gitmirror.assert_legacy_job_inactive(record, proc=proc)

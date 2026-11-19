@@ -204,7 +204,16 @@ main() {
     case "$action" in
         status)
             [[ ! -f "$app/current/version" ]] || printf 'Installed release: %s\n' "$(cat "$app/current/version")"
-            [[ ! -e "$etc/migration-pending" ]] || printf 'Migration pending. Applied runs are blocked.\n'
+            if [[ -f "$etc/migration-state" ]]; then
+                { read -r phase; read -r reason; } <"$etc/migration-state"
+                if [[ "$phase" == complete && -e "$etc/migration-pending" ]]; then
+                    phase=blocked
+                    reason='Cutover was interrupted before managed writes could be enabled. Run cutover again or roll back.'
+                fi
+                printf 'Migration: %s\n%s\n' "$phase" "$reason"
+            elif [[ -d "$etc/legacy" || -e "$etc/migration-pending" ]]; then
+                printf 'Migration: blocked\nNo completed handoff is recorded. Run cutover or rollback-migration.\n'
+            fi
             [[ ! -e "$etc/maintenance-pending" ]] || printf 'Maintenance pending. Applied runs are blocked.\n'
             detect_legacy
             return 0 ;;
@@ -229,7 +238,7 @@ main() {
         if [[ "$action" == migrate ]]; then
             [[ "$old_user" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ && "$old_line" =~ ^[1-9][0-9]{0,5}$ &&
                "$old_lock" == /* && "${#preserve[@]}" -gt 0 ]] ||
-                fail 'Choose an exact legacy user cron line, an existing flock path and the configuration files to preserve'
+                fail 'Choose an exact legacy user cron line, its flock path and the configuration files to preserve'
             confirm STAGE 'Stage an isolated dashboard. The original installation and schedule stay active.'
         fi
     else

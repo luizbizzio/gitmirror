@@ -118,6 +118,35 @@ def test_migration_refuses_cron_with_an_unrelated_second_command(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_migration_accepts_the_pi_cron_and_a_missing_tmp_flock(tmp_path):
+    result = shell('''
+        source "$PROJECT/packaging/legacy.sh"
+        line="0 0,12 * * * /usr/bin/flock -n /tmp/gitmirror.lock /usr/bin/python3 -u /home/rpi5/bin/gitmirror.py --apply >> /home/rpi5/gitmirror.log 2>&1"
+        selected_legacy_command "$line" /tmp/gitmirror.lock
+        [[ "$legacy_target" == /home/rpi5/bin/gitmirror.py ]]
+        old_lock="$PWD/temporary-future-lock"
+        valid_legacy_lock_path
+        ln -s target "$old_lock"
+        ! valid_legacy_lock_path
+    ''', tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(not shutil.which('jq'), reason='cron reload verification requires jq')
+def test_cron_reload_proof_excludes_older_and_unrelated_reload_events(tmp_path):
+    result = shell('''
+        source "$PROJECT/packaging/legacy.sh"
+        old_user=rpi5
+        echo '{"MESSAGE":"(rpi5) RELOAD (crontabs/rpi5)","__MONOTONIC_TIMESTAMP":"100"}' >old
+        ! cron_reloaded_after 100 <old
+        echo '{"MESSAGE":"(someone) RELOAD (crontabs/someone)","__MONOTONIC_TIMESTAMP":"101"}' >>old
+        ! cron_reloaded_after 100 <old
+        echo '{"MESSAGE":"(rpi5) RELOAD (crontabs/rpi5)","__MONOTONIC_TIMESTAMP":"102"}' >>old
+        cron_reloaded_after 100 <old
+    ''', tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize('startup', ['success', 'failure', 'previous-link-failure'])
 def test_upgrade_switch_and_failed_health_rollback(tmp_path, startup):
     result = shell(f'''

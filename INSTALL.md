@@ -28,21 +28,25 @@ A managed local destination gets its own directory automatically. External disks
 
 The installer's `status` command reports likely installations by path, process ID, cron owner and line number, or systemd unit. Reports omit cron command text and credentials. Detection covers conventional paths, user crontabs, system cron files and periodic directories. Scripts with unrelated names, remote schedulers and custom wrappers need operator review. Regular installation stops when it finds a potential legacy installation.
 
-Automated cutover supports one explicit **user crontab** entry invoking GitMirror through `flock -n` with an existing canonical lock path. The installer reports system cron jobs, periodic jobs, systemd services and additional GitMirror schedules for manual review. It leaves them untouched.
+Automated cutover supports one explicit **Debian user crontab** entry invoking an absolute GitMirror executable through `flock -n`. The lock may be temporary or absent at staging. The installer reports system cron jobs, periodic jobs, systemd services and additional GitMirror schedules for manual review. It leaves them untouched.
 
 Use a reviewed local copy of the bootstrap, or pass the same subcommand and flags after `sudo bash -s --` in the release command:
 
 ```sh
 sudo bash install.sh migrate \
-  --legacy-cron pi --cron-line 12 --legacy-lock /srv/gitmirror-legacy/gitmirror.lock \
-  --preserve /home/pi/gitmirror/config.yml --preserve /home/pi/.config/gitmirror/token
+  --legacy-cron rpi5 --cron-line 12 --legacy-lock /tmp/gitmirror.lock \
+  --preserve /home/rpi5/gitmirror/config.yml --preserve /home/rpi5/.config/gitmirror/token
 ```
 
 Repeat `--preserve` for each configuration, standalone script or credential **file** to capture. The old scheduler continues during staging. The installer writes root-only copies of the selected files and original crontab under `/etc/gitmirror-managed/legacy`. Old Git history, LFS objects and archives remain in their original directories. New work, staging backups and credentials use separate storage. Use the browser to configure the new account with its own private credentials.
 
-Complete browser setup with scheduling off. Migration staging can check provider access, but blocks applied sync. During staging, use managed local backup directories. Run `sudo bash install.sh cutover` when ready. Cutover runs the actual engine in dry-run mode with disposable work storage. After explicit confirmation, it checks for competing schedules and unrelated cron edits, takes the original flock, and disables only the selected line. Avoid editing the selected user crontab concurrently with cutover. It leaves the new scheduler disabled until you enable it in the dashboard. The managed account needs read and traverse permission on the original lock. Managed applied jobs continue acquiring that lock and verify its inode. For unattended startup after reboot, the original lock file needs to persist on disk with the same inode. A changed, missing or busy lock blocks writes.
+Complete browser setup with scheduling off and use managed local backup directories during staging. Run `sudo bash install.sh cutover` when ready. Cutover runs a dry-run in disposable work storage. After confirmation, it holds the current legacy flock and checks for processes running the identified command, competing schedules, and crontab changes. If the lock file vanished, the original account creates it as it would on its next run. Only the selected line is parked. The installer waits for Debian cron to acknowledge the reload in the system journal and drain its child processes. Avoid editing cron concurrently. Busy jobs, a replaced lock during cutover, missing reload evidence, and restricted process visibility all keep managed writes paused.
 
-To switch back, run `sudo bash install.sh rollback-migration` and confirm. It blocks managed writes, drains in-flight operations, and restores the exact original crontab if the parked version still matches. If cron changed, it keeps managed writes blocked and leaves the current crontab untouched for manual recovery. Either direction preserves the old and new repositories, LFS objects and credentials.
+Run `sudo bash install.sh status` to see whether migration is staged, complete, blocked, or rolled back. A crash before completion leaves managed writes paused even across reboot. Run `cutover` again to recheck and finish, or select `rollback-migration` to restore the original schedule. A normal cutover failure restores the original table when the parked table still matches the saved copy.
+
+After completion, enable scheduling in the dashboard. Applied runs use `/etc/gitmirror-managed/sync.lock`, a root-owned file in a protected directory. Rebooting or clearing `/tmp` does not affect it. The managed engine detects visible invocations of the recorded legacy command before applying changes. Keep that command retired. A renamed copy, a process on another host, or a manual launch after the managed run's check is outside this protection.
+
+To switch back, run `sudo bash install.sh rollback-migration` and confirm. It persists the write pause, drains managed operations, and restores the exact original crontab if the parked copy still matches. The old job can recreate its own temporary lock on its next run. If cron has other edits, use the saved original for manual recovery while managed writes remain paused. Either direction preserves Git and LFS data and credentials.
 
 ## Upgrade, rollback and uninstall
 

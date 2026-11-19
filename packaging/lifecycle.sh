@@ -69,8 +69,7 @@ issue_certificate() {
 }
 
 unit() {
-    local name=$1 description=$2 command=$3 staged private_tmp=yes
-    if [[ -f "$etc/legacy-lock" ]]; then private_tmp=no; fi
+    local name=$1 description=$2 command=$3 staged
     staged=$(mktemp "$unit_dir/.gitmirror-managed.XXXXXXXX")
     cat >"$staged" <<EOF
 [Unit]
@@ -87,13 +86,12 @@ Environment=PYTHONUNBUFFERED=1
 Environment=TMPDIR=$state/tmp
 Environment=GITMIRROR_MIGRATION_GUARD=$etc/migration-pending
 Environment=GITMIRROR_MAINTENANCE_GUARD=$etc/maintenance-pending
-Environment=GITMIRROR_LEGACY_LOCK_RECORD=$etc/legacy-lock
 ExecStart=$app/current/venv/bin/gitmirror $command
 Restart=on-failure
 RestartSec=4s
 UMask=0077
 NoNewPrivileges=yes
-PrivateTmp=$private_tmp
+PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only
 ProtectKernelTunables=yes
@@ -132,6 +130,7 @@ fresh_install() {
     mkdir -- "$app"; made_app=1
     mkdir -- "$app/releases"
     install -d -m 0755 "$etc"; made_etc=1
+    ensure_managed_lock
     if [[ "$action" == migrate ]]; then
         source "$temporary/source/packaging/legacy.sh"
         prepare_legacy
@@ -168,6 +167,25 @@ fresh_install() {
     cat -- "$state/setup-code"
 }
 
+# The installer owns both the directory and the lock entry. Never recreate an
+# existing entry here, including during upgrades or while a process holds it.
+ensure_managed_lock() {
+    local lock="$etc/sync.lock"
+    [[ -d "$etc" && ! -L "$etc" && "$(stat -c '%u %a' -- "$etc")" == '0 755' ]] ||
+        fail 'Managed configuration directory must be root-owned with mode 0755'
+    if [[ ! -e "$lock" && ! -L "$lock" ]]; then
+        [[ ! -e "$etc/sync-lock-created" ]] ||
+            fail 'Persistent synchronization lock is missing; it cannot be recreated automatically'
+        (umask 022; set -o noclobber; : >"$lock") || fail 'Could not create the persistent synchronization lock'
+    fi
+    [[ -f "$lock" && ! -L "$lock" && "$(stat -c '%u %a %h' -- "$lock")" == '0 644 1' ]] ||
+        fail 'Persistent synchronization lock must be a protected root-owned regular file'
+    if [[ ! -e "$etc/sync-lock-created" ]]; then
+        touch "$etc/sync-lock-created"
+        sync -f "$etc"
+    fi
+}
+
 drain() {
     runuser -u "$account" -- mkdir -p -- "$state/work/web-dashboard"
     runuser -u "$account" -- touch "$state/work/web-dashboard/.action.lock" "$state/work/.gitmirror.lock"
@@ -175,9 +193,14 @@ drain() {
     exec {sync_fd}<"$state/work/.gitmirror.lock"
     flock -w 40 "$web_fd" && flock -w 40 "$sync_fd" ||
         fail 'A dashboard or sync operation is active; try again when it finishes'
+    ensure_managed_lock
+    exec {persistent_fd}<"$etc/sync.lock"
+    flock -w 40 "$persistent_fd" ||
+        fail 'A dashboard or sync operation is active; try again when it finishes'
 }
 
 undrain() {
+    exec {persistent_fd}<&-
     exec {sync_fd}<&-
     exec {web_fd}<&-
 }
