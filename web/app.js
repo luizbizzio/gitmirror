@@ -348,20 +348,33 @@ function runItems(runs, none) {
 }
 
 function renderOverview(data) {
-  renderActivityChart(data.runs);
-  $("#stats").innerHTML = stat("Repositories", data.total_repositories ?? "Unobserved", `${data.destinations.length} configured destinations`)
-    + stat("Applied synchronizations", data.successful + data.failed ? `${data.successful} succeeded` : "Unobserved",
-      data.successful + data.failed ? `${data.failed} failed` : "No completed applied sync observed")
-    + stat("Last successful sync", date(data.last_success), `Next scheduled: ${date(data.next_run, "Unavailable")}`)
-    + stat("Working disk free", size(data.storage.free), `Local backups: ${size(data.backup.logical_bytes)} logical`);
+  const completed = data.successful + data.failed;
+  $("#stats").innerHTML = stat("Repositories", data.total_repositories ?? "—",
+    data.inventory_at ? "Discovered at source" : "Inventory not loaded")
+    + stat("Destinations", String(data.destinations.length), "Mirrors and local backups")
+    + stat("Successful syncs", completed ? String(data.successful) : "—",
+      completed ? `${data.failed} unsuccessful` : "No applied runs yet")
+    + stat("Local backups", size(data.backup.logical_bytes),
+      `${data.backup.available_volumes} available volumes`);
+  renderStorageChart("source-storage-chart", "source-storage-note",
+    data.repository_storage?.repositories, {source:true,
+      emptyMessage: data.inventory_at ? "This provider did not report repository sizes."
+        : "Read the source inventory to display repository sizes."});
+  renderStorageChart("backup-storage-chart", "backup-storage-note",
+    data.backup_storage?.repositories, {emptyMessage: data.backup.configured_volumes
+      ? "No local repository backup data measured yet." : "Add a local backup volume to see repository sizes."});
+  const applied = data.runs.filter((run) => run.mode === "apply" && Number.isFinite(run.ended));
+  $("#activity-panel").hidden = applied.length === 0;
+  if (applied.length) renderActivityChart(data.runs);
+  $("#overview-operations").hidden = !(data.active.length || data.runs.length || data.errors.length
+    || data.backup.configured_volumes);
   $("#active-count").textContent = String(data.active.length);
-  $("#active-list").innerHTML = runItems(data.active, "No active operations observed.");
+  $("#active-list").innerHTML = runItems(data.active, "No active operations.");
   const health = data.backup;
   $("#health").innerHTML = !health.configured_volumes ? empty("No local volumes configured.")
     : list([["Volumes available", `${health.available_volumes} / ${health.configured_volumes}`],
       ["Current verified generations", health.verified], ["Unverified", health.unverified],
-      ["Errors", health.failed]]) + (health.verified + health.failed + health.unverified === 0
-      ? empty("No current generations observed.") : "");
+      ["Errors", health.failed]]);
   $("#recent").innerHTML = runItems(data.runs.slice(0, 5), "No activity recorded.");
   $("#errors").innerHTML = data.errors.map((problem) => `<div class="item"><div>
     <strong>${escape([problem.repository, problem.destination].filter(Boolean).join(" / ") || "Operation failed")}</strong>
