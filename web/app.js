@@ -81,7 +81,30 @@ function notify(message, error = false) {
 
 function connected(status) {
   $("#connection").textContent = status;
-  $("#connection").classList.toggle("connected", status === "Live" || status === "Interface online");
+  $("#connection").classList.toggle("connected", status === "Web connected" || status === "Web online");
+}
+
+function updateSystemStatus(data) {
+  const state = $("#system-state");
+  const indicator = document.createElement("span");
+  indicator.className = "status-dot";
+  let title, description;
+  if (data.web.writes_paused) {
+    title = "Synchronization paused";
+    description = "Managed maintenance is in progress";
+  } else if (data.errors.length || data.backup.failed) {
+    title = "Review recent errors";
+    description = "Open Activity log or Backups for details";
+  } else if (!data.inventory_at) {
+    title = "Inventory pending";
+    description = "No repository status has been measured yet";
+  } else {
+    title = "Monitoring ready";
+    description = `${data.total_repositories} repositories in source inventory`;
+    indicator.classList.add("ready");
+  }
+  state.replaceChildren(indicator, document.createTextNode(title));
+  $("#system-detail").textContent = description;
 }
 
 function signOut() {
@@ -323,7 +346,7 @@ function enterPreview(data) {
   $("#top-setup").textContent = "Setup";
   $("#system-state").innerHTML = '<span class="status-dot"></span> Setup required';
   $("#system-detail").textContent = "Sync is disabled until configuration";
-  connected("Interface online");
+  connected("Web online");
   initializeNavigation();
   openView(routeFromUrl(), {updateUrl: false});
 }
@@ -537,6 +560,7 @@ async function refresh() {
   try {
     snapshot = await api("/api/overview");
     busy = snapshot.active.some((run) => run.origin === "web");
+    updateSystemStatus(snapshot);
     renderContext();
     switch (view) {
       case "overview":
@@ -556,7 +580,7 @@ async function refresh() {
         break;
       }
     }
-    connected("Live");
+    connected("Web connected");
   } finally {
     loading = false;
     if (refreshPending) {
@@ -570,7 +594,7 @@ function connect() {
   stream?.close();
   stream = new EventSource("/api/events");
   stream.onmessage = () => { if (!document.hidden) refresh().catch(report); };
-  stream.onopen = () => connected("Live");
+  stream.onopen = () => connected("Web connected");
   stream.onerror = () => connected("Reconnecting");
   stream.addEventListener("expired", signOut);
   clearInterval(refreshTimer);
@@ -593,8 +617,8 @@ async function boot() {
   $("#refresh").disabled = false;
   $("#discover").disabled = false;
   $("#top-setup").textContent = "Settings";
-  $("#system-state").innerHTML = '<span class="status-dot ready"></span> Connected';
-  $("#system-detail").textContent = "Dashboard authenticated";
+  $("#system-state").innerHTML = '<span class="status-dot"></span> Loading status';
+  $("#system-detail").textContent = "Checking source and destinations";
   initializeNavigation();
   openView(routeFromUrl(), {updateUrl: false});
   connect();
