@@ -278,7 +278,7 @@ def test_managed_update_command_runs_installer_with_no_second_confirmation(tmp_p
     """, tmp_path)
     assert generated.returncode == 0, generated.stderr
     installer = tmp_path / 'fake-installer'
-    installer.write_text('#!/usr/bin/env bash\\nprintf "%s\\\\n" "$@"\\n')
+    installer.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@"\n')
     installer.chmod(0o755)
     script = tmp_path / 'launcher'
     text = script.read_text()
@@ -287,7 +287,7 @@ def test_managed_update_command_runs_installer_with_no_second_confirmation(tmp_p
     script.write_text(text)
     script.chmod(0o755)
     sudo = tmp_path / 'sudo'
-    sudo.write_text('#!/usr/bin/env bash\\n[[ "$1" == -- ]] && shift\\nexec "$@"\\n')
+    sudo.write_text('#!/usr/bin/env bash\n[[ "$1" == -- ]] && shift\nexec "$@"\n')
     sudo.chmod(0o755)
     env = {**os.environ, 'PATH': f'{tmp_path}:{os.environ["PATH"]}'}
     for invocation in ('-up', 'update'):
