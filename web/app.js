@@ -40,7 +40,9 @@ function renderOverview(data){
   $("#live-status").textContent=data.latest?data.latest.state:"No run";
   $("#run-button").disabled=!data.web.allow_actions||busy;
   $("#actions-help").textContent=data.web.allow_actions?"Web actions are enabled. GitMirror uses the existing CLI lock.":"Web actions are disabled. Start the server with --allow-actions.";
+  const selectedDestination=$("#sync-target").value;
   $("#sync-target").innerHTML='<option value="">All configured destinations</option>'+data.destinations.map(d=>`<option value="${esc(d.id)}">${esc(d.id)} (${esc(d.provider)})</option>`).join("");
+  if([...$("#sync-target").options].some(option=>option.value===selectedDestination))$("#sync-target").value=selectedDestination;
 }
 function renderDestinations(data){$("#destinations-list").innerHTML=data.destinations.map(d=>`<article class="panel"><div class="panel-head"><div><h2>${esc(d.id)}</h2><p>${esc(d.provider.toUpperCase())} destination</p></div><span class="badge">Configured</span></div><dl class="mini-data"><dt>Provider</dt><dd>${esc(d.provider)}</dd><dt>Account</dt><dd>${esc(d.owner||"Local storage")}</dd><dt>Location</dt><dd>${esc(d.path||d.api_url||"Managed by provider")}</dd></dl></article>`).join("")}
 function renderSettings(data){$("#settings-list").innerHTML=`<dl class="mini-data"><dt>Source</dt><dd>${esc(data.source.provider)} / ${esc(data.source.owner)}</dd><dt>Schedule</dt><dd>Every ${esc(data.schedule_hours)} hours (CLI scheduler)</dd><dt>Working path</dt><dd>${esc(data.storage.path)}</dd><dt>Web actions</dt><dd>${data.web.allow_actions?"Enabled":"Disabled"}</dd><dt>Web security</dt><dd>Password login, signed session, CSRF protection</dd><dt>Destinations</dt><dd>${esc(data.destinations.map(d=>d.id).join(", "))}</dd></dl>`}
