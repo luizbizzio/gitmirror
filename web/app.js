@@ -670,6 +670,11 @@ function openConfiguration(initial, data) {
 
 async function startDashboard() {
   const response = await fetch("/api/setup", {credentials: "same-origin"});
+  // Standalone dashboards have no managed setup endpoint.
+  if (response.status === 404) {
+    await boot();
+    return;
+  }
   if (!response.ok) throw new Error("The GitMirror server is unavailable.");
   const data = await response.json();
   if (data.required) {
