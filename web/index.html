@@ -78,19 +78,36 @@
       <div class="content">
         <header class="page-heading">
           <div><h1 id="page-title">Dashboard</h1><p id="page-context"></p></div>
-          <span class="page-heading-meta">Git repositories &amp; backups</span>
+
         </header>
         <p id="notice" class="notice" role="status" hidden></p>
         <section id="view-overview">
           <div id="setup-banner" class="setup-banner" hidden>
-            <div class="setup-banner-copy"><strong>GitMirror is not configured</strong><p>Review the dashboard and settings first. Connect your accounts when you are ready.</p></div>
+            <div class="setup-banner-copy">
+              <span class="eyebrow">GET STARTED</span>
+              <h2>Set up your first mirror</h2>
+              <p>Connect a source, choose destinations, then run your first synchronization. No data is transferred until you enable it.</p>
+            </div>
             <button id="banner-setup" type="button" class="button primary">Start setup</button>
           </div>
           <dl id="stats" class="stats"></dl>
-          <article class="panel chart-panel">
-            <header><div><h2>Recent synchronization activity</h2><p class="panel-description">Applied runs over the last 7 days from recorded history</p></div><span id="chart-summary" class="muted">No activity yet</span></header>
+          <div id="storage-charts" class="grid storage-grid">
+            <article class="panel storage-panel">
+              <header><div><h2>Repository sizes</h2><p class="panel-description">Storage reported by your source provider</p></div><button class="link" data-go="repositories" type="button">View repositories</button></header>
+              <div id="source-storage-chart" class="storage-chart"></div>
+              <p id="source-storage-note" class="chart-footnote"></p>
+            </article>
+            <article class="panel storage-panel">
+              <header><div><h2>Local backup sizes</h2><p class="panel-description">Logical size of files in local backup repositories</p></div><button class="link" data-go="backups" type="button">View backups</button></header>
+              <div id="backup-storage-chart" class="storage-chart"></div>
+              <p id="backup-storage-note" class="chart-footnote"></p>
+            </article>
+          </div>
+          <article id="activity-panel" class="panel chart-panel" hidden>
+            <header><div><h2>Synchronization history</h2><p class="panel-description">Applied operations in the last seven days</p></div><span id="chart-summary" class="muted"></span></header>
             <div id="activity-chart" class="activity-chart" aria-label="Last seven days of synchronization activity"></div>
           </article>
+          <div id="overview-operations" class="overview-operations" hidden>
           <div class="grid">
             <article class="panel">
               <header><h2>Active operations</h2><span id="active-count" class="pill"></span></header>
@@ -111,8 +128,16 @@
               <div id="recent"></div>
             </article>
           </div>
+          </div>
         </section>
         <section id="view-repositories" hidden>
+          <article id="repository-onboarding" class="panel empty-panel" hidden>
+            <div class="empty-icon" aria-hidden="true">⑂</div>
+            <h2>No source connected</h2>
+            <p>Connect GitHub, GitLab or Codeberg to see repository names, sizes, and synchronization status.</p>
+            <button type="button" class="button primary" data-setup-open>Open setup</button>
+          </article>
+          <div id="repository-workspace">
           <article class="panel">
             <header><h2>Source inventory</h2><button id="discover" class="button secondary">Read source inventory</button></header>
             <p id="inventory-time" class="muted"></p>
@@ -133,6 +158,7 @@
               <div class="form-footer"><p id="actions-help"></p><button id="sync-submit" class="button primary">Start dry-run</button></div>
             </form>
           </article>
+          </div>
         </section>
         <section id="view-destinations" hidden><div id="destinations" class="grid"></div></section>
         <section id="view-backups" hidden><div id="backups"></div></section>
