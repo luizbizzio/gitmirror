@@ -185,6 +185,91 @@ function renderActivityChart(runs = []) {
   });
 }
 
+const storageColors = ["#6ab8e6", "#58b99b", "#e1b66d", "#a99ad9", "#df8a7e",
+  "#87bdc4", "#a7bd70", "#8c9ebd"];
+
+function chartPlaceholder(message) {
+  return `<div class="storage-placeholder"><span class="storage-placeholder-icon" aria-hidden="true">◌</span>
+    <p>${escape(message)}</p></div>`;
+}
+
+function renderStorageChart(chartId, noteId, records, options = {}) {
+  const chart = $(`#${chartId}`);
+  const note = $(`#${noteId}`);
+  const items = Array.isArray(records) ? records : [];
+  const known = items.filter((item) => Number.isSafeInteger(item.bytes) && item.bytes >= 0);
+  const unknown = items.length - known.length;
+  const positive = known.filter((item) => item.bytes > 0).sort((a, b) => b.bytes - a.bytes);
+  const total = positive.reduce((sum, item) => sum + item.bytes, 0);
+  note.textContent = options.source
+    ? "Provider estimate. Git LFS and additional storage may not be included."
+    : "Logical file sizes across local backups. Hardlinks may be counted more than once.";
+  if (unknown) note.textContent += ` No size reported for ${unknown} repositor${unknown === 1 ? "y" : "ies"}.`;
+  if (!positive.length || !total) {
+    chart.innerHTML = chartPlaceholder(options.emptyMessage || "No storage data yet.");
+    return;
+  }
+  const slices = positive.slice(0, 7).map((item) => ({...item}));
+  if (positive.length > 7) {
+    slices.push({name: `Other (${positive.length - 7})`,
+      bytes: positive.slice(7).reduce((sum, item) => sum + item.bytes, 0)});
+  }
+  chart.replaceChildren();
+  const graphic = document.createElement("div");
+  graphic.className = "donut-graphic";
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 160 160");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `Repository storage breakdown, ${size(total)} in total`);
+  const center = 80, radius = 60, circumference = 2 * Math.PI * radius;
+  const ring = document.createElementNS(svg.namespaceURI, "circle");
+  for (const [key, value] of Object.entries({cx:center, cy:center, r:radius,
+    stroke:"#2d4150", "stroke-width":22, fill:"none"})) ring.setAttribute(key, value);
+  svg.append(ring);
+  let consumed = 0;
+  slices.forEach((item, index) => {
+    const segment = document.createElementNS(svg.namespaceURI, "circle");
+    const portion = item.bytes / total * circumference;
+    for (const [key, value] of Object.entries({cx:center, cy:center, r:radius, fill:"none",
+      stroke:storageColors[index], "stroke-width":22,
+      "stroke-dasharray":`${portion} ${circumference}`,
+      "stroke-dashoffset": -consumed, transform:"rotate(-90 80 80)"})) segment.setAttribute(key, value);
+    const title = document.createElementNS(svg.namespaceURI, "title");
+    title.textContent = `${item.name}: ${size(item.bytes)}`;
+    segment.append(title);
+    svg.append(segment);
+    consumed += portion;
+  });
+  graphic.append(svg);
+  const summary = document.createElement("div");
+  summary.className = "donut-center";
+  summary.innerHTML = `<strong>${escape(size(total))}</strong><span>${known.length} repositories</span>`;
+  graphic.append(summary);
+  const legend = document.createElement("ol");
+  legend.className = "donut-legend";
+  slices.forEach((item, index) => {
+    const row = document.createElement("li");
+    row.innerHTML = `<span class="legend-swatch"></span><span class="legend-name" title="${escape(item.name)}">${escape(item.name)}</span>
+      <strong class="legend-value">${escape(size(item.bytes))}</strong>`;
+    row.querySelector(".legend-swatch").style.backgroundColor = storageColors[index];
+    legend.append(row);
+  });
+  chart.append(graphic, legend);
+}
+
+function emptyPage(title, description, action = "Open setup") {
+  return `<article class="panel empty-panel"><div class="empty-icon" aria-hidden="true">⑂</div>
+    <h2>${escape(title)}</h2><p>${escape(description)}</p>
+    <button type="button" data-setup-open class="button primary">${escape(action)}</button></article>`;
+}
+
+function renderStorageEmpty() {
+  renderStorageChart("source-storage-chart", "source-storage-note", [],
+    {source: true, emptyMessage: "Connect your source to see how much space each repository uses."});
+  renderStorageChart("backup-storage-chart", "backup-storage-note", [],
+    {emptyMessage: "Add a local backup destination to see repository storage breakdowns."});
+}
+
 function renderPreviewView() {
   const messages = {
     overview: "System overview", repositories: "Source repository inventory",
@@ -193,17 +278,16 @@ function renderPreviewView() {
   };
   $("#page-context").textContent = messages[view];
   if (view === "overview") {
-    $("#stats").innerHTML = stat("Repositories", "—", "Source not connected")
-      + stat("Successful syncs", "—", "No operations yet")
-      + stat("Last successful sync", "—", "Scheduling is off")
-      + stat("Backup storage", "—", "No volume configured");
-    renderActivityChart();
-    $("#active-count").textContent = "0";
-    $("#active-list").innerHTML = empty("No operations. Finish setup to connect your repositories.");
-    $("#health").innerHTML = empty("No backup destinations configured.");
-    $("#errors").innerHTML = empty("No errors recorded.");
-    $("#recent").innerHTML = empty("No synchronization history.");
+    $("#stats").innerHTML = stat("Repositories", "—", "No source connected")
+      + stat("Destinations", "0", "No mirrors configured")
+      + stat("Successful syncs", "—", "No executions yet")
+      + stat("Local backups", "—", "No backup volume");
+    renderStorageEmpty();
+    $("#activity-panel").hidden = true;
+    $("#overview-operations").hidden = true;
   } else if (view === "repositories") {
+    $("#repository-workspace").hidden = true;
+    $("#repository-onboarding").hidden = false;
     $("#inventory-time").textContent = "Source not configured";
     $("#repositories").innerHTML = empty("Connect a source account in Setup to view repositories.");
     $("#discover").disabled = true;
@@ -211,13 +295,13 @@ function renderPreviewView() {
     $("#actions-help").textContent = "Synchronization is unavailable until setup is complete.";
     $("#sync-targets").innerHTML = "<legend>Destinations</legend><p>None configured.</p>";
   } else if (view === "destinations") {
-    $("#destinations").innerHTML = '<article class="panel"><header><h2>Destinations</h2></header>'
-      + empty("No remote mirrors or local backup volumes configured.") + '</article>';
+    $("#destinations").innerHTML = emptyPage("No destinations configured",
+      "Add GitLab, Codeberg or local backup storage to receive your copies.");
   } else if (view === "backups") {
-    $("#backups").innerHTML = '<article class="panel"><header><h2>Backup storage</h2></header>'
-      + empty("No backup generations. Add a local destination during Setup.") + '</article>';
+    $("#backups").innerHTML = emptyPage("No local backups yet",
+      "Add a backup volume in Setup to keep recoverable repository generations.");
   } else if (view === "activity") {
-    $("#activity").innerHTML = empty("No activity recorded. GitMirror has not been configured.");
+    $("#activity").innerHTML = '<div class="empty-list-message"><strong>No activity recorded</strong><p>Runs and verification results appear here after the first synchronization.</p></div>';
     $("#log-panel").hidden = true;
   }
 }
