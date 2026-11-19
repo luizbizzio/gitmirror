@@ -1,0 +1,14 @@
+version: 2
+source:
+  provider: codeberg
+  owner: your-codeberg-user
+  token_env: CODEBERG_TOKEN
+destinations:
+  - provider: local
+    path: /data/backups
+storage:
+  path: /data/work
+schedule:
+  interval_hours: 12
+retry:
+  delays_seconds: [3, 8, 20]

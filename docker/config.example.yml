@@ -1,16 +1,17 @@
-version: 1
+version: 2
 source:
   provider: github
   owner: your-github-user
   token_env: GITHUB_TOKEN
 destinations:
-  gitlab:
+  - provider: gitlab
+    owner: your-gitlab-user
     token_env: GITLAB_TOKEN
-  codeberg:
+  - provider: codeberg
     owner: your-codeberg-user
     token_env: CODEBERG_TOKEN
 storage:
-  path: /data
+  path: /data/work
 schedule:
   interval_hours: 12
 retry:

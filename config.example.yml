@@ -1,7 +1,7 @@
-# GitMirror configuration, version 1
+# GitMirror configuration, version 2
 # Copy this file to config.yml and edit the owners.
 # Keep tokens in environment variables or separate files, never in Git.
-version: 1
+version: 2
 
 source:
   provider: github
@@ -9,11 +9,16 @@ source:
   token_env: GITHUB_TOKEN
 
 destinations:
-  gitlab:
+  - provider: gitlab
+    owner: your-gitlab-user
     token_env: GITLAB_TOKEN
-  codeberg:
+  - provider: codeberg
     owner: your-codeberg-user
     token_env: CODEBERG_TOKEN
+  # Optional. Create the directory on the intended drive, then run init-backup.
+  # - provider: local
+  #   path: /mnt/backups/gitmirror
+  # Windows example: path: 'D:\Backups\GitMirror'
 
 storage:
   path: ~/gitmirror-data

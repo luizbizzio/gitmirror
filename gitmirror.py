@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import datetime as dt
 import fnmatch
 import hashlib
@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,12 @@ __version__ = "0.1.0a1"
 
 
 # Configuration
+
+PROVIDER_APIS = {
+    'github': 'https://api.github.com',
+    'gitlab': 'https://gitlab.com/api/v4',
+    'codeberg': 'https://codeberg.org/api/v1',
+}
 
 class ConfigError(ValueError):
     pass
@@ -49,9 +56,43 @@ def _token_source(cfg, label):
 
 
 def _url(value, name):
-    if not isinstance(value, str) or urlparse(value).scheme != 'https' or not urlparse(value).netloc:
-        raise ConfigError(f'{name} must be an HTTPS URL')
+    try:
+        parsed = urlparse(value) if isinstance(value, str) else None
+        valid = (parsed and parsed.scheme == 'https' and parsed.hostname and not parsed.username
+                 and not parsed.password and not parsed.query and not parsed.fragment)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(f'{name} must be an HTTPS API URL without credentials or query parameters')
     return value.rstrip('/')
+
+
+def provider_config(spec, label, *, owner_optional=False):
+    cfg = dict(_mapping(spec, label))
+    provider = cfg.get('provider')
+    if not isinstance(provider, str) or provider not in PROVIDER_APIS:
+        raise ConfigError(f'{label}.provider must be github, gitlab or codeberg')
+    owner = cfg.get('owner')
+    if not (owner_optional and owner is None):
+        if not isinstance(owner, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', owner) or owner in ('.', '..'):
+            raise ConfigError(f'{label}.owner must be a provider account name')
+    _token_source(cfg, label)
+    cfg['api_url'] = _url(cfg.get('api_url', PROVIDER_APIS[provider]), f'{label}.api_url')
+    return cfg
+
+
+def config_path(value, label, *, absolute=False):
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f'{label} must be a non-empty path')
+    try:
+        path = Path(os.path.expandvars(value)).expanduser()
+        if absolute and not path.is_absolute():
+            raise ConfigError(f'{label} must be an absolute path')
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError(f'{label} is not a usable path') from exc
 
 
 def load_config(path):
@@ -61,28 +102,42 @@ def load_config(path):
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f'Cannot load config {file}: {exc}') from exc
     raw = _mapping(raw, 'config')
-    if raw.get('version') != 1:
-        raise ConfigError('version must be 1')
-    source = _mapping(raw.get('source'), 'source')
-    if source.get('provider') != 'github':
-        raise ConfigError('source.provider currently supports github only')
-    if not isinstance(source.get('owner'), str) or not source['owner'].strip():
-        raise ConfigError('source.owner is required')
-    _token_source(source, 'source')
-    source['api_url'] = _url(source.get('api_url', 'https://api.github.com'), 'source.api_url')
-    dests = _mapping(raw.get('destinations'), 'destinations')
-    for provider, default_url in (('gitlab', 'https://gitlab.com/api/v4'),
-                                  ('codeberg', 'https://codeberg.org/api/v1')):
-        cfg = _mapping(dests.get(provider), f'destinations.{provider}')
-        _token_source(cfg, f'destinations.{provider}')
-        cfg['api_url'] = _url(cfg.get('api_url', default_url), f'destinations.{provider}.api_url')
-    if not isinstance(dests['codeberg'].get('owner'), str) or not dests['codeberg']['owner'].strip():
-        raise ConfigError('destinations.codeberg.owner is required')
-    storage = _mapping(raw.get('storage'), 'storage')
-    pathstr = storage.get('path')
-    if not isinstance(pathstr, str) or not pathstr.strip():
-        raise ConfigError('storage.path must be a non-empty path')
-    storage['path'] = Path(os.path.expandvars(pathstr)).expanduser().resolve()
+    version = raw.get('version')
+    if type(version) is not int or version not in (1, 2):
+        raise ConfigError('version must be 1 or 2')
+    source = provider_config(raw.get('source'), 'source')
+    entries = raw.get('destinations')
+    if version == 1:
+        if source['provider'] != 'github':
+            raise ConfigError('version 1 requires a GitHub source; use version 2 for other providers')
+        entries = [{**_mapping(spec, 'destination'), 'provider': platform}
+                   for platform, spec in _mapping(entries, 'destinations').items()]
+        if any(spec['provider'] not in ('gitlab', 'codeberg') for spec in entries):
+            raise ConfigError('version 1 supports GitLab and Codeberg destinations')
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError('destinations must contain at least one destination')
+    storage = _mapping(raw.get('storage', {'path': '~/gitmirror-data'}), 'storage')
+    work_path = config_path(storage.get('path'), 'storage.path')
+    dests = {}
+    for index, entry in enumerate(entries, 1):
+        label = f'destinations[{index}]'
+        cfg = _mapping(entry, label)
+        platform = cfg.get('provider')
+        if platform == 'local':
+            if any(cfg.get(option, True) is not True for option in ('mirror', 'archive', 'preserve_history')):
+                raise ConfigError(f'{label}: local backups require mirror, archive and preserve_history')
+            local_path = config_path(cfg.get('path'), f'{label}.path', absolute=True)
+            if local_path.is_relative_to(work_path) or work_path.is_relative_to(local_path):
+                raise ConfigError('The local backup and working storage paths must be separate')
+            cfg = {'provider': 'local', 'path': local_path}
+        else:
+            cfg = provider_config(cfg, label, owner_optional=version == 1 and platform == 'gitlab')
+            if (platform == source['provider'] and urlparse(cfg['api_url']).hostname == urlparse(source['api_url']).hostname
+                    and cfg['owner'].casefold() == source['owner'].casefold()):
+                raise ConfigError('The source account cannot also be a destination on the same host')
+        if platform in dests:
+            raise ConfigError(f'{label}: only one {platform} destination per configuration is supported')
+        dests[platform] = cfg
     retry = _mapping(raw.get('retry', {'delays_seconds': [3, 8, 20]}), 'retry')
     delays = retry.get('delays_seconds', [3, 8, 20])
     if (not isinstance(delays, list) or len(delays) > 8 or
@@ -94,19 +149,15 @@ def load_config(path):
     if type(hours) not in (int, float) or not (0.1 <= hours <= 720):
         raise ConfigError('schedule.interval_hours must be between 0.1 and 720')
     schedule['interval_hours'] = hours
-    return {'version': 1, 'source': source, 'destinations': dests,
-            'storage': storage, 'retry': retry, 'schedule': schedule}
+    return {'version': version, 'source': source, 'destinations': dests,
+            'storage': {'path': work_path}, 'retry': retry, 'schedule': schedule}
 
 
 # Runtime, credentials, and transports
 
 HOME = Path.home()
 ROOT = HOME / 'gitmirror-data'
-GH_OWNER = ''
-CB_OWNER = ''
-GH_API = 'https://api.github.com'
 GL_API = 'https://gitlab.com/api/v4'
-CB_API = 'https://codeberg.org/api/v1'
 RUN_ID = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6]
 SSH_ENV = dict(os.environ)
 SSH_ENV.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=20')
@@ -123,20 +174,21 @@ TRANSIENT_GIT_ERRORS = (
 )
 
 def configure_runtime(settings, *, apply):
-    """Configure legacy engine from validated config without touching live data."""
-    global HOME, ROOT, GH_OWNER, CB_OWNER, GH_API, GL_API, CB_API
+    """Configure working storage and Git transport for a run."""
+    global ROOT, GL_API
     global JOURNAL_DIR, RETRY_DELAYS, RUN_ID, SSH_ENV
-    HOME = Path.home()
     ROOT = settings['storage']['path']
-    GH_OWNER = settings['source']['owner']
-    CB_OWNER = settings['destinations']['codeberg']['owner']
-    GH_API = settings['source']['api_url'].rstrip('/')
-    GL_API = settings['destinations']['gitlab']['api_url'].rstrip('/')
-    CB_API = settings['destinations']['codeberg']['api_url'].rstrip('/')
+    gitlab = settings['destinations'].get('gitlab')
+    GL_API = gitlab['api_url'] if gitlab else PROVIDER_APIS['gitlab']
     JOURNAL_DIR = ROOT / 'gitlab-protection-journal'
+    if gitlab and settings['version'] == 2:
+        JOURNAL_DIR /= scope_id(gitlab)
     RETRY_DELAYS = tuple(settings['retry']['delays_seconds'])
     RUN_ID = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6]
     SSH_ENV = dict(os.environ)
+    for key in ('GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_NAMESPACE',
+                'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'):
+        SSH_ENV.pop(key, None)
     ssh = 'ssh -o BatchMode=yes -o ConnectTimeout=20'
     if apply:
         SSH_ENV.setdefault('GIT_SSH_COMMAND', ssh)
@@ -179,6 +231,19 @@ def retry_notice(target, attempt, delay, reason):
     time.sleep(delay)
 
 
+class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        old, new = urlparse(request.full_url), urlparse(new_url)
+        if (request.get_method() != 'GET' or old.scheme != new.scheme
+                or old.hostname != new.hostname or old.port != new.port
+                or new.username is not None or new.password is not None):
+            raise urllib.error.HTTPError(request.full_url, code, 'Unsafe API redirect', headers, fp)
+        return super().redirect_request(request, fp, code, message, headers, new_url)
+
+
+API_OPENER = urllib.request.build_opener(SameOriginRedirect)
+
+
 def api(url, headers, method='GET', payload=None):
     """Retry only idempotent reads for transient HTTP/network errors.
 
@@ -191,7 +256,7 @@ def api(url, headers, method='GET', payload=None):
     for attempt in range(len(RETRY_DELAYS) + 1):
         req = urllib.request.Request(url, data=data, headers=h, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=45) as res:
+            with API_OPENER.open(req, timeout=45) as res:
                 raw = res.read()
                 return res.status, json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
@@ -246,6 +311,8 @@ def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, r
 def git(*args, repo=None, check=True, timeout=420, input_text=None, env=None, retry=True,
         before_retry=None):
     a = ['git']
+    if os.name == 'nt':
+        a += ['-c', 'core.longpaths=true']
     if repo is not None:
         a += ['-C', str(repo)]
     a += list(args)
@@ -270,7 +337,7 @@ def parse_refs(text, prefix='refs'):
 
 
 def remote_refs(url):
-    return parse_refs(git('ls-remote', '--heads', '--tags', url, timeout=100).stdout)
+    return parse_refs(git('ls-remote', '--heads', '--tags', '--', url, timeout=100).stdout)
 
 
 def verify_remote_head(url, branch):
@@ -301,10 +368,10 @@ def ensure_remote(repo, remote, url):
 
 
 @contextmanager
-def lfs_snapshot(repo, refs):
+def lfs_snapshot(repo, refs, *, scratch=None):
     """Share Git objects with an isolated repository containing only these refs."""
     try:
-        with tempfile.TemporaryDirectory(prefix='.lfs-check-', dir=repo) as directory:
+        with tempfile.TemporaryDirectory(prefix='.lfs-check-', dir=scratch or repo) as directory:
             snapshot = Path(directory)
             object_format = git('rev-parse', '--show-object-format', repo=repo).stdout.strip()
             git('init', '--bare', '--template=', f'--object-format={object_format}', directory)
@@ -318,11 +385,11 @@ def lfs_snapshot(repo, refs):
         raise SyncError(f'Cannot verify Git LFS objects: {exc}') from exc
 
 
-def lfs_objects(repo, refs):
+def lfs_objects(repo, refs, *, scratch=None):
     """List LFS objects in the full history of these refs, excluding other backups."""
     if not refs:
         return {}
-    with lfs_snapshot(repo, refs) as (snapshot, env):
+    with lfs_snapshot(repo, refs, scratch=scratch) as (snapshot, env):
         inventory = git('lfs', 'ls-files', '--all', '--json', '--include=', '--exclude=',
                         repo=snapshot, timeout=1200, env=env).stdout
     try:
@@ -438,10 +505,10 @@ def verify_destination_lfs(repo, remote, refs, objects, *, full=False):
     print(f'    Git LFS: read back {len(pending)} objects; reused evidence for {len(objects) - len(pending)}')
 
 
-def archive_source_old_tips(repo, previous):
-    """Keep each previously observed GitHub head/tag object reachable forever."""
+def archive_source_old_tips(repo, previous, provider):
+    """Keep each previously observed source head/tag object reachable forever."""
     for sha in set(previous.values()):
-        ref = f'refs/archive/github/{sha}'
+        ref = f'refs/archive/{provider}/{sha}'
         if git('show-ref', '--verify', '--quiet', ref, repo=repo, check=False).returncode:
             git('update-ref', ref, sha, repo=repo)
 
@@ -521,55 +588,14 @@ def push_snapshot(repo, remote, source, previous, *, url=None, before_push=None)
 
 # Provider APIs
 
-def discover_repos(gh_headers):
-    repos, page = [], 1
-    while True:
-        url = f'{GH_API}/user/repos?affiliation=owner&visibility=all&per_page=100&page={page}'
-        _, arr = api(url, gh_headers)
-        if not isinstance(arr, list):
-            raise SyncError('GitHub returned non-array repository list, aborting entire run')
-        repos.extend(x for x in arr if x.get('owner', {}).get('login', '').lower() == GH_OWNER.lower())
-        if len(arr) < 100:
-            break
-        page += 1
-        if page > 100:
-            raise SyncError('Unusual number of GitHub pages; aborting')
-    if not repos:
-        raise SyncError('Zero GitHub repositories detected: aborting; no destinations touched')
-    names = [r['name'] for r in repos]
-    if len(set(names)) != len(names):
-        raise SyncError('Duplicate names found in GitHub list')
-    return sorted(repos, key=lambda x: x['name'].lower())
-
-
 def desired_visibility(desired_private):
     return 'private' if desired_private else 'public'
 
 
-def verify_github_snapshot(record, gh_headers):
-    name = record['name']
-    url = f'{GH_API}/repos/{urllib.parse.quote(GH_OWNER, safe="")}/{urllib.parse.quote(name, safe="")}'
-    try:
-        status, info = api(url, {**gh_headers, 'Cache-Control': 'no-cache'})
-    except SyncError as exc:
-        raise SourceStateError(f'Cannot recheck GitHub state for {name}; stopping this sync') from exc
-    if status != 200 or not isinstance(info, dict):
-        raise SourceStateError(f'GitHub state for {name} is unavailable; stopping this sync')
-    owner = info.get('owner')
-    login = owner.get('login') if isinstance(owner, dict) else None
-    if (not isinstance(login, str) or login.casefold() != GH_OWNER.casefold()
-            or type(info.get('id')) is not int or info['id'] != record['id']
-            or info.get('name') != name or info.get('ssh_url') != record['ssh_url']):
-        raise SourceStateError(f'GitHub repository identity changed for {name}; stopping this sync')
-    private = record['private']
-    expected_visibility = record.get('visibility', desired_visibility(private))
-    actual_visibility = info.get('visibility', desired_visibility(private))
-    allowed_visibility = ('private', 'internal') if private else ('public',)
-    if (info.get('private') is not private or actual_visibility != expected_visibility
-            or actual_visibility not in allowed_visibility):
-        raise SourceStateError(f'GitHub visibility changed or is unconfirmed for {name}; stopping this sync')
-    if info.get('default_branch') != record['default_branch']:
-        raise SourceStateError(f'GitHub default branch changed or is unconfirmed for {name}; stopping this sync')
+def scope_id(spec):
+    identity = json.dumps([spec['provider'], spec['api_url'], spec['owner'].casefold()])
+    digest = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]
+    return f'{spec["provider"]}-{digest}'
 
 
 @dataclass(frozen=True)
@@ -580,75 +606,211 @@ class Destination:
     default_branch: str | None
 
 
-def destination_api_url(platform, name, gl_user):
-    if platform == 'gitlab':
-        return f'{GL_API}/projects/{urllib.parse.quote(f"{gl_user}/{name}", safe="")}'
-    owner, repo = (urllib.parse.quote(part, safe='') for part in (CB_OWNER, name))
-    return f'{CB_API}/repos/{owner}/{repo}'
+@dataclass(frozen=True)
+class Provider:
+    kind: str
+    base: str
+    owner: str | None
+    headers: dict = field(repr=False)
 
+    @property
+    def label(self):
+        return {'github': 'GitHub', 'gitlab': 'GitLab', 'codeberg': 'Codeberg'}[self.kind]
 
-def read_destination(platform, name, headers, gl_user, *, create=False):
-    url = destination_api_url(platform, name, gl_user)
-    status, obj = api(url, {**headers, 'Cache-Control': 'no-cache'})
-    if status == 404:
-        if not create:
-            return None
-        if platform == 'gitlab':
-            url = f'{GL_API}/projects'
-            payload = {'name': name, 'path': name, 'visibility': 'private', 'builds_access_level': 'disabled'}
+    @classmethod
+    def from_config(cls, spec):
+        kind = spec['provider']
+        secret = token(spec)
+        if kind == 'gitlab':
+            headers = {'PRIVATE-TOKEN': secret}
+        elif kind == 'codeberg':
+            headers = {'Authorization': f'token {secret}'}
         else:
-            url = f'{CB_API}/user/repos'
-            payload = {'name': name, 'private': True, 'auto_init': False}
-        # Stage new destinations privately. Publication requires a verified mirror.
-        status, obj = api(url, headers, method='POST', payload=payload)
-        if status != 201:
-            raise SyncError(f'Cannot create private {platform} destination for {name}')
-        print(f'    Created private {platform} destination.')
-    if status not in (200, 201) or not isinstance(obj, dict):
-        raise SyncError(f'Cannot read {platform} destination for {name}')
-    if platform == 'gitlab':
-        url, visibility = obj.get('ssh_url_to_repo'), obj.get('visibility')
-    else:
-        url, private = obj.get('ssh_url'), obj.get('private')
-        visibility = desired_visibility(private) if type(private) is bool else None
-    if not isinstance(url, str) or not url or visibility not in ('private', 'public', 'internal'):
-        raise SyncError(f'Cannot verify {platform} destination URL or visibility for {name}')
-    if status == 201 and visibility != 'private':
-        raise SyncError(f'New {platform} destination is not confirmed private for {name}')
-    default_branch = obj.get('default_branch')
-    if (type(obj.get('id')) is not int or 'default_branch' not in obj
-            or (default_branch is not None and not isinstance(default_branch, str))):
-        raise SyncError(f'Cannot verify {platform} destination identity or default branch for {name}')
-    return Destination(obj['id'], url, visibility, default_branch or None)
+            headers = {'Authorization': f'Bearer {secret}', 'X-GitHub-Api-Version': '2022-11-28'}
+        return cls(kind, spec['api_url'], spec.get('owner'), headers)
 
+    def authenticate(self):
+        status, info = api(f'{self.base}/user', self.headers)
+        field = 'username' if self.kind == 'gitlab' else 'login'
+        login = info.get(field) if isinstance(info, dict) else None
+        if status != 200 or not isinstance(login, str) or not login:
+            raise SyncError(f'Cannot validate {self.label} account')
+        if self.owner and login.casefold() != self.owner.casefold():
+            raise SyncError(f'Authenticated {self.label} account differs from the configured owner')
+        return replace(self, owner=self.owner or login)
 
-def update_destination(platform, name, destination, headers, gl_user, **change):
-    """Send one metadata edit and confirm the result, including after an ambiguous response."""
-    expected = replace(destination, **change)
-    if platform == 'gitlab':
-        url, method = f'{GL_API}/projects/{destination.id}', 'PUT'
-        payload = change
-    else:
-        url, method = destination_api_url(platform, name, gl_user), 'PATCH'
-        payload = {'private': change['visibility'] == 'private'} if 'visibility' in change else change
+    def repo_url(self, name):
+        if self.kind == 'gitlab':
+            return f'{self.base}/projects/{urllib.parse.quote(f"{self.owner}/{name}", safe="")}'
+        owner, repo = (urllib.parse.quote(part, safe='') for part in (self.owner, name))
+        return f'{self.base}/repos/{owner}/{repo}'
 
-    field = next(iter(change))
-    error = None
-    try:
-        status, _ = api(url, headers, method=method, payload=payload)
+    def repo_state(self, info):
+        """Normalize hosting metadata without assuming an unknown repository is public."""
+        if not isinstance(info, dict):
+            raise SyncError(f'Invalid {self.label} repository metadata')
+        if self.kind == 'gitlab':
+            path = info.get('path_with_namespace')
+            owner, _, name = path.rpartition('/') if isinstance(path, str) else ('', '', '')
+            visibility = info.get('visibility')
+            url = info.get('ssh_url_to_repo')
+        else:
+            account = info.get('owner')
+            owner = account.get('login') if isinstance(account, dict) else None
+            name = info.get('name')
+            url = info.get('ssh_url')
+            private = info.get('private')
+            visibility = None
+            if type(private) is bool:
+                visibility = info.get('visibility', desired_visibility(private))
+                if (visibility == 'public') == private:
+                    visibility = None
+        if visibility not in ('public', 'private', 'internal'):
+            raise SyncError(f'{self.label} visibility changed or is unconfirmed')
+        if type(info.get('id')) is not int or not all(isinstance(value, str) and value
+                                                     for value in (owner, name, url)):
+            raise SyncError(f'{self.label} repository identity changed or is invalid')
+        branch = info.get('default_branch')
+        return {'id': info['id'], 'name': name, 'owner': owner, 'ssh_url': url,
+                'private': visibility != 'public', 'visibility': visibility, 'default_branch': branch}
+
+    def discover(self):
+        repos = {}
+        query = {
+            'github': '/user/repos?affiliation=owner&visibility=all&per_page=100',
+            'gitlab': '/projects?owned=true&per_page=100',
+            'codeberg': '/user/repos?limit=50',
+        }[self.kind]
+        seen = set()
+        for page in range(1, 101):
+            status, items = api(f'{self.base}{query}&page={page}', self.headers)
+            if status != 200 or not isinstance(items, list):
+                raise SyncError(f'{self.label} returned an invalid repository list')
+            for item in items:
+                record = self.repo_state(item)
+                if record['id'] in seen:
+                    raise SyncError(f'{self.label} discovery returned duplicate repository IDs')
+                seen.add(record['id'])
+                if record['owner'].casefold() != self.owner.casefold():
+                    continue
+                name = record['name'].casefold()
+                if name in repos:
+                    raise SyncError(f'{self.label} discovery returned duplicate repository names')
+                repos[name] = record
+            # A Forgejo instance can cap page size below the requested limit.
+            if not items or (self.kind != 'codeberg' and len(items) < 100):
+                break
+        else:
+            raise SyncError(f'{self.label} discovery did not finish after 100 pages')
+        if not repos:
+            raise SyncError(f'Zero {self.label} repositories detected: aborting; no destinations touched')
+        return [repos[name] for name in sorted(repos)]
+
+    def confirm_source(self, record):
+        name = record['name']
+        try:
+            status, info = api(self.repo_url(name), {**self.headers, 'Cache-Control': 'no-cache'})
+        except SyncError as exc:
+            raise SourceStateError(f'Cannot recheck {self.label} state for {name}; stopping this sync') from exc
         if status != 200:
-            error = f'HTTP {status}'
-    except SyncError as exc:
-        error = str(exc)
+            raise SourceStateError(f'{self.label} state for {name} is unavailable; stopping this sync')
+        try:
+            current = self.repo_state(info)
+        except SyncError as exc:
+            raise SourceStateError(str(exc)) from exc
+        for fields, description in ((('id', 'owner', 'name', 'ssh_url'), 'repository identity'),
+                                    (('private', 'visibility'), 'visibility'),
+                                    (('default_branch',), 'default branch')):
+            if any(current[key] != record[key] for key in fields):
+                raise SourceStateError(f'{self.label} {description} changed for {name}; stopping this sync')
+
+    def read_destination(self, name, *, create=False):
+        status, obj = api(self.repo_url(name), {**self.headers, 'Cache-Control': 'no-cache'})
+        if status == 404:
+            if not create:
+                return None
+            if self.kind == 'gitlab':
+                url = f'{self.base}/projects'
+                payload = {'name': name, 'path': name, 'visibility': 'private', 'builds_access_level': 'disabled'}
+            else:
+                url = f'{self.base}/user/repos'
+                payload = {'name': name, 'private': True, 'auto_init': False}
+            status, obj = api(url, self.headers, method='POST', payload=payload)
+            if status != 201:
+                raise SyncError(f'Cannot create private {self.kind} destination for {name}')
+        if status not in (200, 201) or not isinstance(obj, dict):
+            raise SyncError(f'Cannot read {self.kind} destination for {name}')
+        if self.kind == 'gitlab':
+            url, visibility = obj.get('ssh_url_to_repo'), obj.get('visibility')
+        else:
+            url, private = obj.get('ssh_url'), obj.get('private')
+            visibility = obj.get('visibility', desired_visibility(private)) if type(private) is bool else None
+            if (visibility == 'public') == private:
+                visibility = None
+        if not isinstance(url, str) or not url or visibility not in ('private', 'public', 'internal'):
+            raise SyncError(f'Cannot verify {self.kind} destination URL or visibility for {name}')
+        if status == 201 and visibility != 'private':
+            raise SyncError(f'New {self.kind} destination is not confirmed private for {name}')
+        default_branch = obj.get('default_branch')
+        if (type(obj.get('id')) is not int or 'default_branch' not in obj
+                or (default_branch is not None and not isinstance(default_branch, str))):
+            raise SyncError(f'Cannot verify {self.kind} destination identity or default branch for {name}')
+        return Destination(obj['id'], url, visibility, default_branch or None)
+
+    def update_destination(self, name, destination, **change):
+        """Write once and confirm the result even if the response was ambiguous."""
+        expected = replace(destination, **change)
+        if self.kind == 'gitlab':
+            url, method = f'{self.base}/projects/{destination.id}', 'PUT'
+        else:
+            url, method = self.repo_url(name), 'PATCH'
+        payload = change
+        if self.kind == 'codeberg' and 'visibility' in change:
+            payload = {'private': change['visibility'] == 'private'}
+
+        attribute = next(iter(change))
+        error = None
+        try:
+            status, _ = api(url, self.headers, method=method, payload=payload)
+            if status != 200:
+                error = f'HTTP {status}'
+        except SyncError as exc:
+            error = str(exc)
+        try:
+            actual = self.read_destination(name)
+        except SyncError as exc:
+            raise SyncError(f'{self.kind}: {attribute} update not verified for {name}; '
+                            f'write issue={error or "none"}; read issue={exc}') from exc
+        if actual != expected:
+            raise SyncError(f'{self.kind}: {attribute} update not verified for {name}; write issue={error or "none"}')
+        print(f'    {self.kind}: {attribute} verified as {getattr(expected, attribute)}')
+        return expected
+
+
+def git_address(url):
+    """Compare expanded Git endpoints, including equivalent SSH URL spellings."""
+    expanded = git('ls-remote', '--get-url', '--', url).stdout.strip()
     try:
-        actual = read_destination(platform, name, headers, gl_user)
-    except SyncError as exc:
-        raise SyncError(f'{platform}: {field} update not verified for {name}; '
-                        f'write issue={error or "none"}; read issue={exc}') from exc
-    if actual != expected:
-        raise SyncError(f'{platform}: {field} update not verified for {name}; write issue={error or "none"}')
-    print(f'    {platform}: {field} verified as {getattr(expected, field)}')
-    return expected
+        parsed = urlparse(expanded)
+        if parsed.hostname:
+            port = parsed.port or {'ssh': 22, 'http': 80, 'https': 443, 'git': 9418}.get(parsed.scheme)
+            return parsed.hostname.casefold(), port, parsed.path.strip('/').removesuffix('.git').casefold()
+    except ValueError as exc:
+        raise SyncError('Cannot compare malformed Git endpoint') from exc
+    match = re.fullmatch(r'[^@]+@([^:]+):(.+)', expanded)
+    if match:
+        host, path = match.groups()
+        return host.casefold(), 22, path.strip('/').removesuffix('.git').casefold()
+    return os.path.normcase(expanded.rstrip('/'))
+
+
+def reject_source_as_destination(source, record, provider, destination):
+    if destination is None:
+        return
+    same_instance = (source.kind == provider.kind and urlparse(source.base).hostname == urlparse(provider.base).hostname)
+    if ((same_instance and record['id'] == destination.id)
+            or git_address(record['ssh_url']) == git_address(destination.url)):
+        raise SyncError('Source and destination resolve to the same repository')
 
 
 # GitLab branch protection and recovery journal
@@ -879,6 +1041,224 @@ def prepare_gl_permissions(project_id, default_branch, src, old, headers):
             print(f'    GitLab temporarily unprotected stale branch for deletion: {branch}')
 
 
+# Independent local mirrors and archives
+
+BACKUP_MARKER = '.gitmirror-volume.json'
+BACKUP_GENERATION = re.compile(r'[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}\.git')
+BACKUP_MANIFEST = 'gitmirror-backup.json'
+
+
+def backup_volume(path):
+    try:
+        stat = path.stat()
+        marker = json.loads((path / BACKUP_MARKER).read_text(encoding='utf-8'))
+        if (not path.is_dir() or not isinstance(marker, dict) or marker.get('version') != 1
+                or not isinstance(marker.get('id'), str) or not re.fullmatch(r'[0-9a-f]{32}', marker['id'])):
+            raise ValueError('Invalid backup volume marker')
+    except (OSError, ValueError) as exc:
+        raise SyncError(f'Local backup volume unavailable or uninitialized at {path}; '
+                        'mount it and use init-backup for a new volume') from exc
+    return marker['id'], stat.st_dev, stat.st_ino
+
+
+def local_path(settings):
+    if 'local' not in settings['destinations']:
+        raise SyncError('Configure a local destination first')
+    return settings['destinations']['local']['path']
+
+
+def initialize_backup(settings):
+    path = local_path(settings)
+    if not path.is_dir():
+        raise SyncError(f'Local backup directory must already exist on the intended volume: {path}')
+    with FileLock(str(path / '.gitmirror-backup.lock'), timeout=0):
+        if not (path / BACKUP_MARKER).exists():
+            store_json(path / BACKUP_MARKER, {'version': 1, 'id': uuid.uuid4().hex})
+        backup_volume(path)
+    print(f'Local backup volume ready at {path}')
+    return 0
+
+
+def backup_refs(repo):
+    out = git('for-each-ref', '--format=%(refname)%09%(objectname)', repo=repo).stdout
+    return dict(line.split('\t', 1) for line in out.split('\n') if line)
+
+
+def current_backup(directory):
+    pointer = directory / 'CURRENT'
+    try:
+        manifest = json.loads(pointer.read_text(encoding='utf-8'))
+        generation = manifest.get('generation') if isinstance(manifest, dict) else None
+        if not isinstance(generation, str) or not BACKUP_GENERATION.fullmatch(generation):
+            raise ValueError('Invalid generation name')
+        repo = directory / 'generations' / generation
+        if not repo.is_dir() or repo.is_symlink():
+            raise ValueError('Backup generation missing')
+        return repo
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as exc:
+        raise SyncError(f'Cannot read the current backup at {directory}') from exc
+
+
+def backup_manifest(repo):
+    try:
+        manifest = json.loads((repo / BACKUP_MANIFEST).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise SyncError(f'Invalid local backup manifest at {repo}') from exc
+    if (not isinstance(manifest, dict) or manifest.get('version') != 1
+            or not isinstance(manifest.get('name'), str) or not isinstance(manifest.get('refs'), dict)):
+        raise SyncError(f'Invalid local backup manifest at {repo}')
+    return manifest
+
+
+def verify_local_generation(repo, manifest=None):
+    if manifest is None:
+        manifest = backup_manifest(repo)
+    if ((repo / 'objects' / 'info' / 'alternates').exists()
+            or any((repo / 'objects' / 'pack').glob('*.promisor'))):
+        raise SyncError('The local backup depends on an external Git object store')
+    refs = backup_refs(repo)
+    if not refs or refs != manifest['refs']:
+        raise SyncError(f'Git refs do not match the local backup manifest at {repo}')
+    head = f'refs/heads/{manifest.get("default_branch")}'
+    if head not in refs or git('symbolic-ref', 'HEAD', repo=repo).stdout.strip() != head:
+        raise SyncError(f'Default branch does not match the local backup manifest at {repo}')
+    git('fsck', '--full', '--no-dangling', repo=repo, timeout=1800,
+        env={**SSH_ENV, 'GIT_NO_LAZY_FETCH': '1', 'GIT_ALLOW_PROTOCOL': 'file'})
+    verify_lfs_objects(repo / 'lfs' / 'objects', lfs_objects(repo, refs, scratch=tempfile.gettempdir()))
+    return manifest
+
+
+def fsync_directory(path):
+    if os.name != 'nt':
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def flush_snapshot(repo):
+    for root, _, files in os.walk(repo, topdown=False):
+        for name in files:
+            path = Path(root) / name
+            if os.name != 'nt':
+                with path.open('rb') as file:
+                    os.fsync(file.fileno())
+                continue
+            # Windows needs a writable handle, including for Git's read-only object files.
+            mode = path.stat().st_mode
+            read_only = not mode & stat.S_IWRITE
+            if read_only:
+                path.chmod(mode | stat.S_IWRITE)
+            try:
+                with path.open('r+b') as file:
+                    os.fsync(file.fileno())
+            finally:
+                if read_only:
+                    path.chmod(mode)
+        fsync_directory(root)
+
+
+def preserve_local_backup(path, volume, scope, source, record, working, refs, objects):
+    """Publish a verified, self-contained generation with a single pointer replacement."""
+    def confirm_volume():
+        if backup_volume(path) != volume:
+            raise SyncError('Local backup volume changed during sync')
+
+    directory = path / scope / str(record['id'])
+    branch = record['default_branch']
+    try:
+        confirm_volume()
+        with FileLock(str(path / '.gitmirror-backup.lock'), timeout=0):
+            confirm_volume()
+            previous = current_backup(directory)
+            archived = {}
+            if previous:
+                old = verify_local_generation(previous)
+                if old.get('source_id') != record['id']:
+                    raise SyncError('Existing local backup belongs to another source repository')
+                before = local_refs(previous)
+                if before == refs and old['default_branch'] == branch and old['name'] == record['name']:
+                    source.confirm_source(record)
+                    confirm_volume()
+                    print(f'  local: verified current backup {previous}')
+                    return
+                archived = {key: oid for key, oid in old['refs'].items() if key.startswith('refs/archive/')}
+                archived.update({f'refs/archive/{previous.stem}/{ref.removeprefix("refs/")}': oid
+                                 for ref, oid in before.items()})
+
+            generations = directory / 'generations'
+            for location in (directory.parent, directory, generations):
+                location.mkdir(mode=0o700, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='.partial-', dir=generations) as scratch:
+                staged = Path(scratch) / 'mirror.git'
+                if previous:
+                    shutil.copytree(previous, staged)
+                    updates = ''.join(f'create refs/archive/{previous.stem}/{ref.removeprefix("refs/")} {oid}\n'
+                                      for ref, oid in before.items())
+                    git('update-ref', '--stdin', repo=staged, input_text=updates)
+                else:
+                    fmt = git('rev-parse', '--show-object-format', repo=working).stdout.strip()
+                    git('init', '--bare', '--template=', f'--object-format={fmt}', str(staged))
+                    git('config', 'lfs.storage', 'lfs', repo=staged)
+                    if os.name == 'nt':
+                        git('config', 'core.longpaths', 'true', repo=staged)
+                git('fetch', '--atomic', '--prune', '--no-tags', '--no-write-fetch-head', '--refmap=',
+                    working.as_uri(), '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*',
+                    repo=staged, timeout=1800, env={**SSH_ENV, 'GIT_ALLOW_PROTOCOL': 'file'})
+                git('symbolic-ref', 'HEAD', f'refs/heads/{branch}', repo=staged)
+                if objects:
+                    media = lfs_media_dir(working)
+                    for oid in objects:
+                        relative = Path(oid[:2], oid[2:4], oid)
+                        target = staged / 'lfs' / 'objects' / relative
+                        if not target.exists():
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copyfile(media / relative, target)
+                store_json(staged / BACKUP_MANIFEST, {
+                    'version': 1, 'source_id': record['id'], 'name': record['name'],
+                    'default_branch': branch, 'refs': {**refs, **archived},
+                })
+                verify_local_generation(staged)
+                flush_snapshot(staged)
+                source.confirm_source(record)
+                confirm_volume()
+                published = generations / f'{RUN_ID}.git'
+                staged.rename(published)
+                for location in (generations, directory, directory.parent, path):
+                    fsync_directory(location)
+                confirm_volume()
+                store_json(directory / 'CURRENT', {'generation': published.name})
+            confirm_volume()
+        print(f'  local: verified and published {published}')
+    except (OSError, Timeout) as exc:
+        raise SyncError(f'Could not complete local backup at {path}: {exc}') from exc
+
+
+def verify_local_backups(settings, only):
+    path = local_path(settings)
+    volume = backup_volume(path)
+    scope = path / scope_id(settings['source'])
+    confirmed = 0
+    for entry in sorted(scope.glob('*')):
+        if not entry.is_dir() or not entry.name.isdecimal():
+            continue
+        repo = current_backup(entry)
+        if repo is None:
+            continue
+        manifest = backup_manifest(repo)
+        if only and manifest['name'].casefold() != only.casefold():
+            continue
+        verify_local_generation(repo, manifest)
+        print(f'Verified {manifest["name"]} at {repo}')
+        confirmed += 1
+    if backup_volume(path) != volume or not confirmed:
+        raise SyncError('No matching local backup could be verified on the configured volume')
+    return 0
+
+
 # Synchronization
 
 def describe_destination_plan(platform, destination, src, source_default, private, headers):
@@ -902,8 +1282,9 @@ def describe_destination_plan(platform, destination, src, source_default, privat
             print(f'    GitLab WOULD {operation}: {branch}')
 
 
-def sync_destination(record, gh_headers, repo, platform, destination, headers, gl_user, src, source_lfs, full_lfs):
+def sync_destination(record, source, repo, provider, destination, src, source_lfs, full_lfs):
     name, source_default = record['name'], record['default_branch']
+    platform, headers = provider.kind, provider.headers
     url = destination.url
     old = remote_refs(url)
     refs_changed = src != old
@@ -913,13 +1294,13 @@ def sync_destination(record, gh_headers, repo, platform, destination, headers, g
         ensure_remote(repo, platform, url)
 
     def confirm_destination():
-        if read_destination(platform, name, headers, gl_user) != destination:
+        if provider.read_destination(name) != destination:
             raise SyncError(f'{platform} destination state changed during sync')
 
     def confirm_transfer():
         # Check source last so a provider read or Git ref preflight cannot delay this check.
         confirm_destination()
-        verify_github_snapshot(record, gh_headers)
+        source.confirm_source(record)
 
     def upload_lfs():
         confirm_transfer()
@@ -957,14 +1338,13 @@ def sync_destination(record, gh_headers, repo, platform, destination, headers, g
         push_refs(staged, old)
         if remote_refs(url) != staged:
             raise SyncError('Destination refs changed before the default branch switch')
-        current = read_destination(platform, name, headers, gl_user)
+        current = provider.read_destination(name)
         if current not in (destination, replace(destination, default_branch=source_default)):
             raise SyncError('Destination state changed before the default branch switch')
         destination = current
         if destination.default_branch != source_default:
-            verify_github_snapshot(record, gh_headers)
-            destination = update_destination(platform, name, destination, headers, gl_user,
-                                             default_branch=source_default)
+            source.confirm_source(record)
+            destination = provider.update_destination(name, destination, default_branch=source_default)
         verify_remote_head(url, source_default)
         old = staged
 
@@ -978,60 +1358,61 @@ def sync_destination(record, gh_headers, repo, platform, destination, headers, g
         upload_lfs()
         verify_destination_lfs(repo, platform, src, source_lfs)
     if remote_refs(url) != src:
-        raise SyncError('Destination refs do not match the GitHub snapshot')
+        raise SyncError('Destination refs do not match the source snapshot')
 
     verify_remote_head(url, source_default)
     confirm_transfer()
     if destination.visibility != desired_visibility(record['private']):
         # Private destinations are only published after all ref, default and LFS checks.
-        update_destination(platform, name, destination, headers, gl_user, visibility='public')
+        provider.update_destination(name, destination, visibility='public')
     print(f'  {platform}: SYNCED (Git refs, default branch, Git LFS and visibility verified)')
 
 
-def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, platforms, *, full_lfs=False):
+def sync_repository(record, source, providers, local, work_scope, apply, *, full_lfs=False):
     name = record['name']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise SyncError(f'Unsupported repository name: {name}')
     source_url = record.get('ssh_url')
-    if not isinstance(source_url, str) or not source_url or type(record.get('id')) is not int:
-        raise SyncError('GitHub repository ID or SSH URL missing; refusing destination updates')
-    if type(record.get('private')) is not bool:
-        raise SyncError('GitHub privacy field missing or invalid; refusing destination updates')
+    if not isinstance(source_url, str) or not source_url or record['id'] <= 0:
+        raise SyncError(f'{source.label} repository ID or SSH URL invalid; refusing destination updates')
     priv = record['private']
     source_default = record.get('default_branch')
     gh = remote_refs(source_url)
     default_ref = f'refs/heads/{source_default}'
     if not isinstance(source_default, str) or not source_default or default_ref not in gh:
-        raise SyncError('GitHub default branch is unconfirmed in advertised refs; refusing destination updates')
-    verify_github_snapshot(record, gh_headers)
+        raise SyncError(f'{source.label} default branch is unconfirmed in advertised refs; refusing destination updates')
+    source.confirm_source(record)
     heads = sum(ref.startswith('refs/heads/') for ref in gh)
     print(f'  source: {heads} branches, {len(gh) - heads} tags; privacy={desired_visibility(priv)}')
 
-    headers = {'gitlab': gl_headers, 'codeberg': cb_headers}
     destinations = {}
     successes = failures = 0
-    for platform in platforms:
+    if local and not apply:
+        path, _, _ = local
+        print(f'  local: would verify and preserve {len(gh)} refs at {path}')
+        successes += 1
+    for platform, provider in providers.items():
         try:
-            secrets = headers[platform]
-            destination = read_destination(platform, name, secrets, gl_user, create=apply)
+            destination = provider.read_destination(name, create=apply)
+            reject_source_as_destination(source, record, provider, destination)
             if not apply:
-                describe_destination_plan(platform, destination, gh, source_default, priv, secrets)
+                describe_destination_plan(platform, destination, gh, source_default, priv, provider.headers)
                 successes += 1
                 continue
             if priv and destination.visibility != 'private':
-                verify_github_snapshot(record, gh_headers)
-                destination = update_destination(platform, name, destination, secrets, gl_user, visibility='private')
+                source.confirm_source(record)
+                destination = provider.update_destination(name, destination, visibility='private')
             destinations[platform] = destination
         except SourceStateError:
             raise
         except SyncError as exc:
             print(f'  {platform}: BLOCKED: {exc}')
             failures += 1
-    if not apply or not destinations:
+    if not apply or (not destinations and not local):
         return successes, failures
 
-    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    repo = ROOT / (name + '.git')
+    repo = ROOT / 'work' / work_scope / f'{record["id"]}.git' if work_scope else ROOT / f'{name}.git'
+    repo.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not repo.exists():
         git('init', '--bare', str(repo))
         os.chmod(repo, 0o700)
@@ -1042,12 +1423,12 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     previous = local_refs(repo)
     previous_lfs = lfs_objects(repo, previous)
     fetch_backup_lfs(repo, 'origin', previous, previous_lfs)
-    archive_source_old_tips(repo, previous)
+    archive_source_old_tips(repo, previous, source.kind)
     git('fetch', '--atomic', '--prune', '--no-tags', '--refmap=', 'origin',
         '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*', repo=repo, timeout=1200)
     src = local_refs(repo)
     if default_ref not in src:
-        raise SourceStateError('GitHub default branch is absent from the fetched snapshot; refusing all pushes')
+        raise SourceStateError(f'{source.label} default branch is absent from the fetched snapshot; refusing all pushes')
 
     source_lfs = previous_lfs if src == previous else lfs_objects(repo, src)
     if src != previous:
@@ -1055,10 +1436,18 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     if full_lfs:
         verify_archived_lfs(repo)
 
+    if local:
+        try:
+            preserve_local_backup(*local, source, record, repo, src, source_lfs)
+            successes += 1
+        except SourceStateError:
+            raise
+        except SyncError as exc:
+            print(f'  local: FAILED: {exc}')
+            failures += 1
     for platform, destination in destinations.items():
         try:
-            sync_destination(record, gh_headers, repo, platform, destination, headers[platform], gl_user,
-                             src, source_lfs, full_lfs)
+            sync_destination(record, source, repo, providers[platform], destination, src, source_lfs, full_lfs)
             successes += 1
         except SourceStateError:
             raise
@@ -1068,57 +1457,70 @@ def sync_repository(record, gh_headers, gl_headers, cb_headers, gl_user, apply, 
     return successes, failures
 
 
-def run(settings, *, apply=False, only=None, platform='both', full_lfs=False):
-    """Run the existing v3 mirror engine under the new configuration layer."""
+def selected_platforms(settings, platform):
+    configured = settings['destinations']
+    if platform in ('both', 'all'):
+        return list(configured)
+    if platform not in configured:
+        raise SyncError(f'{platform} is not a configured destination')
+    return [platform]
+
+
+def run(settings, *, apply=False, only=None, platform='all', full_lfs=False):
     configure_runtime(settings, apply=apply)
     for executable in ('git', 'ssh', 'git-lfs'):
         if shutil.which(executable) is None:
             raise SyncError(f'Missing executable: {executable}')
-    platforms = selected_platforms(platform)
-    gh_headers = {'Authorization': f'Bearer {token(settings["source"])}',
-                  'X-GitHub-Api-Version': '2022-11-28'}
-    gl_headers = {'PRIVATE-TOKEN': token(settings['destinations']['gitlab'])} if 'gitlab' in platforms else {}
-    cb_headers = {'Authorization': f'token {token(settings["destinations"]["codeberg"])}'} if 'codeberg' in platforms else {}
-    if apply and 'gitlab' in platforms:
-        recover_all_gl_permissions(gl_headers)
-    gl_user = 'not selected'
-    if 'gitlab' in platforms:
-        gl_status, user = api(f'{GL_API}/user', gl_headers)
-        if gl_status != 200 or not isinstance(user, dict) or not user.get('username'):
-            raise SyncError('Cannot validate GitLab account')
-        gl_user = user['username']
-    if 'codeberg' in platforms:
-        cb_status, cb_user = api(f'{CB_API}/user', cb_headers)
-        if (cb_status != 200 or not isinstance(cb_user, dict) or
-                cb_user.get('login', '').lower() != CB_OWNER.lower()):
-            raise SyncError('Cannot validate Codeberg account')
-    repos = discover_repos(gh_headers)
-    print(f'GitHub: {GH_OWNER} -> GitLab: {gl_user} / Codeberg: {CB_OWNER}')
+    platforms = selected_platforms(settings, platform)
+    source = Provider.from_config(settings['source'])
+    scope = scope_id(settings['source'])
+    providers = {}
+    local = None
+    successes = failures = 0
+    for target in platforms:
+        spec = settings['destinations'][target]
+        try:
+            if target == 'local':
+                path = spec['path']
+                local = (path, backup_volume(path), scope)
+                continue
+            provider = Provider.from_config(spec).authenticate()
+            if apply and target == 'gitlab':
+                recover_all_gl_permissions(provider.headers)
+            providers[target] = provider
+        except (SyncError, OSError) as exc:
+            print(f'{target}: BLOCKED: {exc}')
+            failures += 1
+    if not providers and not local:
+        return 1
+
+    repos = source.discover()
+    print(f'{source.label}: {source.owner} -> {", ".join(platforms)}')
     print(f'Mode: {"APPLY" if apply else "DRY RUN"} | Discovered: {len(repos)} | Run: {RUN_ID}')
     if only:
-        repos = [r for r in repos if r['name'].lower() == only.lower()]
+        repos = [repo for repo in repos if repo['name'].casefold() == only.casefold()]
         if not repos:
-            raise SyncError(f'{only} not found among accessible GitHub repositories; no changes made')
-    successes = failures = 0
+            raise SyncError(f'{only} not found among accessible {source.label} repositories; no changes made')
+    work_scope = scope if settings['version'] == 2 else None
     for n, repo in enumerate(repos, 1):
         print(f'\n[{n}/{len(repos)}] {repo["name"]}')
         try:
-            ok, bad = sync_repository(repo, gh_headers, gl_headers, cb_headers,
-                                      gl_user, apply, platforms, full_lfs=full_lfs)
+            ok, bad = sync_repository(repo, source, providers, local, work_scope, apply, full_lfs=full_lfs)
             successes += ok
             failures += bad
-        except SyncError as exc:
+        except (SyncError, OSError) as exc:
             print(f'  FAILED safely: {exc}')
             failures += 1
-    print(f'\nSUMMARY: repositories={len(repos)}, successful/checked destinations={successes}, failed={failures}, mode={"apply" if apply else "dry-run"}')
-    print('Missing GitHub repositories are never deleted from destinations.')
+    print(f'\nSUMMARY: repositories={len(repos)}, successful/checked destinations={successes}, '
+          f'failed={failures}, mode={"apply" if apply else "dry-run"}')
+    print('Missing source repositories are never deleted from destinations.')
     return 0 if failures == 0 else 1
 
 
 # Read-only diagnostics
 
 
-def doctor(config, *, network=False, ssh=False, only=None, platform='both'):
+def doctor(config, *, network=False, ssh=False, only=None, platform='all'):
     results = []
 
     def report(status, item, detail):
@@ -1163,70 +1565,65 @@ def doctor(config, *, network=False, ssh=False, only=None, platform='both'):
     except (OSError, StopIteration):
         report('ERROR', 'storage', 'cannot inspect the backup directory or volume')
 
+    platforms = selected_platforms(settings, platform)
+    if 'local' in platforms:
+        try:
+            path = local_path(settings)
+            backup_volume(path)
+            free = shutil.disk_usage(path).free
+            report('OK' if free else 'ERROR', 'local backup volume', f'{free:,} bytes free')
+        except (SyncError, OSError):
+            report('ERROR', 'local backup volume', 'mount the configured volume and check its initialization')
     if network or ssh:
         configure_runtime(settings, apply=False)
-        doctor_network(settings, selected_platforms(platform), ssh, only, report)
+        doctor_network(settings, platforms, ssh, only, report)
     else:
         report('WARNING', 'provider and SSH checks', 'skipped; pass --network or --ssh to opt in')
     return 2 if 'ERROR' in results else 0
 
 
-def selected_platforms(platform):
-    return ['gitlab', 'codeberg'] if platform == 'both' else [platform]
-
-
 def doctor_network(settings, platforms, ssh, only, report):
-    providers = {
-        'github': (settings['source'], GH_API, 'login', GH_OWNER, 'Authorization', 'Bearer '),
-        'gitlab': (settings['destinations']['gitlab'], GL_API, 'username', None, 'PRIVATE-TOKEN', ''),
-        'codeberg': (settings['destinations']['codeberg'], CB_API, 'login', CB_OWNER, 'Authorization', 'token '),
-    }
-    authenticated = {}
-    for name in ('github', *platforms):
-        spec, base, field, expected, header, prefix = providers[name]
+    def connect(spec):
+        name = spec['provider']
         try:
-            headers = {header: prefix + token(spec)}
+            provider = Provider.from_config(spec)
         except (SyncError, ValueError):
             report('ERROR', f'{name} credentials', 'configured token is missing or unreadable')
-            continue
-        if name == 'github':
-            headers['X-GitHub-Api-Version'] = '2022-11-28'
+            return None
         try:
-            status, account = api(f'{base}/user', headers)
-            login = account.get(field) if isinstance(account, dict) else None
-            if status != 200 or not isinstance(login, str) or not login:
-                raise SyncError('Authentication failed')
-            if expected and login.casefold() != expected.casefold():
-                report('ERROR', f'{name} API', 'authenticated account differs from the configured owner')
-                continue
+            provider = provider.authenticate()
         except (SyncError, ValueError):
-            report('ERROR', f'{name} API', 'identity request failed; check credentials and network access')
-            continue
-        authenticated[name] = (headers, login)
+            report('ERROR', f'{name} API', 'identity request failed; check credentials, owner and network access')
+            return None
         report('OK', f'{name} API', 'authenticated identity request succeeded')
+        return provider
 
+    source = connect(settings['source'])
+    providers = [provider for target in platforms if target != 'local'
+                 if (provider := connect(settings['destinations'][target])) is not None]
     if not ssh:
         return
     try:
-        if 'github' not in authenticated:
+        if source is None:
             raise SyncError('Source authentication failed')
-        repos = discover_repos(authenticated['github'][0])
-        record = next(repo for repo in repos if only is None or repo['name'].casefold() == only.casefold())
+        record = next(repo for repo in source.discover()
+                      if only is None or repo['name'].casefold() == only.casefold())
     except (SyncError, StopIteration, ValueError):
         report('ERROR', 'SSH', 'cannot select an accessible source repository')
         return
 
-    for name, (headers, login) in authenticated.items():
+    for index, provider in enumerate([source, *providers]):
+        name = provider.kind
         try:
-            if name == 'github':
-                url = record.get('ssh_url')
+            if index == 0:
+                url = record['ssh_url']
             else:
-                destination = read_destination(name, record['name'], headers, login)
-                url = destination.url if destination else None
-            if not url and name != 'github':
-                report('WARNING', f'{name} SSH', 'matching destination is absent; read access was not checked')
-                continue
-            if not isinstance(url, str) or not re.match(r'^(ssh://|[^/@:\s]+@[^/:\s]+:)', url):
+                destination = provider.read_destination(record['name'])
+                if destination is None:
+                    report('WARNING', f'{name} SSH', 'matching destination is absent; read access was not checked')
+                    continue
+                url = destination.url
+            if not re.match(r'^(ssh://|[^/@:\s]+@[^/:\s]+:)', url):
                 raise SyncError('SSH URL unavailable')
             git('ls-remote', '--heads', '--tags', '--', url, timeout=30, retry=False,
                 env={**SSH_ENV, 'GIT_ALLOW_PROTOCOL': 'ssh'})
@@ -1243,18 +1640,22 @@ def main(argv=None):
     parser.add_argument('--config', default='config.yml', help='Path to YAML config')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', help='Validate YAML without connecting to providers')
+    sub.add_parser('init-backup', help='Initialize a configured local backup directory on its mounted volume')
+    verification = sub.add_parser('verify-backup', help='Verify local backups and archives offline')
+    verification.add_argument('--only', help='Verify the backup for one repository name')
     health = sub.add_parser('doctor', help='Check dependencies, configuration, and backup storage')
     health.add_argument('--network', action='store_true', help='Check provider credentials and API access')
     health.add_argument('--ssh', action='store_true', help='Check provider credentials and SSH Git read access')
     health.add_argument('--only', help='Repository to sample for the SSH check')
-    health.add_argument('--platform', choices=['both', 'gitlab', 'codeberg'], default='both')
+    targets = ['all', 'both', *PROVIDER_APIS, 'local']
+    health.add_argument('--platform', choices=targets, default='all')
     for name in ('sync', 'run'):
         command = sub.add_parser(name)
         mode = command.add_mutually_exclusive_group()
         mode.add_argument('--apply', action='store_true', help='Make changes (default: dry-run)')
         mode.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
         command.add_argument('--only', help='Only one repository')
-        command.add_argument('--platform', choices=['both', 'gitlab', 'codeberg'], default='both')
+        command.add_argument('--platform', choices=targets, default='all')
         command.add_argument('--verify-lfs', action='store_true', help='Recheck all archived and mirrored LFS objects (requires --apply)')
     args = parser.parse_args(argv)
     if args.command in ('sync', 'run') and args.verify_lfs and not args.apply:
@@ -1266,6 +1667,13 @@ def main(argv=None):
         if args.command == 'validate':
             print(f'Config valid: {Path(args.config).expanduser()}')
             return 0
+        if args.command == 'init-backup':
+            return initialize_backup(cfg)
+        if args.command == 'verify-backup':
+            configure_runtime(cfg, apply=False)
+            SSH_ENV['GIT_ALLOW_PROTOCOL'] = 'file'
+            SSH_ENV['GIT_NO_LAZY_FETCH'] = '1'
+            return verify_local_backups(cfg, args.only)
         def execute():
             if not args.apply:
                 return run(cfg, only=args.only, platform=args.platform)
@@ -1284,7 +1692,7 @@ def main(argv=None):
             result = execute()
             print(f'Sync cycle finished with status {result}', flush=True)
             time.sleep(cfg['schedule']['interval_hours'] * 3600)
-    except (ConfigError, SyncError, OSError) as exc:
+    except (ConfigError, SyncError, OSError, Timeout) as exc:
         print(f'GitMirror: {exc}', file=sys.stderr)
         return 2
     except KeyboardInterrupt:
