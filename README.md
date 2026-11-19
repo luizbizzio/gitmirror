@@ -142,6 +142,15 @@ Source Sans Pro is bundled locally under its SIL Open Font License, so no extern
 font provider is required. The setup form has section shortcuts for quicker navigation.
 On a new managed install, you can inspect the dashboard and settings before clicking
 **Setup** in the top bar. Private operations and repository information remain protected until login.
+The dashboard also shows two storage doughnut charts: source repository sizes reported
+by GitHub, GitLab or Codeberg (when the provider includes them), and logical file
+sizes of the repositories in configured local backup volumes. Source estimates can
+exclude Git LFS or other provider storage, and logical backup bytes count linked
+file paths individually rather than measuring unique allocated disk blocks.
+The inventory is fetched read-only on first authenticated dashboard access and can
+be refreshed from Repositories. Unavailable sizes remain unknown, not zero.
+Before any repositories are connected, the charts display an explanation rather
+than invented percentages.
 After setup, the dashboard shows source inventory, applied sync outcomes, the next observed scheduler cycle,
 work and backup storage, and integrity per backup generation. An available volume
 can contain unverified backups. Verification reports the last observed check; use
