@@ -237,6 +237,8 @@ upgrade() {
     local installed newest
     installed=$(cat "$app/current/version")
     if [[ "$installed" == "$tag" ]]; then
+        [[ -f "$app/current/digest" && "$(cat "$app/current/digest")" == "$checksum" ]] ||
+            fail 'The installed version tag matches, but the archive digest differs; refusing to replace it'
         printf 'GitMirror is already up to date (%s).\n' "$tag"
         return 0
     fi
