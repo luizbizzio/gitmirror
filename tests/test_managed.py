@@ -160,3 +160,26 @@ def test_maintenance_guard_blocks_applied_sync_without_service_environment(tmp_p
     custom_guard.touch()
     monkeypatch.setenv('GITMIRROR_MAINTENANCE_GUARD', str(custom_guard))
     assert gitmirror.managed_writes_blocked(settings)
+
+
+def test_unconfigured_dashboard_has_preview_without_opening_private_apis(installation):
+    managed, setup = installation
+    with TestClient(managed_app(managed), base_url='http://localhost') as client:
+        status = client.get('/api/setup')
+        assert status.status_code == 200
+        assert status.json()['required'] is True
+        html = client.get('/')
+        script = client.get('/assets/app.js')
+        styles = client.get('/assets/style.css')
+        assert html.status_code == 200 and script.status_code == 200 and styles.status_code == 200
+        assert 'id="top-setup"' in html.text
+        assert 'id="settings-preview"' in html.text
+        assert 'id="setup"' in html.text
+        assert 'enterPreview(data)' in script.text
+        assert 'if (previewMode || !csrf) return;' in script.text
+        assert 'style="height:' not in script.text
+        assert '.sidebar-status' in styles.text
+        assert setup['code'] not in html.text
+        assert setup['source']['token'] not in html.text
+        assert client.get('/api/overview').status_code == 401
+        assert client.get('/api/managed/settings').status_code == 401
