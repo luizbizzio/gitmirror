@@ -780,6 +780,7 @@ function openConfiguration(initial, data) {
   const wrapper = initial ? $("#setup-editor") : $("#settings-editor");
   wrapper.replaceChildren($("#configuration-template").content.cloneNode(true));
   const form = wrapper.querySelector("form");
+  let showWizardStep = null;
   const sectionNames = ["Administrator", "Source", "Destinations", "SSH keys", "Schedule"];
   const sections = [...form.querySelectorAll(":scope > article.panel")];
   const index = document.createElement("nav");
@@ -792,6 +793,7 @@ function openConfiguration(initial, data) {
     link.className = "configuration-jump";
     link.textContent = sectionNames[position];
     link.addEventListener("click", () => {
+      if (initial && showWizardStep) { showWizardStep(position); return; }
       for (const item of index.querySelectorAll("button")) item.removeAttribute("aria-current");
       link.setAttribute("aria-current", "step");
       section.scrollIntoView({behavior: "smooth", block: "start"});
@@ -828,6 +830,92 @@ function openConfiguration(initial, data) {
     } catch (failure) { feedback.textContent = failure.message; }
     finally { trigger.disabled = false; }
   });
+  if (initial) {
+    form.classList.add("setup-wizard");
+    form.noValidate = true;
+    const review = document.createElement("section");
+    review.className = "wizard-review panel";
+    review.hidden = true;
+    review.innerHTML = '<header><h2>Review configuration</h2></header>' +
+      '<p class="muted">Check your choices before activating GitMirror. Secrets are never displayed here.</p>' +
+      '<dl class="data wizard-review-data"></dl>';
+    const footer = form.querySelector(":scope > .form-footer");
+    form.insertBefore(review, footer);
+    const controls = document.createElement("div");
+    controls.className = "wizard-controls";
+    controls.innerHTML = '<span class="wizard-progress" role="status" aria-live="polite"></span>' +
+      '<div class="wizard-buttons"><button type="button" class="button secondary wizard-previous">Back</button>' +
+      '<button type="button" class="button primary wizard-next">Continue</button></div>';
+    form.insertBefore(controls, footer);
+    let current = 0, furthest = 0;
+    const choices = [...index.querySelectorAll("button")];
+    const validate = (section) => {
+      for (const element of section.querySelectorAll("input, select, textarea")) {
+        if (element.disabled || element.closest("[hidden]")) continue;
+        if (!element.checkValidity()) {
+          element.reportValidity();
+          return false;
+        }
+      }
+      return true;
+    };
+    showWizardStep = (requested) => {
+      if (requested > furthest || requested < 0 || requested > sections.length) return;
+      current = requested;
+      sections.forEach((section, i) => { section.hidden = i !== current; });
+      review.hidden = current !== sections.length;
+      footer.classList.toggle("wizard-footer-visible", current === sections.length);
+      controls.querySelector(".wizard-previous").disabled = current === 0;
+      controls.querySelector(".wizard-next").hidden = current === sections.length;
+      controls.querySelector(".wizard-progress").textContent =
+        `Step ${current + 1} of ${sections.length + 1}`;
+      choices.forEach((choice, i) => {
+        if (i === current) choice.setAttribute("aria-current", "step");
+        else choice.removeAttribute("aria-current");
+        choice.disabled = i > furthest;
+      });
+      if (current === sections.length) {
+        const values = [
+          ["Source", form.querySelector(".source-fields [name=provider]").value],
+          ["Destinations", String(destinations.querySelectorAll("fieldset").length)],
+          ["Schedule interval", `${form.elements.hours.value} hours`],
+          ["Automatic synchronization", form.elements.enabled.checked ? "Enabled" : "Disabled"],
+        ];
+        const summary = review.querySelector(".wizard-review-data");
+        summary.replaceChildren();
+        for (const [label, value] of values) {
+          const dt = document.createElement("dt"), dd = document.createElement("dd");
+          dt.textContent = label; dd.textContent = value;
+          summary.append(dt, dd);
+        }
+      }
+      $("#setup").scrollTop = 0;
+    };
+    controls.querySelector(".wizard-previous").addEventListener("click", () => showWizardStep(current - 1));
+    controls.querySelector(".wizard-next").addEventListener("click", () => {
+      if (current < sections.length && validate(sections[current])) {
+        furthest = Math.max(furthest, current + 1);
+        showWizardStep(current + 1);
+      }
+    });
+    form.addEventListener("submit", (event) => {
+      for (let i = 0; i < sections.length; i++) {
+        sections[i].hidden = false;
+        const valid = validate(sections[i]);
+        sections[i].hidden = true;
+        if (!valid) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          furthest = Math.max(furthest, i);
+          showWizardStep(i);
+          const target = sections[i].querySelector(":invalid");
+          target?.reportValidity();
+          return;
+        }
+      }
+    }, {capture: true});
+    showWizardStep(0);
+  }
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const submit = form.querySelector("button[type=submit]");
