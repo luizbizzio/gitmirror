@@ -146,8 +146,9 @@ visibility and last observed status, with details per destination.
 
 The managed installer and browser setup are documented in the [installation and
 maintenance guide](INSTALL.md). It describes the pending release command, verified
-release artifacts, localhost and LAN HTTPS, staged migration, upgrades, rollback
-and uninstall. Package and systemd support target Debian 12+ and Raspberry Pi OS
+release artifacts, localhost and LAN HTTPS, upgrades, rollback and
+uninstall. Old experimental installations must be stopped separately before
+managed synchronization is enabled. Package and systemd support target Debian 12+ and Raspberry Pi OS
 ARM64. Use the standalone installation below for Windows or Docker.
 
 ### Activity and monitoring
