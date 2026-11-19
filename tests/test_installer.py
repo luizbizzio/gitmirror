@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Li
 ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_FILES = [
     'INSTALL.md', 'LICENSE', 'NOTICE.txt', 'README.md', 'gitmirror.py', 'install.sh',
-    'packaging/legacy.sh', 'packaging/lifecycle.sh', 'pyproject.toml', 'web/app.js',
+    'packaging/lifecycle.sh', 'pyproject.toml', 'web/app.js',
     'web/index.html', 'web/style.css',
 ]
 
@@ -97,54 +97,14 @@ def test_dependencies_require_approval_and_install_only_missing(tmp_path):
     assert (tmp_path / 'apt.calls').read_text().splitlines() == ['update', 'install -y -- git-lfs']
 
 
-def test_cron_match_reports_entries_and_not_environment_or_comments(tmp_path):
-    cron = ('# gitmirror comment\nTOKEN=gitmirror-secret\n'
-            '0 * * * * TOKEN=hidden flock -n /run/gm.lock python3 /srv/gitmirror.py\n'
-            '0 2 * * * unrelated-job\n')
-    (tmp_path / 'cron').write_text(cron)
-    result = shell('cron_matches < cron | cut -d: -f1', tmp_path)
-    assert result.stdout.strip() == '3'
-
-
-def test_migration_refuses_cron_with_an_unrelated_second_command(tmp_path):
-    result = shell('''
-        source "$PROJECT/packaging/legacy.sh"
-        line="@hourly /usr/bin/flock -n /run/gm.lock /usr/bin/python3 -u /srv/gitmirror.py"
-        selected_legacy_command "$line >> /var/log/gitmirror.log 2>&1" /run/gm.lock
-        ! selected_legacy_command "$line && /srv/another-job" /run/gm.lock
-        ! selected_legacy_command "0 * * * * /srv/another-job; ${line#@hourly }" /run/gm.lock
-        ! selected_legacy_command "$line" /run/different.lock
-    ''', tmp_path)
+def test_installer_exposes_clean_lifecycle_only(tmp_path):
+    result = subprocess.run(['bash', str(ROOT / 'install.sh'), '--help'],
+                            capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-
-
-def test_migration_accepts_the_pi_cron_and_a_missing_tmp_flock(tmp_path):
-    result = shell('''
-        source "$PROJECT/packaging/legacy.sh"
-        line="0 0,12 * * * /usr/bin/flock -n /tmp/gitmirror.lock /usr/bin/python3 -u /home/rpi5/bin/gitmirror.py --apply >> /home/rpi5/gitmirror.log 2>&1"
-        selected_legacy_command "$line" /tmp/gitmirror.lock
-        [[ "$legacy_target" == /home/rpi5/bin/gitmirror.py ]]
-        old_lock="$PWD/temporary-future-lock"
-        valid_legacy_lock_path
-        ln -s target "$old_lock"
-        ! valid_legacy_lock_path
-    ''', tmp_path)
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.skipif(not shutil.which('jq'), reason='cron reload verification requires jq')
-def test_cron_reload_proof_excludes_older_and_unrelated_reload_events(tmp_path):
-    result = shell('''
-        source "$PROJECT/packaging/legacy.sh"
-        old_user=rpi5
-        echo '{"MESSAGE":"(rpi5) RELOAD (crontabs/rpi5)","__MONOTONIC_TIMESTAMP":"100"}' >old
-        ! cron_reloaded_after 100 <old
-        echo '{"MESSAGE":"(someone) RELOAD (crontabs/someone)","__MONOTONIC_TIMESTAMP":"101"}' >>old
-        ! cron_reloaded_after 100 <old
-        echo '{"MESSAGE":"(rpi5) RELOAD (crontabs/rpi5)","__MONOTONIC_TIMESTAMP":"102"}' >>old
-        cron_reloaded_after 100 <old
-    ''', tmp_path)
-    assert result.returncode == 0, result.stderr
+    assert 'install' in result.stdout and 'upgrade' in result.stdout
+    assert 'migrate' not in result.stdout and 'cutover' not in result.stdout
+    assert not (ROOT / 'packaging/legacy.sh').exists()
+    assert 'packaging/legacy.sh' not in (ROOT / 'install.sh').read_text()
 
 
 @pytest.mark.parametrize('startup', ['success', 'failure', 'previous-link-failure'])

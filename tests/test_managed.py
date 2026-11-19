@@ -1,10 +1,7 @@
 """Guided setup tests with synthetic passwords, tokens and SSH keys."""
 import base64
 import hashlib
-import io
-import os
 from pathlib import Path
-import sys
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -135,99 +132,31 @@ def test_setup_host_key_lookup_requires_bootstrap_and_exact_fingerprint(installa
         assert calls[-1][-1] == 'mirror.example.invalid'
 
 
-def test_migration_blocks_enable_and_web_apply_but_allows_diagnostics(installation, monkeypatch):
+def test_browser_setup_can_enable_schedule(installation):
     managed, setup = installation
-    guard = managed.root / 'migration-pending'
-    guard.touch()
-    monkeypatch.setenv('GITMIRROR_MIGRATION_GUARD', str(guard))
+    setup['schedule']['enabled'] = True
     with TestClient(managed_app(managed), base_url='http://localhost') as client:
-        assert client.get('/api/setup').json()['migration_pending'] is True
-        enabled = {**setup, 'schedule': {**setup['schedule'], 'enabled': True}}
-        assert client.post('/api/setup', json=enabled).status_code == 400
-        outside = [{**setup['destinations'][0], 'path': str(managed.root.parent / 'legacy-storage')}]
-        assert client.post('/api/setup', json={**setup, 'destinations': outside}).status_code == 400
-        assert managed.active() is None
         assert client.post('/api/setup', json=setup).status_code == 200
-    with TestClient(managed_app(managed), base_url='http://localhost') as client:
-        assert client.post('/api/managed/check', json={}).status_code == 401
-        header = login(client)
-        assert client.post('/api/managed/check', headers=header, json={'ssh': 1}).status_code == 400
-        assert client.post('/api/sync', headers=header, json={'apply': True, 'confirmation': 'SYNC ALL'}).status_code == 409
-        settings = gitmirror.load_config(managed.active().config)
-        with pytest.raises(gitmirror.SyncError, match='paused'):
-            gitmirror.execute_sync(settings, apply=True)
+    assert gitmirror.load_config(managed.active().config)['schedule']['enabled'] is True
 
 
-def test_official_managed_cli_checks_recorded_guards_without_service_environment(tmp_path, monkeypatch):
+def test_maintenance_guard_blocks_applied_sync_without_service_environment(tmp_path, monkeypatch):
     etc = tmp_path / 'etc'
     work = tmp_path / 'work'
     etc.mkdir()
     monkeypatch.setattr(gitmirror, 'MANAGED_SYSTEM_STATE', work)
     monkeypatch.setattr(gitmirror, 'MANAGED_SYSTEM_ETC', etc)
-    monkeypatch.delenv('GITMIRROR_MIGRATION_GUARD', raising=False)
     monkeypatch.delenv('GITMIRROR_MAINTENANCE_GUARD', raising=False)
     settings = {'storage': {'path': work}}
-    (etc / 'migration-pending').touch()
+    guard = etc / 'maintenance-pending'
+    guard.touch()
+    assert gitmirror.managed_writes_blocked(settings)
     with pytest.raises(gitmirror.SyncError, match='paused'):
         gitmirror.execute_sync(settings, apply=True)
     assert not work.exists()
-    (etc / 'migration-pending').unlink()
-    (etc / 'legacy').mkdir()
-    assert gitmirror.managed_writes_blocked(settings)
-    (etc / 'migration-state').write_text('blocked\nLost power while cron was parked\n')
-    assert gitmirror.managed_writes_blocked(settings)
-    (etc / 'migration-state').write_text('complete\nOriginal cron parked\n')
+    guard.unlink()
     assert not gitmirror.managed_writes_blocked(settings)
-    (etc / 'migration-pending').touch()
+    custom_guard = tmp_path / 'manual-maintenance'
+    custom_guard.touch()
+    monkeypatch.setenv('GITMIRROR_MAINTENANCE_GUARD', str(custom_guard))
     assert gitmirror.managed_writes_blocked(settings)
-
-
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux flock')
-def test_cutover_flock_honors_live_inode_and_can_lease_a_recreated_file(tmp_path, monkeypatch, capsys):
-    import fcntl
-
-    lock = tmp_path / 'legacy'
-    lock.touch()
-    expected = lock.stat().st_ino
-    monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
-    with lock.open('rb') as entry:
-        fcntl.flock(entry, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(gitmirror.SyncError, match='old job holds'):
-            gitmirror.hold_legacy_flock(lock)
-    lock.rename(tmp_path / 'previous-lock')
-    lock.touch()
-    gitmirror.hold_legacy_flock(lock)
-    assert int(capsys.readouterr().out.split()[1]) != expected
-    pipe = tmp_path / 'named-pipe'
-    os.mkfifo(pipe)
-    with pytest.raises(gitmirror.SyncError, match='regular file'):
-        gitmirror.hold_legacy_flock(pipe)
-    link = tmp_path / 'link'
-    link.symlink_to(lock)
-    with pytest.raises(gitmirror.SyncError, match='without following links'):
-        gitmirror.hold_legacy_flock(link)
-
-
-@pytest.mark.parametrize('arguments', [
-    b'/usr/bin/python3\x00-u\x00/home/rpi5/bin/gitmirror.py\x00--apply',
-    b'/usr/bin/flock\x00-n\x00/tmp/gitmirror.lock\x00/usr/bin/python3\x00-u\x00/home/rpi5/bin/gitmirror.py',
-    b'/bin/sh\x00-c\x00/usr/bin/flock -n /tmp/gitmirror.lock /usr/bin/python3 -u /home/rpi5/bin/gitmirror.py --apply',
-    b'python3\x00-u\x00./gitmirror.py\x00--apply',
-])
-def test_known_legacy_process_blocks_application_without_reading_the_tmp_lock(tmp_path, arguments):
-    record = tmp_path / 'target'
-    record.write_text('/home/rpi5/bin/gitmirror.py\n')
-    proc = tmp_path / 'proc'
-    (proc / 'self').mkdir(parents=True)
-    mountinfo = proc / 'self/mountinfo'
-    mountinfo.write_text('44 24 0:16 / /proc rw,nosuid - proc proc rw\n')
-    process = proc / '123456789'
-    process.mkdir()
-    (process / 'cmdline').write_bytes(arguments)
-    with pytest.raises(gitmirror.SyncError, match='process 123456789'):
-        gitmirror.assert_legacy_job_inactive(record, proc=proc)
-    (process / 'cmdline').write_bytes(b'/opt/gitmirror-managed/current/venv/bin/python3\x00/elsewhere/gitmirror.py')
-    gitmirror.assert_legacy_job_inactive(record, proc=proc)
-    mountinfo.write_text('44 24 0:16 / /proc rw,nosuid - proc proc rw,hidepid=2\n')
-    with pytest.raises(gitmirror.SyncError, match='hides other users'):
-        gitmirror.assert_legacy_job_inactive(record, proc=proc)
