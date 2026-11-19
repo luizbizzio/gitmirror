@@ -2,6 +2,35 @@
 
 The managed installer targets Debian 12 or later and Debian-based Raspberry Pi OS with systemd, on amd64 and ARM64. Windows and Docker use the existing installation methods.
 
+## Pi-hole-style command-line updates
+
+After the **first** managed installation, GitMirror places a small administrator
+launcher at `/usr/local/bin/gitmirror`. Update it with the same kind of command
+used by Pi-hole:
+
+```sh
+gitmirror -up
+```
+
+`gitmirror update` is an alias. This command checks for a newer version, prints
+the current and candidate versions, and applies the update when available. It
+may request your normal `sudo` password, but does **not** ask you to type
+`UPGRADE` again. No `git clone`, archive creation, release tag or curl command
+is needed after the first installation. When the installed version is already
+current, the command makes no service changes.
+
+Other management commands: `gitmirror -v` shows the installed version;
+`gitmirror status`, `gitmirror check`, `gitmirror rollback` and
+`gitmirror uninstall` call the corresponding managed operations. Unrecognized
+arguments go to the existing Python `gitmirror` CLI in the virtual environment.
+Rollback and uninstall retain their explicit confirmation prompts.
+
+On systems installed before the command launcher was introduced, run the
+one-command installer **once** to upgrade and register the command. Existing
+backup volumes, credentials, TLS files, listener settings and application state
+are preserved. The previous release is retained for rollback. GitMirror does
+not schedule unattended application updates.
+
 ## One-command installation and updates
 
 The same command installs GitMirror on a clean system or updates an existing managed
