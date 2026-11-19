@@ -514,7 +514,8 @@ async function loadLog() {
 async function warmupInventory() {
   if (inventoryWarmupAttempted || !csrf || previewMode || !snapshot) return;
   const rows = snapshot.repository_storage?.repositories ?? [];
-  if (snapshot.inventory_at && rows.every((repo) => repo.bytes !== undefined)) return;
+  if (snapshot.inventory_at && (!rows.length ||
+      rows.some((repo) => Number.isSafeInteger(repo.bytes)))) return;
   inventoryWarmupAttempted = true;
   try {
     await post("/api/repositories/refresh", {});
