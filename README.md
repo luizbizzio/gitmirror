@@ -141,59 +141,59 @@ The first version includes:
 
 - Overview of configured source, destination accounts, working disk space and recent dashboard jobs.
 - Read-only repository discovery, destination configuration and local backup volume summaries.
-- Per-job activity history, live output via Server-Sent Events and searchable browser views.
-- Manual dry-run and applied synchronization through the existing \`sync\` command, using its normal file lock. Manual actions are **disabled by default**.
+- Per-job activity history, live output via Server-Sent Events and browser views.
+- Manual dry-run and applied synchronization through the existing `sync` command, using its normal file lock. Manual actions are **disabled by default**.
 - Local password authentication, 12-hour signed sessions, CSRF protection, login throttling, security headers and a hostname allowlist.
 
 The activity database records **web-started jobs only**. Existing external cron jobs are not yet included in dashboard history. Backup restore, cleanup and editing YAML are CLI-only for this first release. The UI never returns API tokens or password file contents.
 
 ### Install and run locally
 
-\`\`\`sh
+```sh
 python -m pip install -e ".[web]"
 mkdir -p ~/.config/gitmirror
 umask 077
 printf '%s\n' 'replace-with-a-strong-unique-password' > ~/.config/gitmirror/web-password
 chmod 600 ~/.config/gitmirror/web-password
 gitmirror --config config.yml web --password-file ~/.config/gitmirror/web-password
-\`\`\`
+```
 
 Open **http://127.0.0.1:8787** on the same machine.
 
-To allow authenticated browser-triggered synchronization, restart with \`--allow-actions\`. An applied sync additionally requires the confirmation \`SYNC\` for a single repository, or \`SYNC ALL\` when no repository is selected. The dashboard runs the same CLI in a child process and its apply operation uses the existing GitMirror lock. Do not start web actions against untested production repositories.
+To allow authenticated browser-triggered synchronization, restart with `--allow-actions`. An applied sync additionally requires the confirmation `SYNC` for a single repository, or `SYNC ALL` when no repository is selected. The dashboard runs the same CLI in a child process and its apply operation uses the existing GitMirror lock. Do not start web actions against untested production repositories.
 
 On a remote Raspberry Pi, prefer an SSH tunnel to expose the loopback service to your computer:
 
-\`\`\`sh
+```sh
 ssh -L 8787:127.0.0.1:8787 rpi5@YOUR_PI_IP
-\`\`\`
+```
 
-Then browse to \`http://127.0.0.1:8787\` on your computer.
+Then browse to `http://127.0.0.1:8787` on your computer.
 
-For direct LAN access, use a trusted network or, preferably, an HTTPS reverse proxy or VPN. Bind to a non-loopback address only with \`--allow-lan\`, and explicitly allow the hostname or IP users will visit:
+For direct LAN access, use a trusted network or, preferably, an HTTPS reverse proxy or VPN. Bind to a non-loopback address only with `--allow-lan`, and explicitly allow the hostname or IP users will visit:
 
-\`\`\`sh
+```sh
 gitmirror --config config.yml web --host 0.0.0.0 --allow-lan \
   --allowed-host rpi5.local --allowed-host 192.168.1.100 \
   --password-file ~/.config/gitmirror/web-password
-\`\`\`
+```
 
 **Do not expose the plain HTTP web port directly to the internet.** Passwords and session cookies are not encrypted over HTTP. Protect access with HTTPS or a secure tunnel. Use a separate backup user account and restrict access to the YAML, storage, SSH keys and password file.
 
 ### Optional Docker Compose service
 
-The main \`gitmirror\` service remains unchanged. The opt-in \`gitmirror-web\` service uses the same persistent data volume and is bound to the Docker host's loopback address:
+The main `gitmirror` service remains unchanged. The opt-in `gitmirror-web` service uses the same persistent data volume and is bound to the Docker host's loopback address:
 
-\`\`\`sh
+```sh
 # Create a strong secret; on Linux it must be readable by container UID 10001.
 umask 077
 printf '%s\n' 'replace-with-a-strong-unique-password' > docker/web-password
 sudo chown 10001:10001 docker/web-password
 chmod 600 docker/web-password
 docker compose --profile web up -d gitmirror-web
-\`\`\`
+```
 
-Open \`http://127.0.0.1:8787\` on the Docker host, or forward the port through SSH. For this service, its container binds to \`0.0.0.0\` internally, but Compose publishes the port to **127.0.0.1 only**. Add \`--allow-actions\` to the web service command only after testing. The Compose example deliberately leaves actions disabled.
+Open `http://127.0.0.1:8787` on the Docker host, or forward the port through SSH. For this service, its container binds to `0.0.0.0` internally, but Compose publishes the port to **127.0.0.1 only**. Add `--allow-actions` to the web service command only after testing. The Compose example deliberately leaves actions disabled.
 
 **Deployment status:** the initial web dashboard needs separate testing in native Python and Docker. The existing 113 engine tests do not validate the new dashboard. Keep production cron and credentials unchanged while testing.
 
