@@ -718,11 +718,23 @@ class Provider:
         return {'id': info['id'], 'name': name, 'owner': owner, 'ssh_url': url,
                 'private': visibility != 'public', 'visibility': visibility, 'default_branch': branch}
 
+    @staticmethod
+    def source_size_bytes(kind, metadata):
+        """Reported repository size, not a measurement of LFS or physical disk usage."""
+        if kind == 'gitlab':
+            statistics = metadata.get('statistics')
+            value = statistics.get('repository_size') if isinstance(statistics, dict) else None
+        else:
+            value = metadata.get('size')
+        if type(value) is not int or value < 0 or value > 10**15:
+            return None
+        return value if kind == 'gitlab' else value * 1024
+
     def discover(self):
         repos = {}
         query = {
             'github': '/user/repos?affiliation=owner&visibility=all&per_page=100',
-            'gitlab': '/projects?owned=true&per_page=100',
+            'gitlab': '/projects?owned=true&statistics=true&per_page=100',
             'codeberg': '/user/repos?limit=50',
         }[self.kind]
         seen = set()
@@ -732,6 +744,7 @@ class Provider:
                 raise SyncError(f'{self.label} returned an invalid repository list')
             for item in items:
                 record = self.repo_state(item)
+                record['size_bytes'] = self.source_size_bytes(self.kind, item)
                 if record['id'] in seen:
                     raise SyncError(f'{self.label} discovery returned duplicate repository IDs')
                 seen.add(record['id'])
@@ -2352,7 +2365,7 @@ class DashboardOperation:
             self.write('UPDATE operations SET heartbeat=? WHERE id=?', (time.time(), self.id))
 
     def inventory(self, records):
-        entries = [{key: repo[key] for key in ('id', 'name', 'default_branch', 'visibility')} for repo in records]
+        entries = [{key: repo.get(key) for key in ('id', 'name', 'default_branch', 'visibility', 'size_bytes')} for repo in records]
         self.write('INSERT OR REPLACE INTO inventory VALUES (?,?,?)',
                    (self.journal.scope, time.time(), json.dumps(entries)))
 
@@ -2489,12 +2502,24 @@ def dashboard_backups(settings, journal, sizes):
         try:
             volume = backup_volume(path)
             item['free'] = shutil.disk_usage(path).free
+            directories = backup_directories(path, journal.scope)
             if identifier not in sizes or sizes[identifier][0] != volume or sizes[identifier][1] < time.monotonic() - 60:
-                total = sum(file.stat().st_size for file in path.rglob('*') if not file.is_symlink() and file.is_file())
-                sizes[identifier] = volume, time.monotonic(), total
+                # Scan once for total and repository logical bytes; hardlinks count once per path.
+                directory_bytes = {directory.name: 0 for directory in directories}
+                total = 0
+                for file in path.rglob('*'):
+                    if file.is_symlink() or not file.is_file():
+                        continue
+                    length = file.stat().st_size
+                    total += length
+                    parts = file.relative_to(path).parts
+                    if len(parts) >= 3 and parts[0] == journal.scope and parts[1] in directory_bytes:
+                        directory_bytes[parts[1]] += length
+                sizes[identifier] = volume, time.monotonic(), total, directory_bytes
             item['used'] = sizes[identifier][2]
-            for directory in backup_directories(path, journal.scope):
-                status = {'id': directory.name, 'name': directory.name, 'error': None, 'generations': []}
+            for directory in directories:
+                status = {'id': directory.name, 'name': directory.name, 'error': None,
+                          'logical_bytes': sizes[identifier][3].get(directory.name), 'generations': []}
                 item['repositories'].append(status)
                 try:
                     current = current_backup(directory)
@@ -3123,7 +3148,20 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         except OSError:
             free = None
         checked, repositories = inventory()
-        _, current = backup_health(local_data())
+        volumes = local_data()
+        _, current = backup_health(volumes)
+        source_repositories = [{'id': repo['id'], 'name': repo['name'], 'bytes': repo.get('size_bytes')}
+                               for repo in repositories or []]
+        backup_repositories = {}
+        for volume in volumes:
+            if volume['error']:
+                continue
+            for repo in volume['repositories']:
+                length = repo.get('logical_bytes')
+                if type(length) is int:
+                    record = backup_repositories.setdefault(repo['id'],
+                        {'id': repo['id'], 'name': repo['name'], 'bytes': 0})
+                    record['bytes'] += length
         return {'source': {key: settings['source'][key] for key in ('provider', 'owner', 'api_url')},
                 'destinations': [dashboard_destination(s, k) for k, s in settings['destinations'].items()],
                 'schedule_hours': settings['schedule']['interval_hours'],
@@ -3132,6 +3170,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                         'writes_paused': managed_writes_blocked(settings),
                         'secure': bool(public_origin or request.url.scheme == 'https')},
                 'inventory_at': checked, 'total_repositories': None if repositories is None else len(repositories),
+                'repository_storage': {'metric': 'provider-reported', 'repositories': source_repositories},
+                'backup_storage': {'metric': 'logical-file-bytes', 'repositories': list(backup_repositories.values())},
                 'successful': summary.get('succeeded', {}).get('total', 0),
                 'failed': summary.get('failed', {}).get('total', 0),
                 'last_success': summary.get('succeeded', {}).get('last'),
@@ -3174,7 +3214,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             if at is not None and at >= time.time() - 30:
                 return {'checked': at, 'total': len(records)}
             records = Provider.from_config(settings['source']).authenticate().discover()
-            entries = [{key: repo[key] for key in ('id', 'name', 'default_branch', 'visibility')} for repo in records]
+            entries = [{key: repo.get(key) for key in ('id', 'name', 'default_branch', 'visibility', 'size_bytes')} for repo in records]
             at = time.time()
             journal.write('INSERT OR REPLACE INTO inventory VALUES (?,?,?)', (journal.scope, at, json.dumps(entries)))
             return {'checked': at, 'total': len(entries)}
