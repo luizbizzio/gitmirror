@@ -20,7 +20,7 @@ For a headless host, append `-s -- --lan rpi5.local` to `sudo bash`. Use a hostn
 
 ## Setup in the browser
 
-Open the printed URL and enter the one-time code. Set the administrator password, provider accounts and tokens, local disks and remote destinations, repository names, schedule and retention. Register the public key shown by the dashboard in the provider's account UI. The dashboard can match a host key against the provider's published SSH fingerprint. **Settings → Verify connections** checks API authentication and can sample an SSH read. This check does not establish push permissions. Select **Start scheduled applied synchronizations** when ready.
+Open the printed URL to view the dashboard and read the available settings before configuration. The empty state is a preview, not live repository data. Select **Setup** in the top-right corner and enter the one-time code. Set the administrator password, provider accounts and tokens, local disks and remote destinations, repository names, schedule and retention. Register the public key shown by the dashboard in the provider's account UI. The dashboard can match a host key against the provider's published SSH fingerprint. **Settings → Verify connections** checks API authentication and can sample an SSH read. This check does not establish push permissions. Select **Start scheduled applied synchronizations** when ready.
 
 A managed local destination gets its own directory automatically. External disks and NAS paths must already be mounted and writable by the service account. The advanced CLI is available at `/opt/gitmirror-managed/current/venv/bin/gitmirror`.
 
