@@ -24,29 +24,23 @@ Open the printed URL and enter the one-time code. Set the administrator password
 
 A managed local destination gets its own directory automatically. External disks and NAS paths must already be mounted and writable by the service account. The advanced CLI is available at `/opt/gitmirror-managed/current/venv/bin/gitmirror`.
 
-## Legacy migration
+## Replacing an experimental installation
 
-The installer's `status` command reports likely installations by path, process ID, cron owner and line number, or systemd unit. Reports omit cron command text and credentials. Detection covers conventional paths, user crontabs, system cron files and periodic directories. Scripts with unrelated names, remote schedulers and custom wrappers need operator review. Regular installation stops when it finds a potential legacy installation.
+This installer does not import or detect experimental GitMirror scripts, cron jobs,
+credentials or archives. It only refuses to overwrite the directories, services and
+service account of an existing **managed** GitMirror installation.
 
-Automated cutover supports one explicit **Debian user crontab** entry invoking an absolute GitMirror executable through `flock -n`. The lock may be temporary or absent at staging. The installer reports system cron jobs, periodic jobs, systemd services and additional GitMirror schedules for manual review. It leaves them untouched.
+Before a clean installation on a machine that already runs a separate GitMirror
+script, back up that script, its configuration, credentials, Git and LFS archives.
+Check that its sync is not running and disable its cron or other scheduler.
+The clean installation uses different directories and leaves old files untouched.
+Configure the new accounts and destinations in the browser, verify access and
+complete a dry-run before enabling any applied synchronization. Do not run the
+old and managed schedulers against the same repositories at the same time.
 
-Use a reviewed local copy of the bootstrap, or pass the same subcommand and flags after `sudo bash -s --` in the release command:
-
-```sh
-sudo bash install.sh migrate \
-  --legacy-cron rpi5 --cron-line 12 --legacy-lock /tmp/gitmirror.lock \
-  --preserve /home/rpi5/gitmirror/config.yml --preserve /home/rpi5/.config/gitmirror/token
-```
-
-Repeat `--preserve` for each configuration, standalone script or credential **file** to capture. The old scheduler continues during staging. The installer writes root-only copies of the selected files and original crontab under `/etc/gitmirror-managed/legacy`. Old Git history, LFS objects and archives remain in their original directories. New work, staging backups and credentials use separate storage. Use the browser to configure the new account with its own private credentials.
-
-Complete browser setup with scheduling off and use managed local backup directories during staging. Run `sudo bash install.sh cutover` when ready. Cutover runs a dry-run in disposable work storage. After confirmation, it holds the current legacy flock and checks for processes running the identified command, competing schedules, and crontab changes. If the lock file vanished, the original account creates it as it would on its next run. Only the selected line is parked. The installer waits for Debian cron to acknowledge the reload in the system journal and drain its child processes. Avoid editing cron concurrently. Busy jobs, a replaced lock during cutover, missing reload evidence, and restricted process visibility all keep managed writes paused.
-
-Run `sudo bash install.sh status` to see whether migration is staged, complete, blocked, or rolled back. A crash before completion leaves managed writes paused even across reboot. Run `cutover` again to recheck and finish, or select `rollback-migration` to restore the original schedule. A normal cutover failure restores the original table when the parked table still matches the saved copy.
-
-After completion, enable scheduling in the dashboard. Applied runs use `/etc/gitmirror-managed/sync.lock`, a root-owned file in a protected directory. Rebooting or clearing `/tmp` does not affect it. The managed engine detects visible invocations of the recorded legacy command before applying changes. Keep that command retired. A renamed copy, a process on another host, or a manual launch after the managed run's check is outside this protection.
-
-To switch back, run `sudo bash install.sh rollback-migration` and confirm. It persists the write pause, drains managed operations, and restores the exact original crontab if the parked copy still matches. The old job can recreate its own temporary lock on its next run. If cron has other edits, use the saved original for manual recovery while managed writes remain paused. Either direction preserves Git and LFS data and credentials.
+Managed applied runs use `/etc/gitmirror-managed/sync.lock`, a root-owned lock
+in a protected directory. It persists across reboot and protects managed jobs
+and maintenance operations, but does not coordinate with unrelated old scripts.
 
 ## Upgrade, rollback and uninstall
 
@@ -54,7 +48,7 @@ Use `status` to identify the active version and `check` to verify an available r
 
 For a trusted offline release, use `--tag vX.Y.Z --artifact FILE --sha256 HEX`. Obtain the digest through a trusted channel.
 
-Run `sudo bash install.sh uninstall` and confirm to remove the application and its two systemd services. The service account, backup volumes, configuration, credentials and migration records are retained. Legacy schedule recovery is separate.
+Run `sudo bash install.sh uninstall` and confirm to remove the application and its two systemd services. The service account, backup volumes, configuration and credentials are retained. Legacy schedule recovery is separate.
 
 ## Release preparation
 
@@ -63,7 +57,7 @@ Create `gitmirror-linux-source.tar.gz` from reviewed sources. The archive contai
 ```sh
 tar -czf gitmirror-linux-source.tar.gz --no-recursion \
   INSTALL.md LICENSE NOTICE.txt README.md gitmirror.py install.sh \
-  packaging/legacy.sh packaging/lifecycle.sh pyproject.toml \
+  packaging/lifecycle.sh pyproject.toml \
   web/app.js web/index.html web/style.css
 ```
 
