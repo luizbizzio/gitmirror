@@ -23,12 +23,13 @@ The installer does not modify unrelated experimental cron jobs.
 By default, the installer prefers the latest **stable, immutable** GitHub release
 with a matching verified SHA-256 archive. While the project has **no public stable
 release**, GitHub returns HTTP 404 for this lookup. In that case, the installer
-can offer a development snapshot from the current `main` branch, requiring you
-to type `DEV` before proceeding. This is not an immutable release. A revision
-is identified by its Git commit and the selected files are packed locally and
-checked before installation. To explicitly use the latest development snapshot,
-append `-s -- --dev` to `sudo bash`. This avoids the additional `DEV`
-confirmation but not confirmation of an actual upgrade.
+automatically uses a development snapshot from the current `main` branch and
+prints a warning. No separate development branch is created or required.
+This is not an immutable release: changes on `main` can be deployed by the next
+installation command. A revision is identified by its Git commit and the selected
+files are packed locally and checked before installation. To explicitly use the
+latest development snapshot even when a release exists, append `-s -- --dev`
+to `sudo bash`. Upgrades still require an explicit `UPGRADE` confirmation.
 
 A fresh install binds to localhost by default. For a headless Raspberry Pi,
 append `-s -- --lan rpi5` to `sudo bash` if `rpi5` resolves through
