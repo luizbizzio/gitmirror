@@ -14,7 +14,8 @@ scheduler=gitmirror-managed-scheduler.service
 unit_dir=/etc/systemd/system
 cli=/usr/local/bin/gitmirror
 files=(INSTALL.md LICENSE NOTICE.txt README.md gitmirror.py install.sh packaging/lifecycle.sh
-       pyproject.toml web/app.js web/index.html web/style.css)
+       pyproject.toml web/app.js web/index.html web/style.css web/fonts/LICENSE.md
+       web/fonts/source-sans-pro-regular.woff2 web/fonts/source-sans-pro-semibold.woff2 web/fonts/source-sans-pro-bold.woff2 web/fonts/source-sans-pro-italic.woff2)
 
 fail() { printf 'GitMirror: %s\n' "$*" >&2; exit 1; }
 
