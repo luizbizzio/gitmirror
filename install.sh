@@ -12,7 +12,7 @@ account=gitmirror-managed
 web=gitmirror-managed-web.service
 scheduler=gitmirror-managed-scheduler.service
 unit_dir=/etc/systemd/system
-files=(INSTALL.md LICENSE NOTICE.txt README.md gitmirror.py install.sh packaging/legacy.sh packaging/lifecycle.sh
+files=(INSTALL.md LICENSE NOTICE.txt README.md gitmirror.py install.sh packaging/lifecycle.sh
        pyproject.toml web/app.js web/index.html web/style.css)
 
 fail() { printf 'GitMirror: %s\n' "$*" >&2; exit 1; }
@@ -21,9 +21,8 @@ usage() {
     cat <<'EOF'
 GitMirror installer and maintenance
   install  [--port PORT] [--lan HOST_OR_IPV4]
-  migrate  --legacy-cron USER --cron-line N --legacy-lock PATH --preserve FILE [--preserve FILE ...]
-  cutover | rollback-migration | status | check | upgrade | rollback | uninstall
-  install, migrate and upgrade accept --tag vX.Y.Z and --yes (approve missing apt dependencies).
+  status | check | upgrade | rollback | uninstall
+  install and upgrade accept --tag vX.Y.Z and --yes (approve missing apt dependencies).
   A trusted offline release needs --artifact FILE --sha256 HEX --tag vX.Y.Z.
   Confirmation phrases are separate from --yes. See the installation guide.
 EOF
@@ -38,53 +37,6 @@ confirm() {
         read -r -p "Type $phrase to continue: " reply </dev/tty || fail 'An explicit confirmation is required'
         [[ "$reply" == "$phrase" ]] || fail 'Canceled'
     fi
-}
-
-cron_matches() {
-    awk 'tolower($0) ~ /git[-_]?mirror([[:space:]./[:punct:]]|$)/ &&
-        $0 !~ /^[[:space:]]*(#|[A-Za-z_][A-Za-z_0-9]*[[:space:]]*=)/ {print NR ":" $0}'
-}
-
-legacy_cron_reports() {
-    local file user contents match
-    if command -v crontab >/dev/null; then
-        while IFS=: read -r user _; do
-            contents=$(crontab -u "$user" -l 2>/dev/null) || continue
-            while IFS= read -r match; do
-                [[ -n "$match" ]] && printf 'user-cron:%s:%s\n' "$user" "${match%%:*}"
-            done < <(printf '%s\n' "$contents" | cron_matches)
-        done </etc/passwd
-    fi
-    for file in /etc/crontab /etc/cron.d/*; do
-        [[ -f "$file" ]] || continue
-        while IFS= read -r match; do
-            [[ -n "$match" ]] && printf 'system-cron:%s:%s\n' "$file" "${match%%:*}"
-        done < <(cron_matches <"$file")
-    done
-    for file in /etc/cron.{hourly,daily,weekly,monthly}/*; do
-        [[ -f "$file" ]] || continue
-        if [[ "$file" == *[Gg]it[Mm]irror* ]] || grep -qEi 'git[-_]?mirror' "$file"; then
-            printf 'periodic-cron:%s\n' "$file"
-        fi
-    done
-    systemctl list-unit-files --no-legend --no-pager |
-        awk 'tolower($1) ~ /git[-_]?mirror/ && $1 !~ /^gitmirror-managed-(web|scheduler)\.service$/ {print "unit:" $1}'
-}
-
-detect_legacy() {
-    local path home
-    for path in /opt/gitmirror /var/lib/gitmirror /etc/gitmirror /usr/local/bin/gitmirror /usr/bin/gitmirror; do
-        [[ ! -e "$path" && ! -L "$path" ]] || printf 'path:%s\n' "$path"
-    done
-    while IFS=: read -r _ _ _ _ _ home _; do
-        [[ -n "$home" && "$home" != "/" && -d "$home" ]] || continue
-        for path in "$home"/{gitmirror,gitmirror.py,gitmirror-data,.config/gitmirror,scripts/gitmirror.py,bin/gitmirror,bin/gitmirror.py}; do
-            [[ ! -e "$path" && ! -L "$path" ]] || printf 'path:%s\n' "$path"
-        done
-    done </etc/passwd
-    legacy_cron_reports
-    # Report PIDs only. Legacy command arguments can contain tokens.
-    ps -eo pid=,comm=,args= | awk '$2 ~ /^(python[0-9.]*|gitmirror|bash|sh|flock)$/ && $0 ~ /[ /]gitmirror(\.py)?( |$)/ && $0 !~ /\/(opt|var\/lib)\/gitmirror-managed\// {print "process:" $1}'
 }
 
 require_platform() {
@@ -175,10 +127,9 @@ release_source() {
 
 main() {
     action=install
-    tag= checksum= artifact= confirmation= lan= old_user= old_line= old_lock=
+    tag= checksum= artifact= confirmation= lan=
     approve=0 port=8787
-    preserve=()
-    case "${1:-}" in install|migrate|upgrade|rollback|cutover|rollback-migration|uninstall|status|check) action=$1; shift;; esac
+    case "${1:-}" in install|upgrade|rollback|uninstall|status|check) action=$1; shift;; esac
     while (($#)); do
         case "$1" in
             --yes) approve=1; shift; continue ;;
@@ -188,8 +139,6 @@ main() {
         case "$1" in
             --tag) tag=$2;; --artifact) artifact=$2;; --sha256) checksum=$2;;
             --confirm) confirmation=$2;; --port) port=$2;; --lan) lan=$2;;
-            --legacy-cron) old_user=$2;; --cron-line) old_line=$2;; --legacy-lock) old_lock=$2;;
-            --preserve) preserve+=("$2");;
             *) fail "Unknown parameter: $1";;
         esac
         shift 2
@@ -203,44 +152,26 @@ main() {
     flock -n 9 || fail 'Another GitMirror installation or maintenance operation is active'
     case "$action" in
         status)
-            [[ ! -f "$app/current/version" ]] || printf 'Installed release: %s\n' "$(cat "$app/current/version")"
-            if [[ -f "$etc/migration-state" ]]; then
-                { read -r phase; read -r reason; } <"$etc/migration-state"
-                if [[ "$phase" == complete && -e "$etc/migration-pending" ]]; then
-                    phase=blocked
-                    reason='Cutover was interrupted before managed writes could be enabled. Run cutover again or roll back.'
-                fi
-                printf 'Migration: %s\n%s\n' "$phase" "$reason"
-            elif [[ -d "$etc/legacy" || -e "$etc/migration-pending" ]]; then
-                printf 'Migration: blocked\nNo completed handoff is recorded. Run cutover or rollback-migration.\n'
+            if [[ -f "$app/current/version" ]]; then
+                printf 'Installed release: %s\n' "$(cat "$app/current/version")"
+            else
+                printf 'No managed installation found.\n'
             fi
             [[ ! -e "$etc/maintenance-pending" ]] || printf 'Maintenance pending. Applied runs are blocked.\n'
-            detect_legacy
             return 0 ;;
-        cutover|rollback-migration|rollback|uninstall)
+        rollback|uninstall)
             [[ -f "$app/current/lifecycle.sh" ]] || fail 'No managed installation found'
             source "$app/current/lifecycle.sh"
             lifecycle
             return ;;
     esac
-    if [[ "$action" == install || "$action" == migrate ]]; then
+    if [[ "$action" == install ]]; then
         [[ ! -e "$app" && ! -L "$app" && ! -e "$state" && ! -L "$state" &&
            ! -e "$etc" && ! -L "$etc" && ! -e "$unit_dir/$web" && ! -L "$unit_dir/$web" &&
            ! -e "$unit_dir/$scheduler" && ! -L "$unit_dir/$scheduler" ]] ||
             fail 'Managed installation or retained state already exists. Use status or upgrade'
         ! getent passwd "$account" >/dev/null && ! getent group "$account" >/dev/null ||
             fail 'The managed service account already exists'
-        detections=$(detect_legacy)
-        if [[ -n "$detections" ]]; then
-            printf 'Possible older GitMirror installation:\n%s\n' "$detections"
-            [[ "$action" == migrate ]] || fail 'Nothing was changed. Use the staged migration procedure'
-        fi
-        if [[ "$action" == migrate ]]; then
-            [[ "$old_user" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ && "$old_line" =~ ^[1-9][0-9]{0,5}$ &&
-               "$old_lock" == /* && "${#preserve[@]}" -gt 0 ]] ||
-                fail 'Choose an exact legacy user cron line, its flock path and the configuration files to preserve'
-            confirm STAGE 'Stage an isolated dashboard. The original installation and schedule stay active.'
-        fi
     else
         [[ -f "$app/current/version" ]] || fail 'No managed installation to upgrade'
         printf 'Installed release: %s\n' "$(cat "$app/current/version")"
