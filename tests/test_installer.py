@@ -271,6 +271,32 @@ def test_managed_cli_install_update_and_refuse_conflicting_commands(tmp_path):
     assert symlink.returncode != 0
 
 
+def test_managed_update_command_runs_installer_with_no_second_confirmation(tmp_path):
+    generated = shell("""
+        source "$PROJECT/packaging/lifecycle.sh"
+        managed_cli_content >launcher
+    """, tmp_path)
+    assert generated.returncode == 0, generated.stderr
+    installer = tmp_path / 'fake-installer'
+    installer.write_text('#!/usr/bin/env bash\\nprintf "%s\\\\n" "$@"\\n')
+    installer.chmod(0o755)
+    script = tmp_path / 'launcher'
+    text = script.read_text()
+    text = text.replace('installer=/opt/gitmirror-managed/current/install.sh',
+                        f'installer={installer}')
+    script.write_text(text)
+    script.chmod(0o755)
+    sudo = tmp_path / 'sudo'
+    sudo.write_text('#!/usr/bin/env bash\\n[[ "$1" == -- ]] && shift\\nexec "$@"\\n')
+    sudo.chmod(0o755)
+    env = {**os.environ, 'PATH': f'{tmp_path}:{os.environ["PATH"]}'}
+    for invocation in ('-up', 'update'):
+        response = subprocess.run([str(script), invocation], cwd=tmp_path, env=env,
+                                  capture_output=True, text=True, timeout=8)
+        assert response.returncode == 0, response.stderr
+        assert response.stdout.splitlines() == ['upgrade', '--confirm', 'UPGRADE']
+
+
 def test_upgrade_skips_same_version_only_when_digest_matches(tmp_path):
     source = """
         source "$PROJECT/packaging/lifecycle.sh"
