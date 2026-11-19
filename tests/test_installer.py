@@ -111,17 +111,34 @@ def test_automatic_install_upgrade_selection_does_not_overwrite_partial_state(tm
     assert 'refusing to overwrite' in failed.stderr
 
 
-def test_automatic_fallback_requires_explicit_development_confirmation(tmp_path):
+def test_automatic_fallback_uses_main_without_dev_confirmation(tmp_path):
     result = shell("""
         tag= checksum= artifact= development=0 confirmation=
         mkdir output
         fetch_release_metadata() { printf '404'; }
-        confirm() { [[ "$1" == DEV ]]; return 1; }
+        confirm() { printf unexpected-confirmation; return 1; }
+        development_source() {
+            [[ "$1" == output ]] || return 1
+            printf 'selected-main' > selected
+        }
+        release_source output
+        [[ "$(cat selected)" == selected-main ]]
+    """, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert 'No published stable release exists' in result.stdout
+    assert 'unexpected-confirmation' not in result.stdout
+
+
+def test_missing_explicit_release_tag_never_falls_back_to_main(tmp_path):
+    result = shell("""
+        tag=v9.9.9 checksum= artifact= development=0 confirmation=
+        mkdir output
+        fetch_release_metadata() { printf '404'; }
+        development_source() { printf unsafe-fallback > selected; }
         release_source output
     """, tmp_path)
     assert result.returncode != 0
-    assert 'No published stable release exists' in result.stdout
-    assert not (tmp_path / 'output/source').exists()
+    assert not (tmp_path / 'selected').exists()
 
 
 def test_dev_source_packages_allowlisted_files_and_identifies_commit(tmp_path):
