@@ -1,5 +1,6 @@
 """HTTP tests for the optional dashboard, using disposable Git repositories."""
 from contextlib import contextmanager
+import json
 from pathlib import Path
 import socket
 import threading
@@ -96,6 +97,60 @@ def test_authentication_revocation_expiration_and_headers(web_setup):
         assert client.get('/api/overview', headers={'Cookie': f'gm_session={prior}'}).status_code == 401
         login(client)
         wait_for(lambda: client.get('/api/session').status_code == 401, seconds=5)
+
+
+def test_source_size_units_and_unknown_values():
+    size = gitmirror.Provider.source_size_bytes
+    assert size('github', {'size': 1500}) == 1500 * 1024
+    assert size('codeberg', {'size': 8}) == 8192
+    assert size('gitlab', {'statistics': {'repository_size': 7000}}) == 7000
+    assert size('gitlab', {}) is None
+    assert size('github', {'size': True}) is None
+    assert size('github', {'size': -1}) is None
+
+
+def test_repository_size_dashboard_uses_authenticated_cached_inventory(web_setup):
+    with TestClient(app_for(web_setup), base_url='http://localhost') as client:
+        assert client.get('/api/overview').status_code == 401
+        login(client)
+        journal = gitmirror.DashboardJournal(web_setup[0])
+        records = [
+            {'id': 14, 'name': 'demo', 'visibility': 'private', 'default_branch': 'main',
+             'size_bytes': 4096},
+            {'id': 15, 'name': 'unknown', 'visibility': 'public', 'default_branch': 'main',
+             'size_bytes': None},
+        ]
+        journal.write('INSERT OR REPLACE INTO inventory VALUES (?,?,?)',
+                      (journal.scope, time.time(), json.dumps(records)))
+        summary = client.get('/api/overview').json()
+        assert summary['total_repositories'] == 2
+        assert summary['repository_storage']['metric'] == 'provider-reported'
+        assert summary['repository_storage']['repositories'][0]['bytes'] == 4096
+        assert summary['repository_storage']['repositories'][1]['bytes'] is None
+        assert summary['backup_storage']['repositories'] == []
+        inventory = client.get('/api/repositories').json()['repositories']
+        assert inventory[0]['size_bytes'] == 4096
+
+
+def test_local_backup_size_accounting_is_per_repository(tmp_path):
+    from types import SimpleNamespace
+
+    volume = tmp_path / 'volume'
+    volume.mkdir()
+    (volume / gitmirror.BACKUP_MARKER).write_text(json.dumps({'version': 1, 'id': 'a' * 32}))
+    source = {'provider': 'github', 'api_url': 'https://api.github.com', 'owner': 'tester'}
+    scope = gitmirror.scope_id(source)
+    for identifier, amount in [('101', 40), ('102', 80)]:
+        directory = volume / scope / identifier
+        directory.mkdir(parents=True)
+        (directory / 'history.bin').write_bytes(b'x' * amount)
+    journal = SimpleNamespace(scope=scope, read=lambda *_: [])
+    settings = {'source': source, 'destinations': {'local': {'provider': 'local', 'path': volume}}}
+    result = gitmirror.dashboard_backups(settings, journal, {})
+    assert len(result) == 1 and result[0]['error'] is None
+    repositories = {item['id']: item['logical_bytes'] for item in result[0]['repositories']}
+    assert repositories == {'101': 40, '102': 80}
+    assert result[0]['used'] >= 120
 
 
 def test_host_origin_credentials_and_login_budget(web_setup):
