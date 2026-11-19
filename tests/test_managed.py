@@ -175,6 +175,15 @@ def test_unconfigured_dashboard_has_preview_without_opening_private_apis(install
         assert 'id="top-setup"' in html.text
         assert 'id="settings-preview"' in html.text
         assert 'id="setup"' in html.text
+        assert 'id="main-navigation"' in html.text
+        assert 'id="nav-toggle"' in html.text
+        assert 'id="sidebar-backdrop"' in html.text
+        assert 'class="settings-preview settings-grid"' in html.text
+        assert 'routeFromUrl()' in script.text
+        assert 'configuration-nav' in script.text
+        assert '"gitmirror-sidebar"' in script.text
+        assert 'font: 15px/1.48 "Source Sans Pro"' in styles.text
+        assert '--workspace-width: 1450px' in styles.text
         assert 'enterPreview(data)' in script.text
         assert 'if (previewMode || !csrf) return;' in script.text
         assert 'style="height:' not in script.text
