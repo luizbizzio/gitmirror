@@ -2857,6 +2857,10 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         root = Path(sys.prefix) / 'share' / 'gitmirror' / 'web'
     if not all((root / name).is_file() for name in ('index.html', 'style.css', 'app.js')):
         raise SyncError('Web assets are missing; install GitMirror with the web extra')
+    font_files = frozenset(('source-sans-pro-regular.woff2', 'source-sans-pro-semibold.woff2',
+                            'source-sans-pro-bold.woff2', 'source-sans-pro-italic.woff2'))
+    if not all((root / 'fonts' / name).is_file() for name in font_files):
+        raise SyncError('Bundled Source Sans Pro font assets are missing')
     pending_setup = managed is not None and revision is None
     config_digest = None
     if not pending_setup:
@@ -2946,7 +2950,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
             'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
             'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; "
-                                       "connect-src 'self'; img-src 'self'; frame-ancestors 'none'; "
+                                       "connect-src 'self'; img-src 'self'; font-src 'self'; frame-ancestors 'none'; "
                                        "base-uri 'none'; form-action 'self'",
         })
         return response
@@ -2961,6 +2965,13 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         if filename not in media:
             raise HTTPException(404, 'Asset not found')
         return FileResponse(root / filename, media_type=media[filename])
+
+    @app.get('/assets/fonts/{filename}')
+    def font_asset(filename: str):
+        if filename not in font_files:
+            raise HTTPException(404, 'Asset not found')
+        return FileResponse(root / 'fonts' / filename, media_type='font/woff2',
+                            headers={'Cache-Control': 'public, max-age=86400'})
 
     def reserve_attempt(request):
         ip = request.client.host if request.client else 'unknown'
