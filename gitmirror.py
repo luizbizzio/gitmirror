@@ -3211,7 +3211,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             raise HTTPException(409, 'Inventory refresh is already running')
         try:
             at, records = inventory()
-            if at is not None and at >= time.time() - 30:
+            if at is not None and at >= time.time() - 30 and all(
+                    'size_bytes' in record for record in records):
                 return {'checked': at, 'total': len(records)}
             records = Provider.from_config(settings['source']).authenticate().discover()
             entries = [{key: repo.get(key) for key in ('id', 'name', 'default_branch', 'visibility', 'size_bytes')} for repo in records]
