@@ -501,11 +501,6 @@ function openConfiguration(initial, data) {
   form.elements.password.required = initial;
   form.elements.hours.value = data.schedule?.interval_hours ?? 12;
   form.elements.enabled.checked = data.schedule?.enabled ?? false;
-  form.elements.enabled.disabled = Boolean(data.migration_pending);
-  if (data.migration_pending) {
-    form.elements.enabled.checked = false;
-    form.querySelector("[data-schedule-note]").textContent = "Complete the legacy cutover before enabling the schedule.";
-  }
   form.elements.repositories.value = (data.repositories ?? []).join("\n");
   form.elements.known_hosts.value = data.known_hosts ?? "";
   form.querySelector("[data-public-key]").textContent = data.public_key;
