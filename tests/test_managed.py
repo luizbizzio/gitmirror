@@ -175,6 +175,17 @@ def test_unconfigured_dashboard_has_preview_without_opening_private_apis(install
         assert 'id="top-setup"' in html.text
         assert 'id="settings-preview"' in html.text
         assert 'id="setup"' in html.text
+        assert 'id="source-storage-chart"' in html.text
+        assert 'id="backup-storage-chart"' in html.text
+        assert 'id="repository-onboarding"' in html.text
+        assert 'id="activity-panel"' in html.text
+        assert 'class="setup-wizard"' in script.text
+        assert 'renderStorageChart(' in script.text
+        assert 'warmupInventory()' in script.text
+        assert 'configuration-jump' in script.text
+        assert 'source_size_bytes' not in html.text
+        assert '.donut-legend' in styles.text
+        assert '.empty-panel' in styles.text
         assert 'id="main-navigation"' in html.text
         assert 'id="nav-toggle"' in html.text
         assert 'id="sidebar-backdrop"' in html.text
