@@ -13,13 +13,17 @@ dependencies = ["PyYAML>=6,<7", "filelock>=3,<4"]
 keywords = ["git", "backup", "mirror", "github", "gitlab", "codeberg"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10"]
+web = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
+dev = ["pytest>=8,<10", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1"]
 
 [project.scripts]
 gitmirror = "gitmirror:main"
 
 [tool.setuptools]
 py-modules = ["gitmirror"]
+
+[tool.setuptools.data-files]
+"share/gitmirror/web" = ["web/index.html", "web/style.css", "web/app.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
