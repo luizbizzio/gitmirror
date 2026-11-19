@@ -672,6 +672,7 @@ input:not([type=checkbox]):focus, select:focus, textarea:focus {
   color: #bfceda;
 }
 .legend-value { color: #edf4fa; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.legend-percent { flex: 0 0 44px; color: #93adbf; font-variant-numeric: tabular-nums; text-align: right; font-size: .85rem; }
 .chart-footnote { border-top: 1px solid #304553; font-size: .8rem; color: #8fa8b9; padding-top: 11px; line-height: 1.45; }
 .storage-placeholder {
   min-height: 190px;
