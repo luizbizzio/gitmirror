@@ -23,12 +23,13 @@ const table = (labels, rows) => `<table><thead><tr>${labels.map((label) => `<th 
 const row = (...cells) => `<tr>${cells.map((value) => `<td>${value}</td>`).join("")}</tr>`;
 const button = (action, value, label, disabled = false) => `<button class="link" type="button" data-action="${action}" data-value="${escape(value)}" ${disabled ? "disabled" : ""}>${escape(label)}</button>`;
 const origins = {cli: "CLI", web: "Web", scheduled: "Scheduler", cron: "Cron"};
-const pages = {overview: "Overview", repositories: "Repositories", destinations: "Destinations", backups: "Backups",
-  activity: "Activity", settings: "Settings"};
+const pages = {overview: "Dashboard", repositories: "Repositories", destinations: "Destinations", backups: "Backups",
+  activity: "Activity log", settings: "Settings"};
 
 let csrf = "", view = "overview", snapshot = null, stream = null, refreshTimer = null;
 let repositories = [], targetSignature = "", currentRun = "", restoreSelection = null, targets = [];
 let loading = false, refreshPending = false, logRequest = 0, busy = false;
+let previewMode = false, initialSetupData = null;
 
 function notify(message, error = false) {
   const node = $("#notice");
@@ -39,7 +40,7 @@ function notify(message, error = false) {
 
 function connected(status) {
   $("#connection").textContent = status;
-  $("#connection").classList.toggle("connected", status === "Live");
+  $("#connection").classList.toggle("connected", status === "Live" || status === "Interface online");
 }
 
 function signOut() {
@@ -86,6 +87,11 @@ function openView(name) {
   }
   for (const page of all(".content > section")) page.hidden = page.id !== `view-${view}`;
   $("#page-title").textContent = pages[view];
+  $("#topbar-location").textContent = pages[view];
+  if (previewMode) {
+    renderPreviewView();
+    return;
+  }
   renderContext();
   refresh().catch(report);
 }
@@ -105,6 +111,96 @@ function stat(label, value, note) {
   return `<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd><small>${escape(note)}</small></div>`;
 }
 
+function renderActivityChart(runs = []) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Array.from({length: 7}, (_, index) => {
+    const day = new Date(today);
+    day.setDate(today.getDate() - (6 - index));
+    const end = new Date(day);
+    end.setDate(day.getDate() + 1);
+    const finished = runs.filter((run) => run.mode === "apply" && Number.isFinite(run.ended)
+      && run.ended * 1000 >= day.getTime() && run.ended * 1000 < end.getTime());
+    return {name: day.toLocaleDateString(undefined, {weekday: "short"}), successful: finished.filter(
+      (run) => run.state === "succeeded").length, failed: finished.filter(
+      (run) => run.state !== "succeeded").length};
+  });
+  const maximum = Math.max(1, ...days.map((day) => day.successful + day.failed));
+  const total = days.reduce((sum, day) => sum + day.successful + day.failed, 0);
+  $("#chart-summary").textContent = total ? `${total} completed run${total === 1 ? "" : "s"}` : "No completed runs";
+  $("#activity-chart").innerHTML = days.map((day) => {
+    const good = day.successful / maximum * 100;
+    const bad = day.failed / maximum * 100;
+    return `<div class="chart-day" aria-label="${escape(day.name)}: ${day.successful} successful, ${day.failed} failed">
+      <div class="chart-column"><span class="chart-bar failed-bar" style="height:${bad}%"></span>
+      <span class="chart-bar success-bar" style="height:${good}%"></span></div>
+      <span class="chart-label">${escape(day.name)}</span></div>`;
+  }).join("");
+}
+
+function renderPreviewView() {
+  const messages = {
+    overview: "System overview", repositories: "Source repository inventory",
+    destinations: "Configured mirroring targets", backups: "Local backup storage",
+    activity: "Synchronization and verification history", settings: "System configuration",
+  };
+  $("#page-context").textContent = messages[view];
+  if (view === "overview") {
+    $("#stats").innerHTML = stat("Repositories", "—", "Source not connected")
+      + stat("Successful syncs", "—", "No operations yet")
+      + stat("Last successful sync", "—", "Scheduling is off")
+      + stat("Backup storage", "—", "No volume configured");
+    renderActivityChart();
+    $("#active-count").textContent = "0";
+    $("#active-list").innerHTML = empty("No operations. Finish setup to connect your repositories.");
+    $("#health").innerHTML = empty("No backup destinations configured.");
+    $("#errors").innerHTML = empty("No errors recorded.");
+    $("#recent").innerHTML = empty("No synchronization history.");
+  } else if (view === "repositories") {
+    $("#inventory-time").textContent = "Source not configured";
+    $("#repositories").innerHTML = empty("Connect a source account in Setup to view repositories.");
+    $("#discover").disabled = true;
+    $("#sync-submit").disabled = true;
+    $("#actions-help").textContent = "Synchronization is unavailable until setup is complete.";
+    $("#sync-targets").innerHTML = "<legend>Destinations</legend><p>None configured.</p>";
+  } else if (view === "destinations") {
+    $("#destinations").innerHTML = '<article class="panel"><header><h2>Destinations</h2></header>'
+      + empty("No remote mirrors or local backup volumes configured.") + '</article>';
+  } else if (view === "backups") {
+    $("#backups").innerHTML = '<article class="panel"><header><h2>Backup storage</h2></header>'
+      + empty("No backup generations. Add a local destination during Setup.") + '</article>';
+  } else if (view === "activity") {
+    $("#activity").innerHTML = empty("No activity recorded. GitMirror has not been configured.");
+    $("#log-panel").hidden = true;
+  }
+}
+
+function enterPreview(data) {
+  previewMode = true;
+  initialSetupData = data;
+  $("#shell").hidden = false;
+  $("#login").hidden = true;
+  $("#setup-banner").hidden = false;
+  $("#settings-preview").hidden = false;
+  $("#live-settings").hidden = true;
+  $("#settings-editor").hidden = true;
+  $("#logout").hidden = true;
+  $("#refresh").disabled = true;
+  $("#top-setup").textContent = "Setup";
+  $("#system-state").innerHTML = '<span class="status-dot"></span> Setup required';
+  $("#system-detail").textContent = "Sync is disabled until configuration";
+  connected("Interface online");
+  openView("overview");
+}
+
+function showInitialSetup() {
+  if (!previewMode || !initialSetupData) return;
+  if (!$("#setup").open) {
+    openConfiguration(true, initialSetupData);
+    $("#setup").showModal();
+  }
+}
+
 function runName(run) {
   if (run.operation === "doctor") return "Verify connections";
   if (run.operation !== "sync") return run.operation === "restore" ? "Restore" : "Verify backup";
@@ -120,6 +216,7 @@ function runItems(runs, none) {
 }
 
 function renderOverview(data) {
+  renderActivityChart(data.runs);
   $("#stats").innerHTML = stat("Repositories", data.total_repositories ?? "Unobserved", `${data.destinations.length} configured destinations`)
     + stat("Applied synchronizations", data.successful + data.failed ? `${data.successful} succeeded` : "Unobserved",
       data.successful + data.failed ? `${data.failed} failed` : "No completed applied sync observed")
@@ -262,7 +359,7 @@ async function loadLog() {
 }
 
 async function refresh() {
-  if (!csrf) return;
+  if (previewMode || !csrf) return;
   if (loading) { refreshPending = true; return; }
   loading = true;
   try {
@@ -308,8 +405,20 @@ function connect() {
 async function boot() {
   const session = await api("/api/session");
   csrf = session.csrf;
+  previewMode = false;
+  initialSetupData = null;
   $("#login").hidden = true;
   $("#shell").hidden = false;
+  $("#setup-banner").hidden = true;
+  $("#settings-preview").hidden = true;
+  $("#live-settings").hidden = false;
+  $("#settings-editor").hidden = false;
+  $("#logout").hidden = false;
+  $("#refresh").disabled = false;
+  $("#discover").disabled = false;
+  $("#top-setup").textContent = "Settings";
+  $("#system-state").innerHTML = '<span class="status-dot ready"></span> Connected';
+  $("#system-detail").textContent = "Dashboard authenticated";
   openView("overview");
   connect();
 }
@@ -546,7 +655,7 @@ function openConfiguration(initial, data) {
       stream?.close();
       await waitForConfiguration(saved.revision);
       wrapper.replaceChildren();
-      $("#setup").hidden = true;
+      if ($("#setup").open) $("#setup").close();
       // The managed service reloads its validated configuration after sending the response.
       signOut();
       $("#login-error").textContent = "Configuration saved. Sign in with the admin password.";
@@ -555,21 +664,27 @@ function openConfiguration(initial, data) {
       submit.disabled = false;
     }
   });
-  wrapper.scrollIntoView({block: "start"});
+  if (!initial) wrapper.scrollIntoView({block: "start"});
 }
 
 async function startDashboard() {
   const response = await fetch("/api/setup", {credentials: "same-origin"});
-  if (response.ok) {
-    const data = await response.json();
-    if (data.required) {
-      $("#setup").hidden = false;
-      openConfiguration(true, data);
-      return;
-    }
+  if (!response.ok) throw new Error("The GitMirror server is unavailable.");
+  const data = await response.json();
+  if (data.required) {
+    enterPreview(data);
+    return;
   }
   await boot();
 }
+
+$("#top-setup").addEventListener("click", () => {
+  if (previewMode) showInitialSetup();
+  else openView("settings");
+});
+$("#banner-setup").addEventListener("click", showInitialSetup);
+$("#settings-start").addEventListener("click", showInitialSetup);
+$("#setup-close").addEventListener("click", () => $("#setup").close());
 
 $("#edit-configuration").addEventListener("click", () => api("/api/managed/settings")
   .then((data) => openConfiguration(false, data)).catch(report));
