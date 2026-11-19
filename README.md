@@ -148,10 +148,12 @@ visibility and last observed status, with details per destination.
 ### Guided Linux installation
 
 The managed installer and browser setup are documented in the [installation and
-maintenance guide](INSTALL.md). It describes the pending release command, verified
-release artifacts, localhost and LAN HTTPS, upgrades, rollback and
-uninstall. Old experimental installations must be stopped separately before
-managed synchronization is enabled. Package and systemd support target Debian 12+ and Raspberry Pi OS
+maintenance guide](INSTALL.md). The same online `install.sh` command detects a
+clean installation or a managed update. It prefers verified stable releases, and
+offers the current development `main` with an explicit warning until the first
+public release. It preserves managed configuration, backups and service settings
+during upgrades and supports rollback and uninstall. Old experimental cron jobs
+must be stopped separately before managed synchronization is enabled. Package and systemd support target Debian 12+ and Raspberry Pi OS
 ARM64. Use the standalone installation below for Windows or Docker.
 
 ### Activity and monitoring
