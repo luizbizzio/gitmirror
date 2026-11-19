@@ -14,3 +14,6 @@ build/
 gitmirror-data/
 docker/ssh/*
 !docker/ssh/.gitkeep
+
+docker/web-password
+web-dashboard/
