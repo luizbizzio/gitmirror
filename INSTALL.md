@@ -2,21 +2,56 @@
 
 The managed installer targets Debian 12 or later and Debian-based Raspberry Pi OS with systemd, on amd64 and ARM64. Windows and Docker use the existing installation methods.
 
-## Install from a release
+## One-command installation and updates
 
-After the bootstrap reaches the default branch and a stable immutable release is published, the intended command is:
+The same command installs GitMirror on a clean system or updates an existing managed
+installation:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash
 ```
 
-The command is pending publication while PR #4 is a draft. Bash, curl and administrator access are required. The installer detects Python, Git, Git LFS, OpenSSH and other system dependencies, then asks before installing missing packages. For noninteractive installation, add `-s -- --yes` after `sudo bash` to grant that authorization explicitly.
+The installer checks the managed installation before making changes. Existing
+installations use the upgrade lifecycle, retaining their saved accounts, credentials,
+backup generations, systemd service configuration, TLS certificate and listener
+hostname. It checks whether the chosen version is already installed, asks for
+confirmation before an upgrade, waits for active operations, runs health checks,
+and restores the previous executable if activation fails. A partial managed
+installation or retained managed state is never overwritten automatically.
+The installer does not modify unrelated experimental cron jobs.
 
-The bootstrap fetches the latest stable **immutable** GitHub release or the one selected with `--tag vX.Y.Z`. It validates the release metadata, SHA-256 digest and source archive before extracting or installing it. The initial pipe runs a script obtained from the project over HTTPS with administrator rights. Review it at a known commit if you need to pin the bootstrap itself. Artifact checks rely on GitHub HTTPS, repository and release controls, and GitHub's asset digest. Python dependencies come from PyPI.
+By default, the installer prefers the latest **stable, immutable** GitHub release
+with a matching verified SHA-256 archive. While the project has **no public stable
+release**, GitHub returns HTTP 404 for this lookup. In that case, the installer
+can offer a development snapshot from the current `main` branch, requiring you
+to type `DEV` before proceeding. This is not an immutable release. A revision
+is identified by its Git commit and the selected files are packed locally and
+checked before installation. To explicitly use the latest development snapshot,
+append `-s -- --dev` to `sudo bash`. This avoids the additional `DEV`
+confirmation but not confirmation of an actual upgrade.
 
-The managed executable is under `/opt/gitmirror-managed`, configuration and backups under `/var/lib/gitmirror-managed`, and installer state under `/etc/gitmirror-managed`. Both services run as the dedicated `gitmirror-managed` user. The dashboard binds to loopback by default.
+A fresh install binds to localhost by default. For a headless Raspberry Pi,
+append `-s -- --lan rpi5` to `sudo bash` if `rpi5` resolves through
+Tailscale, or use your desired LAN hostname/IP. The chosen listener, certificate
+and authorized hostnames remain unchanged on subsequent updates. You can also set
+`--port` for first installation. A hostname change requires a certificate valid
+for that name; reinstalling or upgrading is not a hostname migration mechanism.
 
-For a headless host, append `-s -- --lan rpi5.local` to `sudo bash`. Use a hostname that resolves on your LAN or the Pi's LAN IPv4 address. Use `--port` if another application needs port 8787. The installer prints the exact URL and the SHA-256 fingerprint of its self-signed certificate. Match the fingerprint from the trusted installer terminal before trusting that certificate in the browser. Self-signed certificates encrypt traffic and require manual identity verification. A hostname or IP change requires a certificate valid for the new address. Keep the service on your trusted local network and omit router port forwarding.
+Bash, curl and administrator access are required. Missing Python, Git, Git LFS,
+OpenSSH and other system packages require explicit approval. Use `--yes` only
+if you approve installation of missing apt packages. Release downloads are
+validated against GitHub's immutable metadata, pinned artifact digest, archive
+member list and file types. Executing the bootstrap with sudo trusts the source
+served at the specified URL. Development builds further trust the mutable
+GitHub main branch and HTTPS Git transport; they should not be treated as
+verified stable releases. Dependencies are installed from PyPI.
+
+Managed code lives under `/opt/gitmirror-managed`, app state under
+`/var/lib/gitmirror-managed` and privileged installer state under
+`/etc/gitmirror-managed`. Services use the dedicated `gitmirror-managed`
+account. For LAN HTTPS, verify the certificate fingerprint printed during
+installation before trusting the browser warning, and avoid public port
+forwarding.
 
 ## Setup in the browser
 
@@ -44,7 +79,7 @@ and maintenance operations, but does not coordinate with unrelated old scripts.
 
 ## Upgrade, rollback and uninstall
 
-Use `status` to identify the active version and `check` to verify an available release. `upgrade` requires explicit confirmation, validates the current configuration with the candidate, drains active operations and switches the executable symlink. If the candidate fails readiness, the installer switches back and restarts the previous services. `rollback` activates a previously installed release with current data and refuses an incompatible configuration. No automatic update is scheduled.
+Run the same online installer for future upgrades. Use `status` to identify the active version and `check` to inspect an available package. Explicit `upgrade` also requires confirmation, validates the current configuration with the candidate, drains active operations and switches the executable symlink. If the candidate fails readiness, the installer switches back and restarts the previous services. `rollback` activates a previously installed release with current data and refuses an incompatible configuration. No automatic update is scheduled.
 
 For a trusted offline release, use `--tag vX.Y.Z --artifact FILE --sha256 HEX`. Obtain the digest through a trusted channel.
 
