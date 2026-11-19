@@ -234,10 +234,47 @@ def test_upgrade_switch_and_failed_health_rollback(tmp_path, startup):
     assert not (tmp_path / 'etc/maintenance-pending').exists()
 
 
+def test_managed_cli_install_update_and_refuse_conflicting_commands(tmp_path):
+    setup = """
+        source "$PROJECT/packaging/lifecycle.sh"
+        cli="$PWD/gitmirror"
+        install_cli
+        [[ -x "$cli" ]]
+        bash -n "$cli"
+        grep -Fq -- '-up|update|upgrade)' "$cli"
+        grep -Fq -- 'args=(--confirm UPGRADE)' "$cli"
+        grep -Fq -- 'exec sudo -- "$installer"' "$cli"
+        check_cli
+        remove_cli
+        [[ ! -e "$cli" ]]
+    """
+    completed = shell(setup, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+
+    conflicting = shell("""
+        source "$PROJECT/packaging/lifecycle.sh"
+        cli="$PWD/unrelated"
+        printf 'not GitMirror\\n' >"$cli"
+        check_cli
+    """, tmp_path)
+    assert conflicting.returncode != 0
+    assert (tmp_path / 'unrelated').read_text() == 'not GitMirror\n'
+
+    (tmp_path / 'target').write_text('not managed')
+    link = tmp_path / 'symlink'
+    link.symlink_to(tmp_path / 'target')
+    symlink = shell("""
+        source "$PROJECT/packaging/lifecycle.sh"
+        cli="$PWD/symlink"
+        check_cli
+    """, tmp_path)
+    assert symlink.returncode != 0
+
+
 def test_upgrade_skips_same_version_only_when_digest_matches(tmp_path):
     source = """
         source "$PROJECT/packaging/lifecycle.sh"
-        app="$PWD/app"
+        app="$PWD/app" cli="$PWD/gitmirror"
         mkdir -p "$app/current"
         printf 'dev-123456789abc\\n' >"$app/current/version"
         printf 'correct-digest\\n' >"$app/current/digest"
@@ -251,6 +288,7 @@ def test_upgrade_skips_same_version_only_when_digest_matches(tmp_path):
     matched = shell(source, tmp_path)
     assert matched.returncode == 0, matched.stderr
     assert 'already up to date' in matched.stdout
+    assert (tmp_path / 'gitmirror').is_file()
     mismatched = shell(source.replace('checksum=correct-digest', 'checksum=other-digest'), tmp_path)
     assert mismatched.returncode != 0
     assert 'archive digest differs' in mismatched.stderr
@@ -260,6 +298,7 @@ def test_uninstall_does_not_touch_configuration_or_archives(tmp_path):
     setup = '''
         source "$PROJECT/packaging/lifecycle.sh"
         app="$PWD/app" etc="$PWD/etc" state="$PWD/state" web=web.service scheduler=scheduler.service unit_dir="$PWD/units"
+        cli="$PWD/gitmirror"
         mkdir -p "$app" "$etc" "$state" "$unit_dir"
         touch "$unit_dir/$web" "$unit_dir/$scheduler" "$state/archive" "$etc/secret"
         systemctl() { :; }
@@ -272,3 +311,4 @@ def test_uninstall_does_not_touch_configuration_or_archives(tmp_path):
     assert removed.returncode == 0, removed.stderr
     assert not (tmp_path / 'app').exists() and not list((tmp_path / 'units').iterdir())
     assert (tmp_path / 'state/archive').exists() and (tmp_path / 'etc/secret').exists()
+    assert not (tmp_path / 'gitmirror').exists()
