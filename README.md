@@ -136,9 +136,12 @@ gitmirror --config config.yml run --apply
 ## Optional self-hosted web dashboard
 
 The dashboard is optional. The CLI works without FastAPI and Uvicorn. The web
-interface uses a compact admin layout inspired by Pi-hole. On a new managed install,
-you can inspect its empty dashboard and settings before clicking **Setup** in the
-top bar. Private operations and repository information remain protected until login.
+interface uses a centered dark-mode admin workspace inspired by Pi-hole, with
+a collapsible desktop sidebar, mobile navigation drawer, and URL-linked sections.
+Source Sans Pro is bundled locally under its SIL Open Font License, so no external
+font provider is required. The setup form has section shortcuts for quicker navigation.
+On a new managed install, you can inspect the dashboard and settings before clicking
+**Setup** in the top bar. Private operations and repository information remain protected until login.
 After setup, the dashboard shows source inventory, applied sync outcomes, the next observed scheduler cycle,
 work and backup storage, and integrity per backup generation. An available volume
 can contain unverified backups. Verification reports the last observed check; use
