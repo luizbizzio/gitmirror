@@ -135,7 +135,7 @@ a { color: var(--blue-dark); }
 }
 .button:hover:not(:disabled) { background: #345064; border-color: #65859c; }
 .button.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
-.button.primary:hover:not(:disabled) { background: var(--blue-dark); }
+.button.primary:hover:not(:disabled) { background: #24638b; }
 .link { border: 0; padding: 2px 0; background: transparent; color: var(--blue-dark); text-decoration: none; font-weight: 550; }
 .link:hover:not(:disabled) { text-decoration: underline; }
 label { display: block; font-size: .9rem; font-weight: 540; }
