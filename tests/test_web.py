@@ -67,6 +67,13 @@ def test_authentication_revocation_expiration_and_headers(web_setup):
         script = client.get('/assets/app.js')
         assert script.status_code == 200
         assert client.get('/api/setup').status_code == 404
+        assert 'font-src \'self\'' in client.get('/').headers['content-security-policy']
+        for weight in ('regular', 'semibold', 'bold', 'italic'):
+            font = client.get(f'/assets/fonts/source-sans-pro-{weight}.woff2')
+            assert font.status_code == 200
+            assert font.headers['content-type'].startswith('font/woff2')
+            assert font.content.startswith(b'wOF2')
+        assert client.get('/assets/fonts/unknown.woff2').status_code == 404
         assert 'if (response.status === 404)' in script.text
         assert client.get('/assets/../gitmirror.py').status_code == 404
         for path in ('overview', 'session', 'backups', 'repositories', 'events'):
