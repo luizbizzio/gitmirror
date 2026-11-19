@@ -1,8 +1,8 @@
 # GitMirror
 
-GitMirror backs up Git history, branches, tags and Git LFS from GitHub, GitLab or Codeberg. A configuration can use remote destinations, a local disk destination, or both. Remote destinations also synchronize visibility and the default branch.
+GitMirror backs up Git history, branches, tags and Git LFS from GitHub, GitLab, Codeberg or Gitea. A configuration can use remote destinations, a local disk destination, or both. Remote destinations also synchronize visibility and the default branch.
 
-**Status:** alpha. Validation uses local repositories and simulated provider APIs. See the platform notes below for the tested environments and remaining checks.
+**Status:** alpha. Validation uses temporary repositories and simulated provider APIs, plus disposable Gitea instances. See the platform notes below for the tested environments and remaining checks.
 
 ## What it does
 
@@ -36,7 +36,7 @@ Edit `config.yml` and set the token variables used by that configuration, or use
 
 ### Configure sources and destinations
 
-Version 2 takes one GitHub, GitLab or Codeberg source and a list of destinations.
+Version 2 takes one GitHub, GitLab, Codeberg or Gitea source and a list of destinations.
 Choose any other host, local disk, or a combination. A different account on the
 same host can also be a destination. GitMirror rejects the source account as a
 destination and checks for Git URLs that resolve to the source repository.
@@ -83,6 +83,36 @@ authenticated user. Discovery targets the configured account's own repositories.
 Set `api_url` to use self-hosted GitLab or a Codeberg-compatible Forgejo instance,
 for example `https://forge.example.com/api/v1`. Use separate, non-overlapping local
 paths. Organization and group namespaces have not been validated.
+
+#### Self-hosted Gitea
+
+Choose **Gitea** in Setup or Settings. Enter the account, API token and the full
+HTTPS API URL, for example `https://git.example.com/api/v1`. If your server
+uses a subpath, include it before `/api/v1`. The same fields work in v2 YAML.
+
+```yaml
+  - provider: gitea
+    id: gitea-backup
+    owner: mirror-user
+    api_url: https://git.example.com/api/v1
+    token_env: GITEA_TOKEN
+```
+
+Use the same fields under `source` to read from Gitea. Use a separate token for
+each account. The source token needs to identify its user and read owned
+repositories. The destination token also needs to create and edit repositories.
+Register the GitMirror SSH key with each account and verify the SSH host key.
+If you use Git LFS, enable it on the Gitea server and use a trusted HTTPS
+certificate for Git LFS transfers. GitMirror creates regular private
+repositories and verifies them before pushing. Archived repositories and pull
+mirrors can be sources. A destination needs to be writable.
+
+The integration was exercised on Gitea 1.25.5. Other Gitea versions and
+organization repositories have not been tested. Gitea reports its repository
+size in KiB. The dashboard converts it to bytes and shows missing sizes as
+unavailable. Local backup sizes come from local files.
+[Gitea API usage](https://docs.gitea.com/1.25/development/api-usage/) ·
+[Git LFS setup](https://docs.gitea.com/administration/git-lfs-setup/)
 
 Existing version 1 configurations still use their original working directories,
 remote credentials and protection journal. To migrate, convert the destination
@@ -143,7 +173,7 @@ font provider is required. The setup form has section shortcuts for quicker navi
 On a new managed install, you can inspect the dashboard and settings before clicking
 **Setup** in the top bar. Private operations and repository information remain protected until login.
 The dashboard also shows two storage doughnut charts: source repository sizes reported
-by GitHub, GitLab or Codeberg (when the provider includes them), and logical file
+by GitHub, GitLab, Codeberg or Gitea (when the provider includes them), and logical file
 sizes of the repositories in configured local backup volumes. Source estimates can
 exclude Git LFS or other provider storage, and logical backup bytes count linked
 file paths individually rather than measuring unique allocated disk blocks.
@@ -451,16 +481,17 @@ local destination and a second copy on another device for disk-loss recovery.
 
 | Environment | Validation |
 | --- | --- |
-| Windows 11 x64, Python 3.13 | 113 tests passed with Git for Windows and Git LFS. |
-| Debian 12 amd64, Python 3.11 | 113 tests passed. Also checked authenticated Git reads against a local OpenSSH server and verified a reflinked Btrfs generation after deleting its three predecessors. |
-| Docker amd64, Python 3.12 | 113 tests passed as UID 10001. Built the image, exercised both Compose configurations and the offline doctor, then verified and restored three backups from a fresh container with a read-only named volume and no network. |
+| Windows 11 x64, Python 3.13 | Portable tests run with Git for Windows and Git LFS. |
+| Debian 12 amd64, Python 3.11 | Full suite, update and rollback checks, and Gitea 1.25.5 over trusted HTTPS and SSH. Earlier checks also verified a reflinked Btrfs generation after deleting its three predecessors. |
+| Docker amd64, Python 3.12 | Full suite as UID 10001 and Compose checks. Earlier checks verified and restored three backups from a fresh container with a read-only named volume and no network. |
 
-The local suite covers the six directions between distinct hosting providers,
+The local suite covers all twelve directions between distinct hosting providers,
+two accounts on the same Gitea instance,
 local-only backups from each, two GitLab instances, two local volumes, rewrites,
 branch and tag deletion, visibility, interrupted writes, disk exhaustion, safe
 retention, offline restoration and GitLab protection recovery. Tests use temporary
 repositories and mocked APIs. The Docker base image publishes a Linux ARM64 build.
-GitMirror itself has yet to run on Raspberry Pi OS or ARM64. Live GitHub, GitLab,
+GitMirror has yet to be validated on Raspberry Pi OS hardware. Live GitHub, GitLab,
 Codeberg and Forgejo account integration also requires validation. The original production script is unavailable
 for direct comparison. The current implementation preserves the documented 12-hour
 default and the Git, LFS, visibility and protection-management flows.

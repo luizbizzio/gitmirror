@@ -47,7 +47,9 @@ hostname. It checks whether the chosen version is already installed, asks for
 confirmation before an upgrade, waits for active operations, runs health checks,
 and restores the previous executable if activation fails. A partial managed
 installation or retained managed state is never overwritten automatically.
-The installer does not modify unrelated experimental cron jobs.
+The installer warns about likely old GitMirror cron entries during install,
+update and `gitmirror status`. It reports the account or cron file without
+printing the job command. It leaves those jobs untouched.
 
 By default, the installer prefers the latest **stable, immutable** GitHub release
 with a matching verified SHA-256 archive. While the project has **no public stable
@@ -91,9 +93,12 @@ A managed local destination gets its own directory automatically. External disks
 
 ## Replacing an experimental installation
 
-This installer does not import or detect experimental GitMirror scripts, cron jobs,
-credentials or archives. It only refuses to overwrite the directories, services and
-service account of an existing **managed** GitMirror installation.
+The cron warning covers user crontabs and common system cron paths. Check
+custom scripts and schedules separately. The installer refuses to overwrite the
+directories, services and service account of an existing **managed** installation.
+It leaves experimental scripts, credentials and archives untouched. If an older
+managed install paused writes for migration, updates keep that pause. Check
+`gitmirror status` before resuming.
 
 Before a clean installation on a machine that already runs a separate GitMirror
 script, back up that script, its configuration, credentials, Git and LFS archives.

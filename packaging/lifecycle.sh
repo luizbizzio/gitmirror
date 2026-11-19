@@ -282,8 +282,8 @@ switch_release() {
     local next=$1 current
     current=$(readlink -e "$app/current")
     [[ "$next" != "$current" ]] || fail 'That release is already active'
-    check_release "$next/venv/bin/gitmirror" || fail 'Candidate could not validate the current configuration'
     drain
+    check_release "$next/venv/bin/gitmirror" || fail 'Candidate could not validate the current configuration'
     touch "$etc/maintenance-pending"
     if ! systemctl stop "$web" "$scheduler"; then
         if systemctl start "$web" "$scheduler" && health; then rm -- "$etc/maintenance-pending"; fi

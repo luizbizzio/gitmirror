@@ -42,7 +42,10 @@ PROVIDER_APIS = {
     'github': 'https://api.github.com',
     'gitlab': 'https://gitlab.com/api/v4',
     'codeberg': 'https://codeberg.org/api/v1',
+    'gitea': None,
 }
+FORGE_PROVIDERS = ('codeberg', 'gitea')
+PROVIDER_LABELS = {'github': 'GitHub', 'gitlab': 'GitLab', 'codeberg': 'Codeberg', 'gitea': 'Gitea'}
 
 class ConfigError(ValueError):
     pass
@@ -65,8 +68,9 @@ def _token_source(cfg, label):
 def _url(value, name):
     try:
         parsed = urlparse(value) if isinstance(value, str) else None
-        valid = (parsed and parsed.scheme == 'https' and parsed.hostname and not parsed.username
-                 and not parsed.password and not parsed.query and not parsed.fragment)
+        valid = (parsed and parsed.scheme == 'https' and parsed.hostname and parsed.port != 0
+                 and not any(c.isspace() or ord(c) < 32 or c in '\\@?#' for c in value)
+                 and not parsed.params)
     except ValueError:
         valid = False
     if not valid:
@@ -78,13 +82,16 @@ def provider_config(spec, label, *, owner_optional=False):
     cfg = dict(_mapping(spec, label))
     provider = cfg.get('provider')
     if not isinstance(provider, str) or provider not in PROVIDER_APIS:
-        raise ConfigError(f'{label}.provider must be github, gitlab or codeberg')
+        raise ConfigError(f'{label}.provider must be github, gitlab, codeberg or gitea')
     owner = cfg.get('owner')
     if not (owner_optional and owner is None):
         if not isinstance(owner, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', owner) or owner in ('.', '..'):
             raise ConfigError(f'{label}.owner must be a provider account name')
     _token_source(cfg, label)
-    cfg['api_url'] = _url(cfg.get('api_url', PROVIDER_APIS[provider]), f'{label}.api_url')
+    base = _url(cfg.get('api_url', PROVIDER_APIS[provider]), f'{label}.api_url')
+    if provider == 'gitea' and not urlparse(base).path.endswith('/api/v1'):
+        raise ConfigError(f'{label}.api_url must include Gitea’s /api/v1 path')
+    cfg['api_url'] = base
     return cfg
 
 
@@ -119,7 +126,11 @@ def load_config(path):
     file = Path(path).expanduser().resolve()
     try:
         raw = yaml.safe_load(file.read_text(encoding='utf-8'))
-    except (OSError, yaml.YAMLError) as exc:
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, 'problem_mark', None)
+        location = f' at line {mark.line + 1}' if mark else ''
+        raise ConfigError(f'Invalid configuration YAML{location}') from exc
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f'Cannot load config {file}: {exc}') from exc
     raw = _mapping(raw, 'config')
     version = raw.get('version')
@@ -201,6 +212,7 @@ ROOT = HOME / 'gitmirror-data'
 GL_API = 'https://gitlab.com/api/v4'
 RUN_ID = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6]
 SSH_ENV = dict(os.environ)
+LOG_SECRETS = ()
 SSH_ENV.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=20')
 JOURNAL_DIR = ROOT / 'gitlab-protection-journal'
 RETRY_DELAYS = (3, 8, 20)
@@ -217,17 +229,18 @@ TRANSIENT_GIT_ERRORS = (
 def configure_runtime(settings, *, apply):
     """Configure working storage and Git transport for a run."""
     global ROOT, GL_API
-    global JOURNAL_DIR, RETRY_DELAYS, RUN_ID, SSH_ENV
+    global JOURNAL_DIR, RETRY_DELAYS, RUN_ID, SSH_ENV, LOG_SECRETS
     ROOT = settings['storage']['path']
     GL_API = PROVIDER_APIS['gitlab']
     JOURNAL_DIR = ROOT / 'gitlab-protection-journal'
     RETRY_DELAYS = tuple(settings['retry']['delays_seconds'])
+    LOG_SECRETS = dashboard_secret_values(settings)
     RUN_ID = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6]
     SSH_ENV = dict(os.environ)
     for key in ('GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_NAMESPACE',
                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'):
         SSH_ENV.pop(key, None)
-    ssh = 'ssh -o BatchMode=yes -o ConnectTimeout=20'
+    ssh = 'ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=yes -o UpdateHostKeys=no'
     managed_ssh = SSH_ENV.get('GITMIRROR_MANAGED_SSH_CONFIG')
     if managed_ssh:
         ssh += f' -F {shlex.quote(managed_ssh)}'
@@ -237,8 +250,7 @@ def configure_runtime(settings, *, apply):
         else:
             SSH_ENV.setdefault('GIT_SSH_COMMAND', ssh)
     else:
-        SSH_ENV['GIT_SSH_COMMAND'] = (ssh + ' -o StrictHostKeyChecking=yes -o UpdateHostKeys=no'
-                                     ' -o ControlPath=none -o AddKeysToAgent=no -o PermitLocalCommand=no')
+        SSH_ENV['GIT_SSH_COMMAND'] = ssh + ' -o ControlPath=none -o AddKeysToAgent=no -o PermitLocalCommand=no'
         SSH_ENV['GIT_SSH_VARIANT'] = 'ssh'
         SSH_ENV['GIT_OPTIONAL_LOCKS'] = '0'
         SSH_ENV['GIT_TERMINAL_PROMPT'] = '0'
@@ -278,9 +290,13 @@ def retry_notice(target, attempt, delay, reason):
 class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, new_url):
         old, new = urlparse(request.full_url), urlparse(new_url)
-        if (request.get_method() != 'GET' or old.scheme != new.scheme
-                or old.hostname != new.hostname or old.port != new.port
-                or new.username is not None or new.password is not None):
+        try:
+            safe = (request.get_method() == 'GET' and old.scheme == new.scheme == 'https'
+                    and old.hostname == new.hostname and (old.port or 443) == (new.port or 443)
+                    and new.username is None and new.password is None)
+        except ValueError:
+            safe = False
+        if not safe:
             raise urllib.error.HTTPError(request.full_url, code, 'Unsafe API redirect', headers, fp)
         return super().redirect_request(request, fp, code, message, headers, new_url)
 
@@ -310,14 +326,14 @@ def api(url, headers, method='GET', payload=None):
             if retryable and transient and attempt < len(RETRY_DELAYS):
                 retry_notice('API', attempt + 1, RETRY_DELAYS[attempt], f'HTTP {e.code}')
                 continue
-            raise SyncError(f'API HTTP {e.code}: {url}') from e
+            raise SyncError(f'Provider API returned HTTP {e.code}') from e
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             if retryable and attempt < len(RETRY_DELAYS):
                 retry_notice('API', attempt + 1, RETRY_DELAYS[attempt], type(e).__name__)
                 continue
-            raise SyncError(f'API unavailable: {url}: {e}') from e
-        except json.JSONDecodeError as e:
-            raise SyncError(f'API invalid JSON: {url}: {e}') from e
+            raise SyncError(f'Provider API request failed ({type(e).__name__})') from e
+        except (json.JSONDecodeError, UnicodeError) as e:
+            raise SyncError('Provider API returned invalid JSON') from e
 
 
 def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, retry=True,
@@ -338,17 +354,17 @@ def cmd(args, *, check=True, cwd=None, timeout=420, input_text=None, env=None, r
             if args[0] == 'git' and attempt + 1 < attempts:
                 retry_notice('Git', attempt + 1, RETRY_DELAYS[attempt], 'command timeout')
                 continue
-            raise SyncError(f'Command timed out: {args[0]} ({e})') from e
+            raise SyncError(f'{args[0]} timed out after {timeout} seconds') from e
         except OSError as e:
             raise SyncError(f'Command failed to run: {args[0]} ({e})') from e
         if check and p.returncode:
-            err = (p.stderr or p.stdout or '').strip()[-1400:]
+            err = redact_dashboard_log((p.stderr or p.stdout or '').strip(), LOG_SECRETS)[-1400:]
             transient = args[0] == 'git' and any(x in err.lower() for x in TRANSIENT_GIT_ERRORS)
             if transient and attempt + 1 < attempts:
                 retry_notice('Git', attempt + 1, RETRY_DELAYS[attempt],
                              err.splitlines()[0][:120] if err else 'SSH network failure')
                 continue
-            raise SyncError(f'Command failed (exit={p.returncode}): {" ".join(args[:4])}\n{err}')
+            raise SyncError(f'{args[0]} failed (exit={p.returncode})\n{err}')
         return p
 
 
@@ -625,7 +641,8 @@ def push_snapshot(repo, remote, source, previous, *, url=None, before_push=None)
     actual = remote_refs(url)
     if result.returncode:
         state = 'destination refs changed; inspect the verified backup' if actual != previous else 'destination refs unchanged'
-        raise SyncError(f'Push failed ({state}): {(result.stderr or result.stdout).strip()[-900:]}')
+        detail = redact_dashboard_log((result.stderr or result.stdout).strip(), LOG_SECRETS)[-900:]
+        raise SyncError(f'Push failed ({state}): {detail}')
     if actual != source:
         raise SyncError('Push did not produce the complete snapshot; inspect the verified backup')
 
@@ -659,7 +676,7 @@ class Provider:
 
     @property
     def label(self):
-        return {'github': 'GitHub', 'gitlab': 'GitLab', 'codeberg': 'Codeberg'}[self.kind]
+        return PROVIDER_LABELS[self.kind]
 
     @classmethod
     def from_config(cls, spec):
@@ -667,7 +684,7 @@ class Provider:
         secret = token(spec)
         if kind == 'gitlab':
             headers = {'PRIVATE-TOKEN': secret}
-        elif kind == 'codeberg':
+        elif kind in FORGE_PROVIDERS:
             headers = {'Authorization': f'token {secret}'}
         else:
             headers = {'Authorization': f'Bearer {secret}', 'X-GitHub-Api-Version': '2022-11-28'}
@@ -711,10 +728,15 @@ class Provider:
                     visibility = None
         if visibility not in ('public', 'private', 'internal'):
             raise SyncError(f'{self.label} visibility changed or is unconfirmed')
-        if type(info.get('id')) is not int or not all(isinstance(value, str) and value
-                                                     for value in (owner, name, url)):
+        if (type(info.get('id')) is not int or info['id'] <= 0
+                or not all(isinstance(value, str) and value for value in (owner, name, url))):
             raise SyncError(f'{self.label} repository identity changed or is invalid')
         branch = info.get('default_branch')
+        if self.kind == 'gitea':
+            if not valid_ssh_url(url):
+                raise SyncError('Gitea did not return a valid SSH repository URL')
+            if 'default_branch' not in info or (branch is not None and not isinstance(branch, str)):
+                raise SyncError('Gitea did not confirm the default branch')
         return {'id': info['id'], 'name': name, 'owner': owner, 'ssh_url': url,
                 'private': visibility != 'public', 'visibility': visibility, 'default_branch': branch}
 
@@ -735,8 +757,7 @@ class Provider:
         query = {
             'github': '/user/repos?affiliation=owner&visibility=all&per_page=100',
             'gitlab': '/projects?owned=true&statistics=true&per_page=100',
-            'codeberg': '/user/repos?limit=50',
-        }[self.kind]
+        }.get(self.kind, '/user/repos?limit=50')
         seen = set()
         for page in range(1, 101):
             status, items = api(f'{self.base}{query}&page={page}', self.headers)
@@ -754,8 +775,8 @@ class Provider:
                 if name in repos:
                     raise SyncError(f'{self.label} discovery returned duplicate repository names')
                 repos[name] = record
-            # A Forgejo instance can cap page size below the requested limit.
-            if not items or (self.kind != 'codeberg' and len(items) < 100):
+            # Gitea and Forgejo may cap pages below the requested length.
+            if not items or (self.kind not in FORGE_PROVIDERS and len(items) < 100):
                 break
         else:
             raise SyncError(f'{self.label} discovery did not finish after 100 pages')
@@ -782,7 +803,10 @@ class Provider:
                 raise SourceStateError(f'{self.label} {description} changed for {name}; stopping this sync')
 
     def read_destination(self, name, *, create=False):
-        status, obj = api(self.repo_url(name), {**self.headers, 'Cache-Control': 'no-cache'})
+        repo_url = self.repo_url(name)
+        headers = {**self.headers, 'Cache-Control': 'no-cache'}
+        status, obj = api(repo_url, headers)
+        created = status == 404 and create
         if status == 404:
             if not create:
                 return None
@@ -794,7 +818,16 @@ class Provider:
                 payload = {'name': name, 'private': True, 'auto_init': False}
             status, obj = api(url, self.headers, method='POST', payload=payload)
             if status != 201:
-                raise SyncError(f'Cannot create private {self.kind} destination for {name}')
+                raise SyncError(f'Cannot create private {self.label} destination for {name} (HTTP {status})')
+            if self.kind == 'gitea':
+                new = self.gitea_destination(name, obj)
+                status, obj = api(repo_url, headers)
+                if status != 200 or new.visibility != 'private' or self.gitea_destination(name, obj) != new:
+                    raise SyncError(f'New Gitea destination could not be read back as the same private repository for {name}')
+        if self.kind == 'gitea':
+            if status != 200:
+                raise SyncError(f'Cannot read Gitea destination for {name} (HTTP {status})')
+            return self.gitea_destination(name, obj)
         if status not in (200, 201) or not isinstance(obj, dict):
             raise SyncError(f'Cannot read {self.kind} destination for {name}')
         if self.kind == 'gitlab':
@@ -806,13 +839,21 @@ class Provider:
                 visibility = None
         if not isinstance(url, str) or not url or visibility not in ('private', 'public', 'internal'):
             raise SyncError(f'Cannot verify {self.kind} destination URL or visibility for {name}')
-        if status == 201 and visibility != 'private':
+        if created and visibility != 'private':
             raise SyncError(f'New {self.kind} destination is not confirmed private for {name}')
         default_branch = obj.get('default_branch')
         if (type(obj.get('id')) is not int or 'default_branch' not in obj
                 or (default_branch is not None and not isinstance(default_branch, str))):
             raise SyncError(f'Cannot verify {self.kind} destination identity or default branch for {name}')
         return Destination(obj['id'], url, visibility, default_branch or None)
+
+    def gitea_destination(self, name, info):
+        repo = self.repo_state(info)
+        if repo['owner'].casefold() != self.owner.casefold() or repo['name'].casefold() != name.casefold():
+            raise SyncError(f'Gitea destination owner or repository name does not match {name}')
+        if info.get('archived') is True or info.get('mirror') is True:
+            raise SyncError(f'Gitea destination {name} is archived or managed as a pull mirror')
+        return Destination(repo['id'], repo['ssh_url'], repo['visibility'], repo['default_branch'] or None)
 
     def update_destination(self, name, destination, **change):
         """Write once and confirm the result even if the response was ambiguous."""
@@ -822,7 +863,7 @@ class Provider:
         else:
             url, method = self.repo_url(name), 'PATCH'
         payload = change
-        if self.kind == 'codeberg' and 'visibility' in change:
+        if self.kind in FORGE_PROVIDERS and 'visibility' in change:
             payload = {'private': change['visibility'] == 'private'}
 
         attribute = next(iter(change))
@@ -842,6 +883,21 @@ class Provider:
             raise SyncError(f'{self.kind}: {attribute} update not verified for {name}; write issue={error or "none"}')
         print(f'    {self.kind}: {attribute} verified as {getattr(expected, attribute)}')
         return expected
+
+
+def valid_ssh_url(value):
+    if not isinstance(value, str) or len(value) > 2048 or re.search(r'[\s\x00-\x1f\x7f\\]', value):
+        return False
+    if value.startswith('ssh://'):
+        try:
+            parsed = urlparse(value)
+            return bool(parsed.hostname and parsed.port != 0 and parsed.username
+                        and re.fullmatch(r'[A-Za-z0-9_.-]+', parsed.username)
+                        and parsed.password is None and re.fullmatch(r'/[A-Za-z0-9_./+-]+', parsed.path)
+                        and not any(c in value for c in '?#'))
+        except ValueError:
+            return False
+    return bool(re.fullmatch(r'[A-Za-z0-9_.-]+@(?:[A-Za-z0-9.-]+|\[[A-Fa-f0-9:]+\]):/?[A-Za-z0-9_./+-]+', value))
 
 
 def git_address(url):
@@ -1920,6 +1976,8 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, ide
             raise SyncError(f'Missing executable: {executable}')
     platforms = selected_platforms(settings, platform, identifiers)
     source = Provider.from_config(settings['source'])
+    if source.kind == 'gitea':
+        source = source.authenticate()
     providers = {}
     volumes = {}
     mounted = set()
@@ -2012,7 +2070,7 @@ def execute_sync(settings, *, apply=False, only=None, platform='all', full_lfs=F
 
 def managed_writes_blocked(settings=None):
     if settings and settings['storage']['path'] == MANAGED_SYSTEM_STATE:
-        if (MANAGED_SYSTEM_ETC / 'maintenance-pending').exists():
+        if any((MANAGED_SYSTEM_ETC / marker).exists() for marker in ('maintenance-pending', 'migration-pending')):
             return True
     guard = os.getenv('GITMIRROR_MAINTENANCE_GUARD')
     return bool(guard and Path(guard).exists())
@@ -2085,6 +2143,8 @@ def doctor(config, *, network=False, ssh=False, only=None, platform='all', ident
         return 2
     report('OK', 'configuration', 'YAML is valid')
     storage = settings['storage']['path']
+    if managed_writes_blocked(settings):
+        report('WARNING', 'managed sync', 'applied runs are paused; check installer status')
     try:
         ancestor = next(path for path in (storage, *storage.parents) if path.exists())
         if not ancestor.is_dir():
@@ -2285,8 +2345,8 @@ def redact_dashboard_log(message, values=()):
         if value:
             message = message.replace(value, '[redacted]').replace(urllib.parse.quote(value, safe=''), '[redacted]')
     message = re.sub(r'(?i)\b((?:https?|ssh|git)://)[^/\s@]+@', r'\1[redacted]@', message)
-    message = re.sub(r'(?i)\b(authorization|private-token|(?:access_|oauth_)?token|password)(\s*[:=]\s*)'
-                     r'(?:(?:bearer|basic)\s+)?[^\s&,;]+', r'\1\2[redacted]', message)
+    message = re.sub(r'(?i)\b(authorization|private[-_]token|(?:access_|oauth_)?token|password)(\s*[:=]\s*)'
+                     r'(?:(?:bearer|basic|token)\s+)?[^\s&,;]+', r'\1\2[redacted]', message)
     message = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]', '', message)
     return message
 
@@ -2489,6 +2549,25 @@ def dashboard_destination(spec, identifier):
             'api_url': spec.get('api_url'), 'retention': spec.get('retention')}
 
 
+def logical_backup_sizes(path, scope, directories):
+    def unreadable(error):
+        raise error
+
+    by_repo = {directory.name: 0 for directory in directories}
+    total = 0
+    for root, subdirs, files in os.walk(path, onerror=unreadable):
+        folder = Path(root)
+        subdirs[:] = [name for name in subdirs if not linked_backup_path(folder / name)]
+        parts = folder.relative_to(path).parts
+        for name in files:
+            info = (folder / name).lstat()
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+                if len(parts) >= 2 and parts[0] == scope and parts[1] in by_repo:
+                    by_repo[parts[1]] += info.st_size
+    return total, by_repo
+
+
 def dashboard_backups(settings, journal, sizes):
     verified = {(row['destination'], row['repository'], row['generation']): row for row in
                 journal.read('SELECT * FROM verification WHERE scope=?', (journal.scope,))}
@@ -2504,17 +2583,7 @@ def dashboard_backups(settings, journal, sizes):
             item['free'] = shutil.disk_usage(path).free
             directories = backup_directories(path, journal.scope)
             if identifier not in sizes or sizes[identifier][0] != volume or sizes[identifier][1] < time.monotonic() - 60:
-                # Scan once for total and repository logical bytes; hardlinks count once per path.
-                directory_bytes = {directory.name: 0 for directory in directories}
-                total = 0
-                for file in path.rglob('*'):
-                    if file.is_symlink() or not file.is_file():
-                        continue
-                    length = file.stat().st_size
-                    total += length
-                    parts = file.relative_to(path).parts
-                    if len(parts) >= 3 and parts[0] == journal.scope and parts[1] in directory_bytes:
-                        directory_bytes[parts[1]] += length
+                total, directory_bytes = logical_backup_sizes(path, journal.scope, directories)
                 sizes[identifier] = volume, time.monotonic(), total, directory_bytes
             item['used'] = sizes[identifier][2]
             for directory in directories:
@@ -2545,6 +2614,8 @@ def dashboard_backups(settings, journal, sizes):
             if backup_volume(path) != volume:
                 raise SyncError('Backup volume changed during inspection')
         except (SyncError, OSError) as exc:
+            sizes.pop(identifier, None)
+            item['used'] = None
             item['error'] = redact_dashboard_log(str(exc))
     return output
 
@@ -2688,6 +2759,10 @@ class ManagedInstallation:
         if provider == 'local':
             return clean
         clean.setdefault('api_url', PROVIDER_APIS.get(provider))
+        if provider == 'gitea':
+            if not clean['api_url']:
+                raise ConfigError(f'{label}.api_url must be an explicit HTTPS Gitea API URL')
+            clean['api_url'] = clean['api_url'].rstrip('/') if isinstance(clean['api_url'], str) else clean['api_url']
         credential = row.get('token', '')
         if not isinstance(credential, str) or len(credential) > 4096 or any(c.isspace() for c in credential):
             raise ConfigError(f'{label} needs a single-line API token')
@@ -3431,7 +3506,7 @@ def backup_health(volumes):
                     identifier = repository['id']
                     last[identifier] = max(last.get(identifier, 0), generation['created'])
     used = [volume['used'] for volume in volumes if volume['used'] is not None and not volume['error']]
-    counts['logical_bytes'] = sum(used) if used else None
+    counts['logical_bytes'] = sum(used) if used and len(used) == len(volumes) else None
     counts['available_volumes'] = len(used)
     counts['configured_volumes'] = len(volumes)
     return last, counts

@@ -168,7 +168,7 @@ function openView(name, {updateUrl = true} = {}) {
 
 function renderContext() {
   if (!snapshot) return;
-  const source = `${snapshot.source.provider} / ${snapshot.source.owner}`;
+  const source = `${providerLabel(snapshot.source.provider)} / ${snapshot.source.owner}`;
   const context = {
     overview: source, repositories: source, destinations: `${snapshot.destinations.length} configured targets`,
     backups: `${snapshot.backup.configured_volumes} configured local volumes`,
@@ -230,7 +230,8 @@ function renderStorageChart(chartId, noteId, records, options = {}) {
     : "Logical file sizes across local backups. Hardlinks may be counted more than once.";
   if (unknown) note.textContent += ` No size reported for ${unknown} repositor${unknown === 1 ? "y" : "ies"}.`;
   if (!positive.length || !total) {
-    chart.innerHTML = chartPlaceholder(options.emptyMessage || "No storage data yet.");
+    chart.innerHTML = chartPlaceholder(known.length ? "The measured size is 0 B." :
+      options.emptyMessage || "No storage data yet.");
     return;
   }
   const slices = positive.slice(0, 7).map((item) => ({...item}));
@@ -389,6 +390,9 @@ function renderOverview(data) {
   renderStorageChart("backup-storage-chart", "backup-storage-note",
     data.backup_storage?.repositories, {emptyMessage: data.backup.configured_volumes
       ? "No local repository backup data measured yet." : "Add a local backup volume to see repository sizes."});
+  if (data.backup.available_volumes < data.backup.configured_volumes) {
+    $("#backup-storage-note").textContent += " Some backup volumes could not be measured.";
+  }
   const applied = data.runs.filter((run) => run.mode === "apply" && Number.isFinite(run.ended));
   $("#activity-panel").hidden = applied.length === 0;
   if (applied.length) renderActivityChart(data.runs);
@@ -417,7 +421,7 @@ function retentionText(policy) {
 function renderDestinations(data) {
   $("#destinations").innerHTML = data.destinations.length
     ? data.destinations.map((destination) => `<article class="panel"><header>
-    <h2>${escape(destination.id)}</h2><span class="pill">${escape(destination.provider)}</span></header>
+    <h2>${escape(destination.id)}</h2><span class="pill">${escape(providerLabel(destination.provider))}</span></header>
     ${list(destination.provider === "local"
       ? [["Backup path", destination.path], ["Retention", retentionText(destination.retention)]]
       : [["Account", destination.owner ?? "Determined on login"], ["API", destination.api_url]])}</article>`).join("")
@@ -429,7 +433,7 @@ function renderSettings(data) {
   $("#edit-configuration").hidden = !data.web.managed;
   $("#check-connections").hidden = !data.web.managed;
   $("#check-connections button").disabled = busy;
-  $("#settings").innerHTML = list([["Source", `${data.source.provider} / ${data.source.owner}`],
+  $("#settings").innerHTML = list([["Source", `${providerLabel(data.source.provider)} / ${data.source.owner}`],
     ["Source API", data.source.api_url], ["Schedule interval", `${data.schedule_hours} hours`],
     ["Next observed run", date(data.next_run, "Unavailable")], ["Working path", data.storage.path],
     ["Web actions", data.web.writes_paused ? "Applied sync paused" : data.web.allow_actions ? "Enabled" : "Read-only"],
@@ -745,18 +749,21 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh().catch(report);
 });
 
+const providerLabels = {github: "GitHub", gitlab: "GitLab", codeberg: "Codeberg", gitea: "Gitea", local: "Local backup"};
+const providerLabel = (id) => Object.hasOwn(providerLabels, id) ? providerLabels[id] : id;
+
 function providerInput(spec = {}, destination = false) {
   const fieldset = document.createElement("fieldset");
-  const choices = destination ? ["github", "gitlab", "codeberg", "local"] : ["github", "gitlab", "codeberg"];
+  const choices = Object.entries(providerLabels).filter(([id]) => destination || id !== "local");
   fieldset.innerHTML = `
     ${destination ? '<div class="target-head"><button type="button" class="link remove-target">Remove</button></div>' : ""}
     <div class="action-form">
       ${destination ? '<label>Destination ID<input name="id" pattern="[a-z][a-z0-9_\\-]{0,62}" maxlength="63" required></label>' : ""}
-      <label>Provider<select name="provider">${choices.map((p) => `<option>${p}</option>`).join("")}</select></label>
+      <label>Provider<select name="provider">${choices.map(([id, label]) => `<option value="${id}">${label}</option>`).join("")}</select></label>
     </div>
     <div class="action-form remote-section">
       <label>Account<input name="owner" maxlength="100" autocomplete="off"></label>
-      <label>API URL (optional)<input name="api_url" type="url" autocomplete="off" placeholder="Provider default"></label>
+      <label><span data-api-label>API URL (optional)</span><input name="api_url" type="url" autocomplete="off" placeholder="Provider default"></label>
       <label>API token<input name="token" type="password" autocomplete="new-password" maxlength="4096"></label>
     </div>
     <div class="action-form local-section">
@@ -784,6 +791,10 @@ function providerInput(spec = {}, destination = false) {
     for (const input of localFields.querySelectorAll("input")) input.disabled = !local;
     for (const input of remoteFields.querySelectorAll("input")) input.disabled = local;
     control("owner").required = !local;
+    const gitea = control("provider").value === "gitea";
+    control("api_url").required = gitea;
+    control("api_url").placeholder = gitea ? "https://git.example.com/api/v1" : "Provider default";
+    fieldset.querySelector("[data-api-label]").textContent = gitea ? "Gitea API URL" : "API URL (optional)";
     control("keep").required = local && (control("days").value !== "" || control("automatic").checked);
   }
   fieldset.addEventListener("input", syncFields);

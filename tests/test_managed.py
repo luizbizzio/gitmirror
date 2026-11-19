@@ -140,7 +140,8 @@ def test_browser_setup_can_enable_schedule(installation):
     assert gitmirror.load_config(managed.active().config)['schedule']['enabled'] is True
 
 
-def test_maintenance_guard_blocks_applied_sync_without_service_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize('pause', ['maintenance-pending', 'migration-pending'])
+def test_maintenance_guard_blocks_applied_sync_without_service_environment(tmp_path, monkeypatch, pause):
     etc = tmp_path / 'etc'
     work = tmp_path / 'work'
     etc.mkdir()
@@ -148,7 +149,7 @@ def test_maintenance_guard_blocks_applied_sync_without_service_environment(tmp_p
     monkeypatch.setattr(gitmirror, 'MANAGED_SYSTEM_ETC', etc)
     monkeypatch.delenv('GITMIRROR_MAINTENANCE_GUARD', raising=False)
     settings = {'storage': {'path': work}}
-    guard = etc / 'maintenance-pending'
+    guard = etc / pause
     guard.touch()
     assert gitmirror.managed_writes_blocked(settings)
     with pytest.raises(gitmirror.SyncError, match='paused'):

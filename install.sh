@@ -109,7 +109,8 @@ fetch_release_metadata() {
 }
 
 development_source() {
-    local temp=$1 commit
+    local temp commit
+    temp=$(realpath -e -- "$1") || fail 'Development package directory is unavailable'
     [[ -z "$artifact" && -z "$checksum" && -z "$tag" ]] ||
         fail 'Development snapshots cannot be combined with release tags or offline artifacts'
     command -v git >/dev/null || fail 'Development installation requires Git'
@@ -186,6 +187,25 @@ select_action() {
     fi
 }
 
+warn_legacy_cron() {
+    local user table file
+    local pattern='^[[:space:]]*[^#[:space:]].*(/tmp/gitmirror\.lock|gitmirror\.py|(^|[ /])gitmirror[[:space:]]+(sync|run))'
+    if command -v crontab >/dev/null; then
+        while IFS=: read -r user _; do
+            table=$(crontab -u "$user" -l 2>/dev/null) || continue
+            if grep -Eqi "$pattern" <<<"$table"; then
+                printf 'WARNING: Possible old GitMirror schedule in the crontab for %s. Review it before enabling managed sync.\n' "$user" >&2
+            fi
+        done </etc/passwd
+    fi
+    for file in /etc/crontab /etc/cron.d/* /etc/cron.{hourly,daily,weekly,monthly}/*; do
+        [[ -f "$file" ]] || continue
+        if grep -Eqi "$pattern" "$file"; then
+            printf 'WARNING: Possible old GitMirror schedule in %s. Review it before enabling managed sync.\n' "$file" >&2
+        fi
+    done
+}
+
 main() {
     action=auto
     tag= checksum= artifact= confirmation= lan=
@@ -224,6 +244,8 @@ main() {
                 printf 'No managed installation found.\n'
             fi
             [[ ! -e "$etc/maintenance-pending" ]] || printf 'Maintenance pending. Applied runs are blocked.\n'
+            [[ ! -e "$etc/migration-pending" ]] || printf 'A previous migration pause is still active. Applied runs are blocked.\n'
+            warn_legacy_cron
             return 0 ;;
         rollback|uninstall)
             [[ -f "$app/current/lifecycle.sh" ]] || fail 'No managed installation found'
@@ -231,6 +253,7 @@ main() {
             lifecycle
             return ;;
     esac
+    if [[ "$action" != check ]]; then warn_legacy_cron; fi
     if [[ "$action" == install ]]; then
         [[ ! -e "$app" && ! -L "$app" && ! -e "$state" && ! -L "$state" &&
            ! -e "$etc" && ! -L "$etc" && ! -e "$unit_dir/$web" && ! -L "$unit_dir/$web" &&

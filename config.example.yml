@@ -16,6 +16,11 @@ destinations:
   - provider: codeberg
     owner: your-codeberg-user
     token_env: CODEBERG_TOKEN
+  # To use Gitea here or as the source, set its HTTPS API URL.
+  # - provider: gitea
+  #   owner: your-gitea-user
+  #   api_url: https://git.example.com/api/v1
+  #   token_env: GITEA_TOKEN
   # Optional. Create the directory on the intended drive, then run init-backup.
   # - provider: local
   #   id: disk-a

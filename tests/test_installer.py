@@ -298,6 +298,19 @@ def test_managed_update_command_runs_installer_with_no_second_confirmation(tmp_p
         assert response.stdout.splitlines() == ['upgrade', '--confirm', 'UPGRADE']
 
 
+def test_status_warns_about_old_cron_without_printing_credentials_or_modifying_jobs(tmp_path):
+    response = shell("""
+        crontab() {
+            [[ "$1" == -u && "$2" == root && "$3" == -l ]] || return 1
+            printf '0 0,12 * * * TOKEN=synthetic-cron-secret /usr/bin/flock -n /tmp/gitmirror.lock /usr/bin/python3 -u /home/pi/bin/gitmirror.py --apply\\n'
+        }
+        warn_legacy_cron
+    """, tmp_path)
+    assert response.returncode == 0
+    assert 'crontab for root' in response.stderr
+    assert 'synthetic-cron-secret' not in response.stderr
+
+
 def test_upgrade_skips_same_version_only_when_digest_matches(tmp_path):
     source = """
         source "$PROJECT/packaging/lifecycle.sh"

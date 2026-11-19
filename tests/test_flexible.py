@@ -1,6 +1,7 @@
 import errno
 from itertools import permutations
 import json
+import os
 from pathlib import Path
 from urllib.parse import quote
 
@@ -12,7 +13,8 @@ from test_git_local import add_lfs_file, cmd, local_git_only, mirror
 
 
 PROVIDERS = tuple(gitmirror.PROVIDER_APIS)
-PAIRS = list(permutations(PROVIDERS, 2))
+PAIRS = [*permutations(PROVIDERS, 2), ('gitea', 'gitea')]
+API_BASES = {**gitmirror.PROVIDER_APIS, 'gitea': 'https://gitea.example.invalid/api/v1'}
 
 
 def configured(mirror, monkeypatch, source, targets, *, private=False, missing=False):
@@ -21,6 +23,8 @@ def configured(mirror, monkeypatch, source, targets, *, private=False, missing=F
     local.mkdir()
     destinations, hosts, counters = [], {}, {'source_reads': 0}
     source_spec = {'provider': source, 'owner': 'source', 'token_env': 'TEST_FLEX_SOURCE'}
+    if source == 'gitea':
+        source_spec['api_url'] = API_BASES[source]
     monkeypatch.setenv(source_spec['token_env'], 'synthetic-source')
     for target in targets:
         if target == 'local':
@@ -29,7 +33,10 @@ def configured(mirror, monkeypatch, source, targets, *, private=False, missing=F
         owner = f'mirror-{target}'
         token = f'TEST_FLEX_{target.upper()}'
         monkeypatch.setenv(token, f'synthetic-{target}')
-        destinations.append({'provider': target, 'owner': owner, 'token_env': token})
+        spec = {'provider': target, 'owner': owner, 'token_env': token}
+        if target == 'gitea':
+            spec['api_url'] = API_BASES[target]
+        destinations.append(spec)
         dest = config.parent / f'{target}.git'
         cmd('clone', '--bare', mirror.work, dest)
         if missing:
@@ -46,26 +53,43 @@ def configured(mirror, monkeypatch, source, targets, *, private=False, missing=F
         'default': 'main', 'present': True,
     }
 
+    def endpoint(platform, entry):
+        local_url = entry['repo'].as_uri()
+        if platform != 'gitea':
+            return local_url
+        advertised = f'ssh://git@gitea.example.invalid:2222/{entry["owner"]}/demo.git'
+        cmd('config', '--file', os.environ['GIT_CONFIG_GLOBAL'], f'url.{local_url}.insteadOf', advertised)
+        return advertised
+
+    upstream['url'] = endpoint(source, upstream)
+    for platform, entry in hosts.items():
+        entry['url'] = endpoint(platform, entry)
+
     def serialize(platform, entry, identity):
         info = {'id': identity, 'default_branch': entry['default'], 'visibility': entry['visibility'],
-                'archived': True, 'fork': True}
+                'archived': identity == 45, 'fork': identity == 45}
+        ssh_url = entry['url'] if platform == 'gitea' else entry['repo'].as_uri()
         if platform == 'gitlab':
             info.update(name='Demo Project', path_with_namespace=f'{entry["owner"]}/demo',
-                        ssh_url_to_repo=entry['repo'].as_uri(), forked_from_project={'id': 99})
+                        ssh_url_to_repo=ssh_url, forked_from_project={'id': 99})
         else:
-            info.update(name='demo', owner={'login': entry['owner']}, ssh_url=entry['repo'].as_uri(),
+            info.update(name='demo', owner={'login': entry['owner']}, ssh_url=ssh_url,
                         private=entry['visibility'] != 'public')
         return info
 
     def mock_api(url, headers, method='GET', payload=None):
-        platform, base = next((key, value) for key, value in gitmirror.PROVIDER_APIS.items()
+        platform, base = next((key, value) for key, value in API_BASES.items()
                               if url.startswith(value + '/'))
         path = url[len(base):]
         authenticate = 'PRIVATE-TOKEN' if platform == 'gitlab' else 'Authorization'
         assert 'synthetic-' in headers[authenticate]
         source_path = '/projects/source%2Fdemo' if source == 'gitlab' else '/repos/source/demo'
         lists = {'github': '/user/repos?affiliation=owner', 'gitlab': '/projects?owned=true',
-                 'codeberg': '/user/repos?limit=50'}
+                 'codeberg': '/user/repos?limit=50', 'gitea': '/user/repos?limit=50'}
+        if platform == 'gitea':
+            assert headers['Authorization'].startswith('token ')
+            if path == '/user' and headers['Authorization'] == 'token synthetic-source':
+                return 200, {'login': 'source'}
         if platform == source and path.startswith(lists[source]):
             assert method == 'GET' and headers[authenticate].endswith('synthetic-source')
             if not upstream['present'] or not path.endswith('page=1'):
@@ -112,16 +136,16 @@ def configured(mirror, monkeypatch, source, targets, *, private=False, missing=F
 @pytest.mark.parametrize('source,target', PAIRS)
 def test_remote_provider_pairs(mirror, monkeypatch, source, target):
     # Test private data, and creation of a new (initially private) GitHub repository.
-    private = source == 'gitlab'
+    private = source == 'gitlab' or source == target
     _, _, hosts, counters = configured(mirror, monkeypatch, source, [target], private=private,
-                                       missing=target == 'github')
+                                       missing=target in ('github', 'gitea'))
     cmd('tag', 'v2', cwd=mirror.work)
     cmd('push', 'source', '--tags', cwd=mirror.work)
     assert gitmirror.main([*mirror.args, 'sync', '--apply']) == 0
     dest = hosts[target]
     assert gitmirror.remote_refs(dest['repo'].as_uri()) == gitmirror.remote_refs(mirror.source.as_uri())
     assert dest['visibility'] == ('private' if private else 'public')
-    if target == 'github':
+    if target in ('github', 'gitea'):
         assert dest['writes'][0] == 'create private'
     assert counters['source_reads'] >= 3
 

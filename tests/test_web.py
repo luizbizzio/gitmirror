@@ -103,6 +103,8 @@ def test_source_size_units_and_unknown_values():
     size = gitmirror.Provider.source_size_bytes
     assert size('github', {'size': 1500}) == 1500 * 1024
     assert size('codeberg', {'size': 8}) == 8192
+    assert size('gitea', {'size': 8}) == 8192
+    assert size('gitea', {}) is None
     assert size('gitlab', {'statistics': {'repository_size': 7000}}) == 7000
     assert size('gitlab', {}) is None
     assert size('github', {'size': True}) is None
@@ -151,6 +153,35 @@ def test_local_backup_size_accounting_is_per_repository(tmp_path):
     repositories = {item['id']: item['logical_bytes'] for item in result[0]['repositories']}
     assert repositories == {'101': 40, '102': 80}
     assert result[0]['used'] >= 120
+
+
+def test_failed_backup_scan_does_not_report_a_partial_total(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    volume = tmp_path / 'mounted'
+    volume.mkdir()
+    missing = tmp_path / 'missing'
+    (volume / gitmirror.BACKUP_MARKER).write_text(json.dumps({'version': 1, 'id': 'a' * 32}))
+    source = {'provider': 'github', 'api_url': 'https://api.github.com', 'owner': 'tester'}
+    journal = SimpleNamespace(scope=gitmirror.scope_id(source), read=lambda *_: [])
+    settings = {'destinations': {'local': {'provider': 'local', 'path': volume}}}
+    real_walk = gitmirror.os.walk
+
+    def walk(path, *args, **kwargs):
+        if path != volume:
+            return real_walk(path, *args, **kwargs)
+        kwargs['onerror'](PermissionError('Unreadable backup directory'))
+        return ()
+
+    monkeypatch.setattr(gitmirror.os, 'walk', walk)
+    result = gitmirror.dashboard_backups(settings, journal, {})
+    assert result[0]['used'] is None
+    assert 'Unreadable backup directory' in result[0]['error']
+    monkeypatch.setattr(gitmirror.os, 'walk', real_walk)
+    settings['destinations']['another'] = {'provider': 'local', 'path': missing}
+    result = gitmirror.dashboard_backups(settings, journal, {})
+    assert result[0]['used'] > 0 and result[1]['used'] is None
+    assert gitmirror.backup_health(result)[1]['logical_bytes'] is None
 
 
 def test_host_origin_credentials_and_login_budget(web_setup):
