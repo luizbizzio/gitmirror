@@ -1,5 +1,78 @@
 # Sourced by the installer after release verification, or from the root-owned active release.
 
+# Public management command, separate from the Python CLI in the virtualenv.
+managed_cli_content() {
+    cat <<'GITMIRROR_CLI'
+#!/usr/bin/env bash
+# GitMirror managed launcher v1
+set -Eeuo pipefail
+
+installer=/opt/gitmirror-managed/current/install.sh
+engine=/opt/gitmirror-managed/current/venv/bin/gitmirror
+
+if (($# == 0)); then
+    printf 'GitMirror management: gitmirror -up | -v | status | check | rollback | uninstall\n'
+    printf 'Other arguments are passed to the GitMirror Python CLI.\n'
+    exit 0
+fi
+
+case "$1" in
+    -up|update|upgrade)
+        shift
+        action=upgrade
+        args=(--confirm UPGRADE)
+        ;;
+    status|check|rollback|uninstall)
+        action=$1
+        shift
+        args=()
+        ;;
+    -v|version)
+        [[ -f /opt/gitmirror-managed/current/version ]] ||
+            { printf 'GitMirror: managed installation not found\n' >&2; exit 1; }
+        printf 'GitMirror %s\n' "$(cat /opt/gitmirror-managed/current/version)"
+        exit 0
+        ;;
+    *)
+        exec "$engine" "$@"
+        ;;
+esac
+
+[[ -f "$installer" ]] || { printf 'GitMirror: installer unavailable\n' >&2; exit 1; }
+if ((EUID == 0)); then
+    exec "$installer" "$action" "${args[@]}" "$@"
+fi
+exec sudo -- "$installer" "$action" "${args[@]}" "$@"
+GITMIRROR_CLI
+}
+
+check_cli() {
+    if [[ -e "$cli" || -L "$cli" ]]; then
+        [[ -f "$cli" && ! -L "$cli" ]] &&
+            grep -Fxq '# GitMirror managed launcher v1' "$cli" ||
+            fail "$cli already exists and is not the GitMirror managed launcher"
+    fi
+}
+
+install_cli() {
+    local staged
+    check_cli
+    [[ -d "${cli%/*}" ]] || fail 'The global command directory does not exist'
+    staged=$(mktemp "${cli%/*}/.gitmirror.XXXXXXXX") || fail 'Could not stage GitMirror launcher'
+    if ! managed_cli_content >"$staged" || ! chmod 0755 "$staged" ||
+        ! mv -Tf -- "$staged" "$cli"; then
+        rm -f -- "$staged"
+        fail 'Could not install GitMirror management command'
+    fi
+}
+
+remove_cli() {
+    if [[ -f "$cli" && ! -L "$cli" ]] &&
+        grep -Fxq '# GitMirror managed launcher v1' "$cli"; then
+        rm -- "$cli"
+    fi
+}
+
 check_release() {
     local binary=$1
     "$binary" --version >/dev/null &&
@@ -111,6 +184,7 @@ cleanup_lifecycle() {
     trap - EXIT
     [[ -z "${temporary:-}" ]] || rm -rf -- "$temporary"
     [[ -z "${building:-}" ]] || rm -rf -- "$building"
+    if [[ "${fresh:-}" == 1 && "${made_cli:-0}" == 1 && "$result" != 0 ]]; then remove_cli; fi
     if [[ "${fresh:-}" == 1 && "$result" != 0 ]]; then
         if ((made_web)); then systemctl disable --now "$web" || true; rm -f -- "$unit_dir/$web"; fi
         if ((made_scheduler)); then systemctl disable --now "$scheduler" || true; rm -f -- "$unit_dir/$scheduler"; fi
@@ -125,7 +199,8 @@ cleanup_lifecycle() {
 
 fresh_install() {
     fresh=1
-    made_web=0 made_scheduler=0 made_state=0 made_etc=0 made_app=0 made_account=0
+    made_web=0 made_scheduler=0 made_state=0 made_etc=0 made_app=0 made_account=0 made_cli=0
+    check_cli
     mkdir -- "$app"; made_app=1
     mkdir -- "$app/releases"
     install -d -m 0755 "$etc"; made_etc=1
@@ -152,6 +227,8 @@ fresh_install() {
     systemctl daemon-reload
     systemctl enable --now "$web" "$scheduler"
     health || fail 'Dashboard or scheduler failed its readiness check; rolling back application installation'
+    install_cli
+    made_cli=1
     fresh=0
     printf '\nOpen %s and enter the one-time setup code printed below.\n' "$url"
     if [[ -n "$lan" ]]; then
@@ -235,10 +312,12 @@ switch_release() {
 
 upgrade() {
     local installed newest
+    check_cli
     installed=$(cat "$app/current/version")
     if [[ "$installed" == "$tag" ]]; then
         [[ -f "$app/current/digest" && "$(cat "$app/current/digest")" == "$checksum" ]] ||
             fail 'The installed version tag matches, but the archive digest differs; refusing to replace it'
+        install_cli
         printf 'GitMirror is already up to date (%s).\n' "$tag"
         return 0
     fi
@@ -253,6 +332,7 @@ upgrade() {
     confirm UPGRADE "Upgrade from $installed to $tag and restart the managed services."
     build_release
     switch_release "$candidate"
+    install_cli
 }
 
 uninstall() {
@@ -261,6 +341,7 @@ uninstall() {
     systemctl disable --now "$web" "$scheduler"
     rm -- "$unit_dir/$web" "$unit_dir/$scheduler"
     systemctl daemon-reload
+    remove_cli
     rm -rf -- "$app"
     printf 'Application removed. Preserved data: %s and %s\n' "$state" "$etc"
 }
