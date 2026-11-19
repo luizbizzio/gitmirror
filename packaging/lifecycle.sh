@@ -1,4 +1,5 @@
 # Sourced by the installer after release verification, or from the root-owned active release.
+cli=${cli:-/usr/local/bin/gitmirror}
 
 # Public management command, separate from the Python CLI in the virtualenv.
 managed_cli_content() {
