@@ -123,7 +123,11 @@ Create `gitmirror-linux-source.tar.gz` from reviewed sources. The archive contai
 tar -czf gitmirror-linux-source.tar.gz --no-recursion \
   INSTALL.md LICENSE NOTICE.txt README.md gitmirror.py install.sh \
   packaging/lifecycle.sh pyproject.toml \
-  web/app.js web/index.html web/style.css
+  web/app.js web/index.html web/style.css web/fonts/LICENSE.md \
+  web/fonts/source-sans-pro-regular.woff2 \
+  web/fonts/source-sans-pro-semibold.woff2 \
+  web/fonts/source-sans-pro-bold.woff2 \
+  web/fonts/source-sans-pro-italic.woff2
 ```
 
 Upload it to a stable GitHub release with release immutability enabled. Verify that the release API reports the release as immutable and supplies the uploaded asset's SHA-256. Exercise the public command on a disposable host before announcing it.
