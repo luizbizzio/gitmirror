@@ -1,1 +1,6 @@
 Development note: GitMirror 0.1.0a1 is an initial package conversion of the proven github_resilient_mirror_v3.py engine. No live Git service tests were run on this package. Do not replace a working production installation yet.
+
+Bundled web font: Source Sans Pro (regular, semibold, bold and italic WOFF2).
+Copyright 2010-2024 Adobe (http://www.adobe.com/), Reserved Font Name "Source".
+Licensed under the SIL Open Font License 1.1. Full license: web/fonts/LICENSE.md.
+Font files are sourced from the Pi-hole web project's vendored Source Sans Pro assets.
