@@ -1983,15 +1983,13 @@ def execute_sync(settings, *, apply=False, only=None, platform='all', full_lfs=F
         return run(settings, only=only, platform=platform, identifiers=identifiers, activity=activity)
     storage = settings['storage']['path']
     if managed_writes_blocked(settings):
-        raise SyncError('Managed synchronization is paused for migration or maintenance')
+        raise SyncError('Managed synchronization is paused for maintenance')
     storage.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(storage / '.gitmirror.lock'), timeout=0):
             with managed_sync_lock(settings):
                 if managed_writes_blocked(settings):
-                    raise SyncError('Managed synchronization is paused for migration or maintenance')
-                if storage == MANAGED_SYSTEM_STATE and (MANAGED_SYSTEM_ETC / 'legacy').is_dir():
-                    assert_legacy_job_inactive(MANAGED_SYSTEM_ETC / 'legacy-target')
+                    raise SyncError('Managed synchronization is paused for maintenance')
                 return run(settings, apply=True, only=only, platform=platform, full_lfs=full_lfs,
                            identifiers=identifiers, activity=activity)
     except Timeout:
@@ -1999,25 +1997,12 @@ def execute_sync(settings, *, apply=False, only=None, platform='all', full_lfs=F
         return 2
 
 
-def managed_guard_exists(variable, settings=None):
-    if settings and settings['storage']['path'] == MANAGED_SYSTEM_STATE:
-        filename = 'migration-pending' if variable == 'GITMIRROR_MIGRATION_GUARD' else 'maintenance-pending'
-        if (MANAGED_SYSTEM_ETC / filename).exists():
-            return True
-        if variable == 'GITMIRROR_MIGRATION_GUARD' and (MANAGED_SYSTEM_ETC / 'legacy').is_dir():
-            try:
-                with (MANAGED_SYSTEM_ETC / 'migration-state').open(encoding='utf-8') as file:
-                    if file.readline().strip() != 'complete':
-                        return True
-            except (OSError, UnicodeError):
-                return True
-    value = os.getenv(variable)
-    return bool(value and Path(value).exists())
-
-
 def managed_writes_blocked(settings=None):
-    return (managed_guard_exists('GITMIRROR_MIGRATION_GUARD', settings)
-            or managed_guard_exists('GITMIRROR_MAINTENANCE_GUARD', settings))
+    if settings and settings['storage']['path'] == MANAGED_SYSTEM_STATE:
+        if (MANAGED_SYSTEM_ETC / 'maintenance-pending').exists():
+            return True
+    guard = os.getenv('GITMIRROR_MAINTENANCE_GUARD')
+    return bool(guard and Path(guard).exists())
 
 
 @contextmanager
@@ -2053,81 +2038,6 @@ def managed_sync_lock(settings):
         except OSError as exc:
             raise SyncError('Managed synchronization lock disappeared while opening it') from exc
         yield
-    finally:
-        os.close(descriptor)
-
-
-def legacy_command_active(arguments, targets):
-    if not arguments:
-        return False
-    program = Path(arguments[0]).name
-    python = re.fullmatch(r'python[0-9.]*', program)
-    if arguments[0] in targets or ((python or program in ('sh', 'dash', 'bash', 'flock'))
-                                  and any(argument in targets for argument in arguments[1:])):
-        return True
-    if program in ('sh', 'dash', 'bash') and '-c' in arguments[1:3]:
-        command = arguments[arguments.index('-c') + 1:][:1]
-        return bool(command and re.search(r'\bflock\b', command[0])
-                    and any(re.search(rf'(?<![\w./-]){re.escape(target)}(?![\w./-])', command[0])
-                            for target in targets))
-    if python:
-        # A relative invocation with the same filename cannot be ruled out across user accounts.
-        names = {Path(target).name for target in targets}
-        return any(not arg.startswith('/') and Path(arg).name in names for arg in arguments[1:] if arg)
-    return False
-
-
-def assert_legacy_job_inactive(record, *, proc=Path('/proc')):
-    try:
-        targets = record.read_text(encoding='utf-8').splitlines()
-        if not 1 <= len(targets) <= 2 or any(not re.fullmatch(r'/[A-Za-z0-9_./+-]+', path) for path in targets):
-            raise ValueError('Invalid legacy executable record')
-        # A restricted procfs can hide the original user's processes entirely.
-        mountinfo = (proc / 'self/mountinfo').read_text(encoding='utf-8')
-        visible_proc = False
-        for line in mountinfo.splitlines():
-            mount, _, filesystem = line.partition(' - ')
-            if mount.split()[4:5] == ['/proc'] and filesystem.startswith('proc '):
-                visible_proc = True
-                if any(option != 'hidepid=0' for option in re.findall(r'hidepid=[^,\s]+', line)):
-                    raise SyncError('Cannot check legacy jobs because /proc hides other users')
-        if not visible_proc:
-            raise SyncError('Cannot confirm the host procfs mount for the legacy job check')
-        for process in proc.iterdir():
-            if not process.name.isdecimal() or process.name == str(os.getpid()):
-                continue
-            try:
-                command = (process / 'cmdline').read_bytes().decode('utf-8', 'surrogateescape')
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            if legacy_command_active(command.strip('\x00').split('\x00'), targets):
-                raise SyncError(f'Legacy GitMirror process {process.name} is still active; retry after it exits')
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise SyncError('Cannot verify that the identified legacy GitMirror job is inactive') from exc
-
-
-def hold_legacy_flock(path):
-    """Hold the named legacy inode until the cutover parent's pipe closes."""
-    if not sys.platform.startswith('linux'):
-        raise SyncError('Legacy flock handoff requires Linux')
-    import fcntl
-
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError as exc:
-        raise SyncError('Cannot open the legacy flock without following links') from exc
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise SyncError('The legacy flock path is not a regular file')
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise SyncError('The old job holds its flock; retry after it exits') from exc
-        if not os.path.samestat(info, path.lstat()):
-            raise SyncError('The legacy flock was replaced while opening it')
-        print(f'{info.st_dev} {info.st_ino}', flush=True)
-        sys.stdin.read(1)
     finally:
         os.close(descriptor)
 
@@ -2307,7 +2217,6 @@ class DashboardJournal:
                 """)
             if os.name != 'nt':
                 self.path.chmod(0o600)
-            self.import_legacy()
             self.touch()
 
     def connect(self):
@@ -2333,22 +2242,6 @@ class DashboardJournal:
             return self.change.stat().st_mtime_ns
         except OSError:
             return 0
-
-    def import_legacy(self):
-        legacy = self.directory / 'runs.sqlite3'
-        if not legacy.is_file():
-            return
-        with closing(sqlite3.connect(legacy.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
-            runs = db.execute('SELECT id,started,ended,mode,repository,destinations,state,exit_code,error FROM runs')
-            with closing(self.connect()) as current, current:
-                for identifier, started, ended, mode, repo, dests, state, code, error in runs:
-                    if re.fullmatch(r'[a-f0-9]{20}', identifier):
-                        current.execute('INSERT OR IGNORE INTO operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                                        (identifier, self.scope, started, ended, ended or started, 'sync',
-                                         'web', mode, repo, dests,
-                                         'interrupted' if state == 'running' else state, code,
-                                         'Legacy run failed' if error else None, None))
-        # Legacy logs were captured without credential redaction.
 
     def begin(self, identifier, operation, mode, origin, repository, destinations, *, state='running'):
         now = time.time()
@@ -2849,9 +2742,6 @@ class ManagedInstallation:
         schedule = payload.get('schedule')
         if not isinstance(schedule, dict) or type(schedule.get('enabled')) is not bool:
             raise ConfigError('Choose whether to enable the schedule')
-        migration = managed_guard_exists('GITMIRROR_MIGRATION_GUARD', {'storage': {'path': self.work}})
-        if migration and schedule['enabled']:
-            raise ConfigError('Complete migration cutover before enabling the schedule')
         repositories = payload.get('repositories', [])
         raw = {'version': 2, 'source': source, 'destinations': destinations, 'storage': {'path': str(self.work)},
                'schedule': {'enabled': schedule['enabled'], 'interval_hours': schedule.get('interval_hours')},
@@ -2889,8 +2779,6 @@ class ManagedInstallation:
             salt, verifier = self.credentials(active)
         private_text(revision.path / 'admin.json', json.dumps({'salt': salt.hex(), 'password': verifier.hex()}))
         volumes = {key: spec for key, spec in settings['destinations'].items() if spec['provider'] == 'local'}
-        if migration and any(spec['path'] != self.volumes / key for key, spec in volumes.items()):
-            raise ConfigError('Staged migration uses managed local backup directories only')
         for key, spec in volumes.items():
             if spec['path'] == self.volumes / key:
                 spec['path'].mkdir(mode=0o700, exist_ok=True)
@@ -2932,27 +2820,20 @@ def managed_scheduler(installation):
         due = time.time() + settings['schedule']['interval_hours'] * 3600
 
 
-def validate_managed(installation, *, preflight=False):
+def validate_managed(installation):
     revision = installation.active()
     if not revision:
-        if preflight:
-            raise SyncError('Complete the staged dashboard setup before cutover')
         return 0
     settings = load_config(revision.config)
     if settings['storage']['path'] != installation.work:
-        raise SyncError('The managed configuration does not use its isolated work directory')
+        raise SyncError('The managed configuration does not use its private work directory')
     installation.credentials(revision)
     for spec in (settings['source'], *settings['destinations'].values()):
         if spec['provider'] != 'local':
             token(spec)
     if not revision.ssh_config.is_file():
         raise SyncError('Managed SSH configuration is missing')
-    if not preflight:
-        return 0
-    os.environ['GITMIRROR_MANAGED_SSH_CONFIG'] = str(revision.ssh_config)
-    with tempfile.TemporaryDirectory(prefix='migration-check-', dir=installation.work) as scratch:
-        settings['storage']['path'] = Path(scratch)
-        return run(settings, apply=False)
+    return 0
 
 
 # Optional self-hosted dashboard
@@ -3146,8 +3027,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         @app.get('/api/setup')
         def setup_status():
             return {'required': pending_setup, 'public_key': managed.public_key() if pending_setup else None,
-                    'revision': revision.identifier if revision else None,
-                    'migration_pending': managed_guard_exists('GITMIRROR_MIGRATION_GUARD', settings)}
+                    'revision': revision.identifier if revision else None}
 
         async def save_settings(data, *, initial=False):
             try:
@@ -3197,8 +3077,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         @app.get('/api/managed/settings')
         def managed_settings(request: _GitMirrorWebRequest):
             auth(request)
-            return {**managed.settings(revision), 'revision': revision.identifier,
-                    'migration_pending': managed_guard_exists('GITMIRROR_MIGRATION_GUARD', settings)}
+            return {**managed.settings(revision), 'revision': revision.identifier}
 
         @app.post('/api/managed/settings')
         async def update_settings(request: _GitMirrorWebRequest):
@@ -3421,7 +3300,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         repository, targets = repo_name(data), selected(data)
         applied = data['apply']
         if applied and managed_writes_blocked(settings):
-            raise HTTPException(409, 'Applied synchronization is paused for migration or maintenance')
+            raise HTTPException(409, 'Applied synchronization is paused for maintenance')
         required = 'SYNC' if repository else 'SYNC ALL'
         if applied and data.get('confirmation') != required:
             raise HTTPException(400, f'Type {required} to confirm this applied sync')
@@ -3610,16 +3489,8 @@ def main(argv=None):
     provision.add_argument('--state-dir', required=True)
     scheduler = sub.add_parser('managed-scheduler', help='Run the managed installation scheduler')
     scheduler.add_argument('--state-dir', required=True)
-    handoff = sub.add_parser('managed-legacy-scan', help='Check for a recorded legacy GitMirror process')
-    handoff.add_argument('--record', type=Path, required=True)
-    handoff.add_argument('--clock', action='store_true', help='Return the current boot monotonic time in microseconds')
-    lease = sub.add_parser('managed-legacy-lock', help='Hold the old flock during a migration transaction')
-    lease.add_argument('--path', type=Path, required=True)
-    for name, help_text in (
-            ('managed-validate', 'Check a managed configuration without connecting to providers'),
-            ('managed-preflight', 'Exercise the staged managed configuration in a temporary dry-run')):
-        managed_check = sub.add_parser(name, help=help_text)
-        managed_check.add_argument('--state-dir', required=True)
+    managed_check = sub.add_parser('managed-validate', help='Check a managed configuration')
+    managed_check.add_argument('--state-dir', required=True)
 
     initialization = sub.add_parser('init-backup', help='Initialize a configured local backup volume')
     add_destination_selector(initialization)
@@ -3678,16 +3549,8 @@ def main(argv=None):
             return 0
         if args.command == 'managed-scheduler':
             return managed_scheduler(ManagedInstallation(args.state_dir))
-        if args.command == 'managed-legacy-scan':
-            assert_legacy_job_inactive(args.record)
-            if args.clock:
-                print(time.monotonic_ns() // 1000)
-            return 0
-        if args.command == 'managed-legacy-lock':
-            hold_legacy_flock(args.path)
-            return 0
-        if args.command in ('managed-validate', 'managed-preflight'):
-            return validate_managed(ManagedInstallation(args.state_dir), preflight=args.command == 'managed-preflight')
+        if args.command == 'managed-validate':
+            return validate_managed(ManagedInstallation(args.state_dir))
         if args.command == 'doctor':
             def diagnose(activity):
                 return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform,
