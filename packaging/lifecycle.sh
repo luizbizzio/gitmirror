@@ -19,7 +19,7 @@ build_release() {
     "$candidate/venv/bin/python" -m pip install --disable-pip-version-check --no-input \
         --index-url https://pypi.org/simple "$temporary/source[web]"
     install -m 0755 "$temporary/source/install.sh" "$candidate/install.sh"
-    install -m 0644 "$temporary/source/packaging/"{lifecycle,legacy}.sh "$candidate/"
+    install -m 0644 "$temporary/source/packaging/lifecycle.sh" "$candidate/"
     printf '%s\n' "$tag" >"$candidate/version"
     printf '%s\n' "$checksum" >"$candidate/digest"
     building=
@@ -84,7 +84,6 @@ Group=$account
 WorkingDirectory=$state
 Environment=PYTHONUNBUFFERED=1
 Environment=TMPDIR=$state/tmp
-Environment=GITMIRROR_MIGRATION_GUARD=$etc/migration-pending
 Environment=GITMIRROR_MAINTENANCE_GUARD=$etc/maintenance-pending
 ExecStart=$app/current/venv/bin/gitmirror $command
 Restart=on-failure
@@ -131,10 +130,6 @@ fresh_install() {
     mkdir -- "$app/releases"
     install -d -m 0755 "$etc"; made_etc=1
     ensure_managed_lock
-    if [[ "$action" == migrate ]]; then
-        source "$temporary/source/packaging/legacy.sh"
-        prepare_legacy
-    fi
     build_release
     point "$candidate" current
     useradd --system --user-group --home-dir "$state" --shell /usr/sbin/nologin "$account"
@@ -163,7 +158,6 @@ fresh_install() {
         printf 'Match this certificate fingerprint in the browser before trusting the local certificate.\n'
         openssl x509 -noout -sha256 -fingerprint -in "$etc/tls/server.crt"
     fi
-    [[ "$action" != migrate ]] || printf 'Migration is staged. Applied synchronization remains blocked until cutover.\n'
     cat -- "$state/setup-code"
 }
 
@@ -250,7 +244,7 @@ upgrade() {
 }
 
 uninstall() {
-    confirm UNINSTALL 'Remove this application and its two services. Preserve configuration, credentials, backups, legacy state and the service account.'
+    confirm UNINSTALL 'Remove this application and its two services. Preserve configuration, credentials, backups and the service account.'
     drain
     systemctl disable --now "$web" "$scheduler"
     rm -- "$unit_dir/$web" "$unit_dir/$scheduler"
@@ -262,17 +256,13 @@ uninstall() {
 lifecycle() {
     trap cleanup_lifecycle EXIT
     case "$action" in
-        install|migrate) fresh_install ;;
+        install) fresh_install ;;
         upgrade) settings; upgrade ;;
         rollback)
             settings
             [[ -L "$app/previous" ]] || fail 'No previously active release is available'
             confirm ROLLBACK 'Revert the application while preserving current user data.'
             switch_release "$(readlink -e "$app/previous")" ;;
-        cutover|rollback-migration)
-            settings
-            source "$app/current/legacy.sh"
-            if [[ "$action" == cutover ]]; then cutover; else rollback_migration; fi ;;
         uninstall) uninstall ;;
     esac
 }
