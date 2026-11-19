@@ -12,6 +12,7 @@ account=gitmirror-managed
 web=gitmirror-managed-web.service
 scheduler=gitmirror-managed-scheduler.service
 unit_dir=/etc/systemd/system
+cli=/usr/local/bin/gitmirror
 files=(INSTALL.md LICENSE NOTICE.txt README.md gitmirror.py install.sh packaging/lifecycle.sh
        pyproject.toml web/app.js web/index.html web/style.css)
 
@@ -27,6 +28,7 @@ GitMirror installer and maintenance
   --tag vX.Y.Z    Select an immutable stable release
   --artifact FILE --sha256 HEX --tag vX.Y.Z   Install a trusted offline archive
   --yes           Approve installing missing apt dependencies
+  After installation: gitmirror -up (update), gitmirror -v (version)
   Without a published stable release, interactive runs can choose main.
   Updates keep configuration, backups and service settings. See INSTALL.md.
 EOF
