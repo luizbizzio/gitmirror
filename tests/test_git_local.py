@@ -697,9 +697,10 @@ def test_new_destination_is_private_until_default_and_refs_are_verified(mirror, 
     assert state.created and state.default == 'trunk' and state.visibility == 'public'
 
 
-def test_default_change_dry_run_never_updates_branches(mirror, default_change, capsys):
+@pytest.mark.parametrize('platform', ['gitlab', 'codeberg'])
+def test_default_change_dry_run_never_updates_branches(mirror, default_change, capsys, platform):
     state, previous = default_change
-    assert main([*mirror.args, 'sync', '--dry-run']) == 0
+    assert main([*mirror.args, 'sync', '--dry-run', '--platform', platform]) == 0
     assert 'WOULD verify trunk, then set it as default' in capsys.readouterr().out
     assert not state.switches
     assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous

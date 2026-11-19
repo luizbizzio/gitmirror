@@ -9,6 +9,7 @@ source:
   token_env: GITHUB_TOKEN
 
 destinations:
+  # Add a unique lowercase id when configuring multiple targets of the same type.
   - provider: gitlab
     owner: your-gitlab-user
     token_env: GITLAB_TOKEN
@@ -17,7 +18,12 @@ destinations:
     token_env: CODEBERG_TOKEN
   # Optional. Create the directory on the intended drive, then run init-backup.
   # - provider: local
+  #   id: disk-a
   #   path: /mnt/backups/gitmirror
+  #   retention:                # Omit to keep every generation.
+  #     keep: 3
+  #     days: 30                # Optional. Also keep every generation this recent.
+  #     automatic: false        # Run cleanup --apply explicitly.
   # Windows example: path: 'D:\Backups\GitMirror'
 
 storage:

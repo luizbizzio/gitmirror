@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 import datetime as dt
+import errno
 import fnmatch
 import hashlib
 import json
@@ -95,6 +96,19 @@ def config_path(value, label, *, absolute=False):
         raise ConfigError(f'{label} is not a usable path') from exc
 
 
+def retention_config(value, label):
+    if value is None:
+        return None
+    policy = _mapping(value, label)
+    if policy.keys() - {'keep', 'days', 'automatic'}:
+        raise ConfigError(f'{label}: use keep, days and automatic')
+    keep, days, auto = policy.get('keep', 1), policy.get('days'), policy.get('automatic', False)
+    if (type(keep) is not int or keep < 1 or (days is not None and (type(days) is not int or days < 1))
+            or type(auto) is not bool):
+        raise ConfigError(f'{label}: keep and days must be positive integers and automatic must be boolean')
+    return {'keep': keep, 'days': days, 'automatic': auto}
+
+
 def load_config(path):
     file = Path(path).expanduser().resolve()
     try:
@@ -119,25 +133,38 @@ def load_config(path):
     storage = _mapping(raw.get('storage', {'path': '~/gitmirror-data'}), 'storage')
     work_path = config_path(storage.get('path'), 'storage.path')
     dests = {}
+    endpoint_accounts = set()
+    local_roots = []
     for index, entry in enumerate(entries, 1):
         label = f'destinations[{index}]'
         cfg = _mapping(entry, label)
         platform = cfg.get('provider')
+        identifier = cfg.get('id', platform)
+        if (not isinstance(identifier, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,62}', identifier)
+                or identifier in ('origin', 'all', 'both')):
+            raise ConfigError(f'{label}.id must be a lowercase identifier distinct from origin, all and both')
+        if identifier in dests:
+            raise ConfigError(f'{label}: duplicate destination ID {identifier}; give each destination a unique id')
         if platform == 'local':
             if any(cfg.get(option, True) is not True for option in ('mirror', 'archive', 'preserve_history')):
                 raise ConfigError(f'{label}: local backups require mirror, archive and preserve_history')
             local_path = config_path(cfg.get('path'), f'{label}.path', absolute=True)
             if local_path.is_relative_to(work_path) or work_path.is_relative_to(local_path):
                 raise ConfigError('The local backup and working storage paths must be separate')
-            cfg = {'provider': 'local', 'path': local_path}
+            if any(local_path.is_relative_to(root) or root.is_relative_to(local_path) for root in local_roots):
+                raise ConfigError('Local backup destinations must have separate, non-overlapping paths')
+            local_roots.append(local_path)
+            cfg = {'provider': 'local', 'path': local_path,
+                   'retention': retention_config(cfg.get('retention'), f'{label}.retention')}
         else:
             cfg = provider_config(cfg, label, owner_optional=version == 1 and platform == 'gitlab')
-            if (platform == source['provider'] and urlparse(cfg['api_url']).hostname == urlparse(source['api_url']).hostname
-                    and cfg['owner'].casefold() == source['owner'].casefold()):
+            account = platform, cfg['api_url'], (cfg.get('owner') or '').casefold()
+            if account == (source['provider'], source['api_url'], source['owner'].casefold()):
                 raise ConfigError('The source account cannot also be a destination on the same host')
-        if platform in dests:
-            raise ConfigError(f'{label}: only one {platform} destination per configuration is supported')
-        dests[platform] = cfg
+            if account in endpoint_accounts:
+                raise ConfigError('The same remote account and API endpoint cannot be configured twice')
+            endpoint_accounts.add(account)
+        dests[identifier] = cfg
     retry = _mapping(raw.get('retry', {'delays_seconds': [3, 8, 20]}), 'retry')
     delays = retry.get('delays_seconds', [3, 8, 20])
     if (not isinstance(delays, list) or len(delays) > 8 or
@@ -178,11 +205,8 @@ def configure_runtime(settings, *, apply):
     global ROOT, GL_API
     global JOURNAL_DIR, RETRY_DELAYS, RUN_ID, SSH_ENV
     ROOT = settings['storage']['path']
-    gitlab = settings['destinations'].get('gitlab')
-    GL_API = gitlab['api_url'] if gitlab else PROVIDER_APIS['gitlab']
+    GL_API = PROVIDER_APIS['gitlab']
     JOURNAL_DIR = ROOT / 'gitlab-protection-journal'
-    if gitlab and settings['version'] == 2:
-        JOURNAL_DIR /= scope_id(gitlab)
     RETRY_DELAYS = tuple(settings['retry']['delays_seconds'])
     RUN_ID = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:6]
     SSH_ENV = dict(os.environ)
@@ -807,13 +831,30 @@ def git_address(url):
 def reject_source_as_destination(source, record, provider, destination):
     if destination is None:
         return
-    same_instance = (source.kind == provider.kind and urlparse(source.base).hostname == urlparse(provider.base).hostname)
+    same_instance = source.kind == provider.kind and source.base == provider.base
     if ((same_instance and record['id'] == destination.id)
             or git_address(record['ssh_url']) == git_address(destination.url)):
         raise SyncError('Source and destination resolve to the same repository')
 
 
 # GitLab branch protection and recovery journal
+
+@contextmanager
+def protection_scope(settings, spec):
+    """Select the journal and API for one GitLab account while retaining v1 paths."""
+    global GL_API, JOURNAL_DIR
+    if spec['provider'] != 'gitlab':
+        yield
+        return
+    old_api, old_journal = GL_API, JOURNAL_DIR
+    GL_API = spec['api_url']
+    JOURNAL_DIR = ROOT / 'gitlab-protection-journal'
+    if settings['version'] == 2:
+        JOURNAL_DIR /= scope_id(spec)
+    try:
+        yield
+    finally:
+        GL_API, JOURNAL_DIR = old_api, old_journal
 
 # GitLab protected branch support. Only exact, project-owned rules are
 # modified. Wildcard/group rules and protected tags are never bypassed.
@@ -1061,22 +1102,32 @@ def backup_volume(path):
     return marker['id'], stat.st_dev, stat.st_ino
 
 
-def local_path(settings):
-    if 'local' not in settings['destinations']:
+def local_destinations(settings, identifiers=None):
+    configured = settings['destinations']
+    keys = dict.fromkeys(identifiers or (name for name, spec in configured.items() if spec['provider'] == 'local'))
+    if not keys:
         raise SyncError('Configure a local destination first')
-    return settings['destinations']['local']['path']
+    if any(key not in configured or configured[key]['provider'] != 'local' for key in keys):
+        raise SyncError('Select existing local destination IDs')
+    return {key: configured[key] for key in keys}
 
 
-def initialize_backup(settings):
-    path = local_path(settings)
-    if not path.is_dir():
-        raise SyncError(f'Local backup directory must already exist on the intended volume: {path}')
-    with FileLock(str(path / '.gitmirror-backup.lock'), timeout=0):
-        if not (path / BACKUP_MARKER).exists():
-            store_json(path / BACKUP_MARKER, {'version': 1, 'id': uuid.uuid4().hex})
-        backup_volume(path)
-    print(f'Local backup volume ready at {path}')
-    return 0
+def initialize_backup(settings, identifiers=None):
+    failed = False
+    for name, spec in local_destinations(settings, identifiers).items():
+        path = spec['path']
+        try:
+            if not path.is_dir():
+                raise SyncError(f'Local backup directory must already exist on the intended volume: {path}')
+            with FileLock(str(path / '.gitmirror-backup.lock'), timeout=0):
+                if not (path / BACKUP_MARKER).exists():
+                    store_json(path / BACKUP_MARKER, {'version': 1, 'id': uuid.uuid4().hex})
+                backup_volume(path)
+            print(f'{name}: Local backup volume ready at {path}')
+        except (OSError, SyncError, Timeout) as exc:
+            print(f'{name}: FAILED: {exc}')
+            failed = True
+    return 2 if failed else 0
 
 
 def backup_refs(repo):
@@ -1112,9 +1163,33 @@ def backup_manifest(repo):
     return manifest
 
 
-def verify_local_generation(repo, manifest=None):
+def linked_backup_path(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def verify_backup_payload_paths(repo):
+    def fail(error):
+        raise error
+
+    for base in (repo / 'objects', repo / 'lfs'):
+        if linked_backup_path(base):
+            raise SyncError(f'Linked path in the local backup: {base}')
+        for root, dirs, files in os.walk(base, onerror=fail) if base.exists() else ():
+            for name in dirs + files:
+                path = Path(root) / name
+                if linked_backup_path(path):
+                    raise SyncError(f'Linked path in the local backup: {path}')
+
+
+def verify_local_generation(repo, manifest=None, *, objects=None):
     if manifest is None:
         manifest = backup_manifest(repo)
+    verify_backup_payload_paths(repo)
     if ((repo / 'objects' / 'info' / 'alternates').exists()
             or any((repo / 'objects' / 'pack').glob('*.promisor'))):
         raise SyncError('The local backup depends on an external Git object store')
@@ -1126,7 +1201,9 @@ def verify_local_generation(repo, manifest=None):
         raise SyncError(f'Default branch does not match the local backup manifest at {repo}')
     git('fsck', '--full', '--no-dangling', repo=repo, timeout=1800,
         env={**SSH_ENV, 'GIT_NO_LAZY_FETCH': '1', 'GIT_ALLOW_PROTOCOL': 'file'})
-    verify_lfs_objects(repo / 'lfs' / 'objects', lfs_objects(repo, refs, scratch=tempfile.gettempdir()))
+    if objects is None:
+        objects = lfs_objects(repo, refs, scratch=tempfile.gettempdir())
+    verify_lfs_objects(repo / 'lfs' / 'objects', objects)
     return manifest
 
 
@@ -1161,7 +1238,67 @@ def flush_snapshot(repo):
         fsync_directory(root)
 
 
-def preserve_local_backup(path, volume, scope, source, record, working, refs, objects):
+def clone_file(source, target):
+    if not sys.platform.startswith('linux'):
+        return False
+    import fcntl
+
+    try:
+        with open(source, 'rb') as original, open(target, 'xb') as cloned:
+            # Linux _IOW(0x94, 9, int), as defined by <linux/fs.h>.
+            fcntl.ioctl(cloned.fileno(), getattr(fcntl, 'FICLONE', 0x40049409), original.fileno())
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTTY, errno.EXDEV, errno.ENOSYS, errno.EBADF):
+            raise
+        Path(target).unlink(missing_ok=True)
+        return False
+    return True
+
+
+class BackupCopy:
+    """Use independent inodes with copy-on-write where supported."""
+
+    def __init__(self):
+        self.unsupported = set()
+        self.cloned = self.copied = 0
+
+    def __call__(self, source, target):
+        source, target = Path(source), Path(target)
+        if source.is_symlink() or not source.is_file():
+            raise SyncError(f'Backup payload must be a regular file: {source}')
+        devices = source.stat().st_dev, target.parent.stat().st_dev
+        if devices not in self.unsupported and clone_file(source, target):
+            self.cloned += 1
+        else:
+            self.unsupported.add(devices)
+            shutil.copyfile(source, target)
+            self.copied += 1
+        shutil.copymode(source, target)
+        return target
+
+
+def init_bare_backup(working, staged):
+    fmt = git('rev-parse', '--show-object-format', repo=working).stdout.strip()
+    git('init', '--bare', '--template=', f'--object-format={fmt}', str(staged))
+    git('config', 'lfs.storage', 'lfs', repo=staged)
+    if os.name == 'nt':
+        git('config', 'core.longpaths', 'true', repo=staged)
+
+
+def copy_lfs_payload(staged, objects, copy, *media_dirs):
+    for oid in objects:
+        relative = Path(oid[:2], oid[2:4], oid)
+        source = next((directory / relative for directory in media_dirs
+                       if directory is not None and (directory / relative).is_file()), None)
+        if source is None:
+            raise SyncError(f'Missing LFS object {oid} for the verified backup')
+        target = staged / 'lfs' / 'objects' / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        copy(source, target)
+
+
+def preserve_local_backup(path, volume, scope, source, record, working, refs, objects, *,
+                          identifier='local', retention=None):
     """Publish a verified, self-contained generation with a single pointer replacement."""
     def confirm_volume():
         if backup_volume(path) != volume:
@@ -1183,7 +1320,9 @@ def preserve_local_backup(path, volume, scope, source, record, working, refs, ob
                 if before == refs and old['default_branch'] == branch and old['name'] == record['name']:
                     source.confirm_source(record)
                     confirm_volume()
-                    print(f'  local: verified current backup {previous}')
+                    if retention and retention['automatic']:
+                        cleanup_repository(directory, retention, apply=True, confirm_volume=confirm_volume)
+                    print(f'  {identifier}: verified current backup {previous}')
                     return
                 archived = {key: oid for key, oid in old['refs'].items() if key.startswith('refs/archive/')}
                 archived.update({f'refs/archive/{previous.stem}/{ref.removeprefix("refs/")}': oid
@@ -1194,34 +1333,30 @@ def preserve_local_backup(path, volume, scope, source, record, working, refs, ob
                 location.mkdir(mode=0o700, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix='.partial-', dir=generations) as scratch:
                 staged = Path(scratch) / 'mirror.git'
+                init_bare_backup(working, staged)
+                copy = BackupCopy()
                 if previous:
-                    shutil.copytree(previous, staged)
-                    updates = ''.join(f'create refs/archive/{previous.stem}/{ref.removeprefix("refs/")} {oid}\n'
-                                      for ref, oid in before.items())
-                    git('update-ref', '--stdin', repo=staged, input_text=updates)
-                else:
-                    fmt = git('rev-parse', '--show-object-format', repo=working).stdout.strip()
-                    git('init', '--bare', '--template=', f'--object-format={fmt}', str(staged))
-                    git('config', 'lfs.storage', 'lfs', repo=staged)
-                    if os.name == 'nt':
-                        git('config', 'core.longpaths', 'true', repo=staged)
+                    # Keep the Git pack/loose objects for incremental negotiation, without
+                    # inheriting repository config, locks, hooks, or LFS cache leftovers.
+                    shutil.copytree(previous / 'objects', staged / 'objects', dirs_exist_ok=True,
+                                    ignore=shutil.ignore_patterns('info'), copy_function=copy)
+                    updates = ''.join(f'create {ref} {oid}\n' for ref, oid in archived.items())
+                    if updates:
+                        git('update-ref', '--stdin', repo=staged, input_text=updates)
                 git('fetch', '--atomic', '--prune', '--no-tags', '--no-write-fetch-head', '--refmap=',
                     working.as_uri(), '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*',
                     repo=staged, timeout=1800, env={**SSH_ENV, 'GIT_ALLOW_PROTOCOL': 'file'})
                 git('symbolic-ref', 'HEAD', f'refs/heads/{branch}', repo=staged)
-                if objects:
-                    media = lfs_media_dir(working)
-                    for oid in objects:
-                        relative = Path(oid[:2], oid[2:4], oid)
-                        target = staged / 'lfs' / 'objects' / relative
-                        if not target.exists():
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copyfile(media / relative, target)
-                store_json(staged / BACKUP_MANIFEST, {
+                expected = {**refs, **archived}
+                required = lfs_objects(staged, expected)
+                copy_lfs_payload(staged, required, copy, previous / 'lfs' / 'objects' if previous else None,
+                                 lfs_media_dir(working) if objects else None)
+                manifest = {
                     'version': 1, 'source_id': record['id'], 'name': record['name'],
-                    'default_branch': branch, 'refs': {**refs, **archived},
-                })
-                verify_local_generation(staged)
+                    'default_branch': branch, 'refs': expected, 'created_ns': time.time_ns(),
+                }
+                store_json(staged / BACKUP_MANIFEST, manifest)
+                verify_local_generation(staged, manifest, objects=required)
                 flush_snapshot(staged)
                 source.confirm_source(record)
                 confirm_volume()
@@ -1232,66 +1367,274 @@ def preserve_local_backup(path, volume, scope, source, record, working, refs, ob
                 confirm_volume()
                 store_json(directory / 'CURRENT', {'generation': published.name})
             confirm_volume()
-        print(f'  local: verified and published {published}')
+            print(f'  {identifier}: verified and published {published} ({copy.cloned} reflinks, {copy.copied} file copies)')
+            if retention and retention['automatic']:
+                cleanup_repository(directory, retention, apply=True, confirm_volume=confirm_volume)
     except (OSError, Timeout) as exc:
         raise SyncError(f'Could not complete local backup at {path}: {exc}') from exc
 
 
-def verify_local_backups(settings, only):
-    path = local_path(settings)
-    volume = backup_volume(path)
-    scope = path / scope_id(settings['source'])
+def backup_directories(path, scope):
+    parent = path / scope
+    if parent.is_symlink():
+        raise SyncError(f'Backup scope is an unexpected symbolic link: {parent}')
+    return sorted(entry for entry in parent.glob('*')
+                  if entry.name.isascii() and entry.name.isdecimal() and entry.is_dir() and not entry.is_symlink())
+
+
+def backup_generations(directory):
+    parent = directory / 'generations'
+    if parent.is_symlink():
+        raise SyncError(f'Generation directory is an unexpected symbolic link: {parent}')
+    return sorted(repo for repo in parent.glob('*.git')
+                  if BACKUP_GENERATION.fullmatch(repo.name) and repo.is_dir() and not repo.is_symlink())
+
+
+def backup_matches(directory, manifest, only):
+    return not only or only == directory.name or only.casefold() == manifest['name'].casefold()
+
+
+def verify_local_backups(settings, only, identifiers=None):
     confirmed = 0
-    for entry in sorted(scope.glob('*')):
-        if not entry.is_dir() or not entry.name.isdecimal():
+    failed = False
+    for name, spec in local_destinations(settings, identifiers).items():
+        path = spec['path']
+        try:
+            volume = backup_volume(path)
+            for entry in backup_directories(path, scope_id(settings['source'])):
+                repo = current_backup(entry)
+                if repo is None:
+                    continue
+                manifest = backup_manifest(repo)
+                if not backup_matches(entry, manifest, only):
+                    continue
+                verify_local_generation(repo, manifest)
+                print(f'{name}: Verified {manifest["name"]} at {repo}')
+                confirmed += 1
+            if backup_volume(path) != volume:
+                raise SyncError('Local backup volume changed during verification')
+        except (OSError, SyncError) as exc:
+            print(f'{name}: FAILED: {exc}')
+            failed = True
+    if not confirmed:
+        print('No matching local backup could be verified on the configured volumes')
+    return 2 if failed or not confirmed else 0
+
+
+def generation_created(repo, manifest):
+    value = manifest.get('created_ns')
+    if type(value) is int and value > 0:
+        return value
+    # v2 backups written before timestamps were added have UTC names.
+    timestamp = dt.datetime.strptime(repo.name[:16], '%Y%m%dT%H%M%SZ').replace(tzinfo=dt.timezone.utc)
+    return int(timestamp.timestamp()) * 1_000_000_000
+
+
+def cleanup_repository(directory, policy, *, apply, confirm_volume):
+    current = current_backup(directory)
+    if current is None:
+        return
+    current_manifest = verify_local_generation(current)
+    current_time = generation_created(current, current_manifest)
+    older = []
+    for repo in backup_generations(directory):
+        if repo == current:
             continue
-        repo = current_backup(entry)
-        if repo is None:
+        try:
+            manifest = backup_manifest(repo)
+            created = generation_created(repo, manifest)
+        except (SyncError, ValueError) as exc:
+            print(f'Keeping unreadable generation {repo}: {exc}')
             continue
-        manifest = backup_manifest(repo)
-        if only and manifest['name'].casefold() != only.casefold():
+        if created < current_time:
+            older.append((created, repo, manifest))
+    older.sort(key=lambda item: item[0], reverse=True)
+
+    days = policy['days']
+    cutoff = time.time_ns() - days * 86_400 * 1_000_000_000 if days is not None else None
+    for created, repo, manifest in older[policy['keep'] - 1:]:
+        if cutoff is not None and created >= cutoff:
             continue
-        verify_local_generation(repo, manifest)
-        print(f'Verified {manifest["name"]} at {repo}')
-        confirmed += 1
-    if backup_volume(path) != volume or not confirmed:
-        raise SyncError('No matching local backup could be verified on the configured volume')
+        covered = {}
+        for ref, oid in manifest['refs'].items():
+            if not isinstance(ref, str):
+                raise SyncError(f'Invalid reference in generation {repo}')
+            saved_ref = ref if ref.startswith('refs/archive/') else f'refs/archive/{repo.stem}/{ref.removeprefix("refs/")}'
+            covered[saved_ref] = oid
+        if (manifest.get('source_id') != current_manifest.get('source_id')
+                or not covered or any(current_manifest['refs'].get(ref) != oid for ref, oid in covered.items())):
+            print(f'Keeping {repo}: the current backup does not cover its complete history')
+            continue
+        if backup_refs(repo) != manifest['refs']:
+            print(f'Keeping {repo}: its refs differ from its manifest')
+            continue
+        if apply:
+            confirm_volume()
+            if current_backup(directory) != current or repo.resolve() != repo:
+                raise SyncError('Backup location or CURRENT changed during cleanup')
+            print(f'Removing generation {repo}; current backup is verified and covers its history')
+            shutil.rmtree(repo, onerror=unlock_backup_file)
+            fsync_directory(repo.parent)
+        else:
+            print(f'Would remove generation {repo}; current backup is verified and covers its history')
+
+
+def unlock_backup_file(function, path, error_info):
+    error = error_info[1]
+    if os.name != 'nt' or not isinstance(error, PermissionError):
+        raise error
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
+def report_backup_usage(name, path):
+    total = sum(file.lstat().st_size for file in path.rglob('*') if file.is_file() and not file.is_symlink())
+    print(f'{name}: {total:,} logical bytes stored; {shutil.disk_usage(path).free:,} volume bytes free')
+
+
+def cleanup_backups(settings, identifiers, *, apply):
+    failed = False
+    for name, spec in local_destinations(settings, identifiers).items():
+        path = spec['path']
+        try:
+            volume = backup_volume(path)
+
+            def confirm_volume():
+                if backup_volume(path) != volume:
+                    raise SyncError('Local backup volume changed during cleanup')
+
+            policy = spec['retention']
+            if not policy:
+                print(f'{name}: retention disabled')
+            else:
+                lock = FileLock(str(path / '.gitmirror-backup.lock'), timeout=0) if apply else nullcontext()
+                with lock:
+                    confirm_volume()
+                    for directory in backup_directories(path, scope_id(settings['source'])):
+                        cleanup_repository(directory, policy, apply=apply, confirm_volume=confirm_volume)
+            report_backup_usage(name, path)
+        except (OSError, SyncError, Timeout) as exc:
+            print(f'{name}: cleanup FAILED: {exc}')
+            failed = True
+    return 2 if failed else 0
+
+
+def select_restore_backup(settings, identifiers, only, generation, *, listing):
+    selected = []
+    failed = False
+    for name, spec in local_destinations(settings, identifiers).items():
+        path = spec['path']
+        try:
+            backup_volume(path)
+            for directory in backup_directories(path, scope_id(settings['source'])):
+                if only and only.isascii() and only.isdecimal() and only != directory.name:
+                    continue
+                try:
+                    current = current_backup(directory)
+                except SyncError:
+                    current = None
+                    print(f'{name}: cannot read CURRENT for repository {directory.name}; use an explicit generation')
+                for repo in backup_generations(directory):
+                    if not listing and (repo != current if generation == 'current' else repo.stem != generation):
+                        continue
+                    try:
+                        manifest = backup_manifest(repo)
+                    except SyncError as exc:
+                        print(f'{name}: {exc}')
+                        continue
+                    if not backup_matches(directory, manifest, only):
+                        continue
+                    if listing:
+                        suffix = ' (current)' if repo == current else ''
+                        print(f'{name}: {manifest["name"]} [{directory.name}]  {repo.stem}{suffix}')
+                    else:
+                        selected.append((name, repo, manifest))
+        except (OSError, SyncError) as exc:
+            print(f'{name}: {exc}')
+            failed = True
+    if listing:
+        return 2 if failed else 0
+    if len(selected) != 1:
+        raise SyncError('Select one available repository and generation; use restore --list and specify --destination when needed')
+    return selected[0]
+
+
+def restore_backup(settings, identifiers, only, generation, output_path, include_archive):
+    name, repo, manifest = select_restore_backup(settings, identifiers, only, generation, listing=False)
+    output = Path(output_path).expanduser().absolute()
+    if output.exists() or output.is_symlink() or not output.parent.is_dir():
+        raise SyncError('Restore requires a new output directory under an existing parent')
+    if any(output.resolve().is_relative_to(spec['path']) for spec in local_destinations(settings).values()):
+        raise SyncError('Restore output must be outside all configured backup volumes')
+
+    verify_local_generation(repo, manifest)
+    expected = {ref: oid for ref, oid in manifest['refs'].items()
+                if include_archive or not ref.startswith('refs/archive/')}
+    with tempfile.TemporaryDirectory(prefix='.gitmirror-restore-', dir=output.parent) as scratch:
+        staged = Path(scratch) / 'mirror.git'
+        init_bare_backup(repo, staged)
+        refspecs = ['refs/heads/*:refs/heads/*', 'refs/tags/*:refs/tags/*']
+        if include_archive:
+            refspecs.append('refs/archive/*:refs/archive/*')
+        git('fetch', '--atomic', '--no-tags', '--no-write-fetch-head', '--refmap=',
+            repo.as_uri(), *refspecs, repo=staged, timeout=1800)
+        git('symbolic-ref', 'HEAD', f'refs/heads/{manifest["default_branch"]}', repo=staged)
+        required = lfs_objects(staged, expected)
+        copy_lfs_payload(staged, required, BackupCopy(), repo / 'lfs' / 'objects')
+        verify_local_generation(staged, {**manifest, 'refs': expected}, objects=required)
+        flush_snapshot(staged)
+        if os.name == 'nt':
+            staged.rename(output)
+        else:
+            output.mkdir(mode=0o700)  # Fail if another process occupied the path.
+            try:
+                staged.replace(output)
+            except OSError:
+                try:
+                    output.rmdir()
+                except OSError:
+                    pass
+                raise
+        fsync_directory(output.parent)
+    print(f'{name}: Restored and verified {manifest["name"]} from {repo.stem} at {output}')
     return 0
 
 
 # Synchronization
 
-def describe_destination_plan(platform, destination, src, source_default, private, headers):
+def describe_destination_plan(platform, destination, src, source_default, private, headers, *, identifier=None):
+    label = identifier or platform
     if destination is None:
-        print(f'  {platform}: would create a private project, then mirror {len(src)} refs')
+        print(f'  {label}: would create a private project, then mirror {len(src)} refs')
         if not private:
-            print(f'    {platform}: WOULD publish after Git and LFS verification')
+            print(f'    {label}: WOULD publish after Git and LFS verification')
         return
     old = remote_refs(destination.url)
     add, change, delete = count_changes(src, old)
-    print(f'  {platform}: visibility={destination.visibility}, add={add}, rewrite/update={change}, delete={delete} refs')
+    print(f'  {label}: visibility={destination.visibility}, add={add}, rewrite/update={change}, delete={delete} refs')
     if destination.default_branch != source_default:
-        print(f'    {platform}: WOULD verify {source_default}, then set it as default before deleting old branches')
+        print(f'    {label}: WOULD verify {source_default}, then set it as default before deleting old branches')
     target = desired_visibility(private)
     if destination.visibility != target:
         when = 'before Git sync' if private else 'after Git and LFS verification'
-        print(f'    {platform}: WOULD change visibility {destination.visibility} -> {target} ({when})')
+        print(f'    {label}: WOULD change visibility {destination.visibility} -> {target} ({when})')
     if platform == 'gitlab' and src != old:
         for action, branch, _ in plan_gl_permissions(destination.id, source_default, src, old, headers):
             operation = 'temporarily allow force push' if action == 'force' else 'unprotect for deletion'
             print(f'    GitLab WOULD {operation}: {branch}')
 
 
-def sync_destination(record, source, repo, provider, destination, src, source_lfs, full_lfs):
+def sync_destination(record, source, repo, provider, destination, src, source_lfs, full_lfs, *, identifier=None):
     name, source_default = record['name'], record['default_branch']
     platform, headers = provider.kind, provider.headers
+    remote = identifier or platform
     url = destination.url
     old = remote_refs(url)
     refs_changed = src != old
     if refs_changed and old:
-        backup_destination_refs(repo, platform, url, old)
+        backup_destination_refs(repo, remote, url, old)
     if refs_changed or source_lfs:
-        ensure_remote(repo, platform, url)
+        ensure_remote(repo, remote, url)
 
     def confirm_destination():
         if provider.read_destination(name) != destination:
@@ -1305,7 +1648,7 @@ def sync_destination(record, source, repo, provider, destination, src, source_lf
     def upload_lfs():
         confirm_transfer()
         git('-c', 'lfs.allowincompletepush=false', 'lfs', 'push', '--all',
-            platform, *src, repo=repo, timeout=1800, before_retry=confirm_transfer)
+            remote, *src, repo=repo, timeout=1800, before_retry=confirm_transfer)
 
     def push_refs(desired, previous):
         if desired == previous:
@@ -1318,13 +1661,13 @@ def sync_destination(record, source, repo, provider, destination, src, source_lf
             confirm_transfer()
 
         if platform != 'gitlab':
-            push_snapshot(repo, platform, desired, previous, url=url, before_push=before_push)
+            push_snapshot(repo, remote, desired, previous, url=url, before_push=before_push)
             return
         project_id = destination.id
         try:
             confirm_destination()
             prepare_gl_permissions(project_id, destination.default_branch, desired, previous, headers)
-            push_snapshot(repo, platform, desired, previous, url=url, before_push=before_push)
+            push_snapshot(repo, remote, desired, previous, url=url, before_push=before_push)
         finally:
             restore_gl_permissions(project_id, headers)
 
@@ -1350,13 +1693,13 @@ def sync_destination(record, source, repo, provider, destination, src, source_lf
 
     push_refs(src, old)
     try:
-        verify_destination_lfs(repo, platform, src, source_lfs, full=full_lfs)
+        verify_destination_lfs(repo, remote, src, source_lfs, full=full_lfs)
     except SyncError:
         if full_lfs or refs_changed or not source_lfs:
             raise
         # Equal refs can still reference missing LFS objects.
         upload_lfs()
-        verify_destination_lfs(repo, platform, src, source_lfs)
+        verify_destination_lfs(repo, remote, src, source_lfs)
     if remote_refs(url) != src:
         raise SyncError('Destination refs do not match the source snapshot')
 
@@ -1365,10 +1708,10 @@ def sync_destination(record, source, repo, provider, destination, src, source_lf
     if destination.visibility != desired_visibility(record['private']):
         # Private destinations are only published after all ref, default and LFS checks.
         provider.update_destination(name, destination, visibility='public')
-    print(f'  {platform}: SYNCED (Git refs, default branch, Git LFS and visibility verified)')
+    print(f'  {remote}: SYNCED (Git refs, default branch, Git LFS and visibility verified)')
 
 
-def sync_repository(record, source, providers, local, work_scope, apply, *, full_lfs=False):
+def sync_repository(record, source, providers, volumes, settings, apply, *, full_lfs=False):
     name = record['name']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise SyncError(f'Unsupported repository name: {name}')
@@ -1386,32 +1729,43 @@ def sync_repository(record, source, providers, local, work_scope, apply, *, full
     print(f'  source: {heads} branches, {len(gh) - heads} tags; privacy={desired_visibility(priv)}')
 
     destinations = {}
+    resolved_urls = set()
     successes = failures = 0
-    if local and not apply:
-        path, _, _ = local
-        print(f'  local: would verify and preserve {len(gh)} refs at {path}')
-        successes += 1
-    for platform, provider in providers.items():
+    active = len(providers) + len(volumes)
+    if not apply:
+        for identifier, (path, _) in volumes.items():
+            print(f'  {identifier}: would verify and preserve {len(gh)} refs at {path}')
+            successes += 1
+    for identifier, provider in providers.items():
         try:
             destination = provider.read_destination(name, create=apply)
             reject_source_as_destination(source, record, provider, destination)
+            if destination is not None:
+                address = git_address(destination.url)
+                if address in resolved_urls:
+                    raise SyncError('Another selected destination resolves to the same repository')
+                resolved_urls.add(address)
             if not apply:
-                describe_destination_plan(platform, destination, gh, source_default, priv, provider.headers)
+                with protection_scope(settings, settings['destinations'][identifier]):
+                    describe_destination_plan(provider.kind, destination, gh, source_default, priv,
+                                              provider.headers, identifier=identifier)
                 successes += 1
                 continue
             if priv and destination.visibility != 'private':
                 source.confirm_source(record)
                 destination = provider.update_destination(name, destination, visibility='private')
-            destinations[platform] = destination
-        except SourceStateError:
-            raise
-        except SyncError as exc:
-            print(f'  {platform}: BLOCKED: {exc}')
+            destinations[identifier] = destination
+        except SourceStateError as exc:
+            print(f'  {identifier}: BLOCKED: {exc}')
+            return successes, active - successes
+        except (SyncError, OSError) as exc:
+            print(f'  {identifier}: BLOCKED: {exc}')
             failures += 1
-    if not apply or (not destinations and not local):
+    if not apply or (not destinations and not volumes):
         return successes, failures
 
-    repo = ROOT / 'work' / work_scope / f'{record["id"]}.git' if work_scope else ROOT / f'{name}.git'
+    scope = scope_id(settings['source'])
+    repo = ROOT / 'work' / scope / f'{record["id"]}.git' if settings['version'] == 2 else ROOT / f'{name}.git'
     repo.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not repo.exists():
         git('init', '--bare', str(repo))
@@ -1436,62 +1790,80 @@ def sync_repository(record, source, providers, local, work_scope, apply, *, full
     if full_lfs:
         verify_archived_lfs(repo)
 
-    if local:
+    for identifier, (path, volume) in volumes.items():
         try:
-            preserve_local_backup(*local, source, record, repo, src, source_lfs)
+            preserve_local_backup(path, volume, scope, source, record, repo, src, source_lfs,
+                                  identifier=identifier, retention=settings['destinations'][identifier]['retention'])
             successes += 1
-        except SourceStateError:
-            raise
-        except SyncError as exc:
-            print(f'  local: FAILED: {exc}')
+        except SourceStateError as exc:
+            print(f'  {identifier}: BLOCKED: {exc}')
+            return successes, active - successes
+        except (SyncError, OSError) as exc:
+            print(f'  {identifier}: FAILED: {exc}')
             failures += 1
-    for platform, destination in destinations.items():
+    for identifier, destination in destinations.items():
         try:
-            sync_destination(record, source, repo, providers[platform], destination, src, source_lfs, full_lfs)
+            with protection_scope(settings, settings['destinations'][identifier]):
+                sync_destination(record, source, repo, providers[identifier], destination, src, source_lfs,
+                                 full_lfs, identifier=identifier)
             successes += 1
-        except SourceStateError:
-            raise
-        except SyncError as exc:
-            print(f'  {platform}: FAILED without deleting project: {exc}')
+        except SourceStateError as exc:
+            print(f'  {identifier}: BLOCKED: {exc}')
+            return successes, active - successes
+        except (SyncError, OSError) as exc:
+            print(f'  {identifier}: FAILED without deleting project: {exc}')
             failures += 1
     return successes, failures
 
 
-def selected_platforms(settings, platform):
+def selected_platforms(settings, platform, identifiers=None):
     configured = settings['destinations']
+    if identifiers:
+        keys = list(dict.fromkeys(identifiers))
+        if any(key not in configured for key in keys):
+            raise SyncError('Select configured destination IDs with --destination')
+        return keys
     if platform in ('both', 'all'):
         return list(configured)
-    if platform not in configured:
+    matches = [key for key, spec in configured.items() if spec['provider'] == platform]
+    if not matches:
         raise SyncError(f'{platform} is not a configured destination')
-    return [platform]
+    return matches
 
 
-def run(settings, *, apply=False, only=None, platform='all', full_lfs=False):
+def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, identifiers=None):
     configure_runtime(settings, apply=apply)
     for executable in ('git', 'ssh', 'git-lfs'):
         if shutil.which(executable) is None:
             raise SyncError(f'Missing executable: {executable}')
-    platforms = selected_platforms(settings, platform)
+    platforms = selected_platforms(settings, platform, identifiers)
     source = Provider.from_config(settings['source'])
-    scope = scope_id(settings['source'])
     providers = {}
-    local = None
+    volumes = {}
+    mounted = set()
     successes = failures = 0
     for target in platforms:
         spec = settings['destinations'][target]
         try:
-            if target == 'local':
+            if spec['provider'] == 'local':
                 path = spec['path']
-                local = (path, backup_volume(path), scope)
+                volume = backup_volume(path)
+                if volume[0] in mounted:
+                    raise SyncError('Another selected destination uses the same backup volume marker')
+                mounted.add(volume[0])
+                volumes[target] = (path, volume)
                 continue
             provider = Provider.from_config(spec).authenticate()
-            if apply and target == 'gitlab':
-                recover_all_gl_permissions(provider.headers)
+            if apply and provider.kind == 'gitlab':
+                with protection_scope(settings, spec):
+                    recover_all_gl_permissions(provider.headers)
             providers[target] = provider
         except (SyncError, OSError) as exc:
             print(f'{target}: BLOCKED: {exc}')
             failures += 1
-    if not providers and not local:
+    active = len(providers) + len(volumes)
+    if not active:
+        print(f'SUMMARY: repositories=0, successful/checked destinations=0, failed={failures}')
         return 1
 
     repos = source.discover()
@@ -1501,16 +1873,15 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False):
         repos = [repo for repo in repos if repo['name'].casefold() == only.casefold()]
         if not repos:
             raise SyncError(f'{only} not found among accessible {source.label} repositories; no changes made')
-    work_scope = scope if settings['version'] == 2 else None
     for n, repo in enumerate(repos, 1):
         print(f'\n[{n}/{len(repos)}] {repo["name"]}')
         try:
-            ok, bad = sync_repository(repo, source, providers, local, work_scope, apply, full_lfs=full_lfs)
+            ok, bad = sync_repository(repo, source, providers, volumes, settings, apply, full_lfs=full_lfs)
             successes += ok
             failures += bad
         except (SyncError, OSError) as exc:
             print(f'  FAILED safely: {exc}')
-            failures += 1
+            failures += active
     print(f'\nSUMMARY: repositories={len(repos)}, successful/checked destinations={successes}, '
           f'failed={failures}, mode={"apply" if apply else "dry-run"}')
     print('Missing source repositories are never deleted from destinations.')
@@ -1520,7 +1891,7 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False):
 # Read-only diagnostics
 
 
-def doctor(config, *, network=False, ssh=False, only=None, platform='all'):
+def doctor(config, *, network=False, ssh=False, only=None, platform='all', identifiers=None):
     results = []
 
     def report(status, item, detail):
@@ -1565,15 +1936,19 @@ def doctor(config, *, network=False, ssh=False, only=None, platform='all'):
     except (OSError, StopIteration):
         report('ERROR', 'storage', 'cannot inspect the backup directory or volume')
 
-    platforms = selected_platforms(settings, platform)
-    if 'local' in platforms:
+    platforms = selected_platforms(settings, platform, identifiers)
+    for target in platforms:
+        spec = settings['destinations'][target]
+        if spec['provider'] != 'local':
+            continue
+        label = 'local backup volume' if target == 'local' else f'{target} backup volume'
         try:
-            path = local_path(settings)
+            path = spec['path']
             backup_volume(path)
             free = shutil.disk_usage(path).free
-            report('OK' if free else 'ERROR', 'local backup volume', f'{free:,} bytes free')
+            report('OK' if free else 'ERROR', label, f'{free:,} bytes free')
         except (SyncError, OSError):
-            report('ERROR', 'local backup volume', 'mount the configured volume and check its initialization')
+            report('ERROR', label, 'mount the configured volume and check its initialization')
     if network or ssh:
         configure_runtime(settings, apply=False)
         doctor_network(settings, platforms, ssh, only, report)
@@ -1583,8 +1958,7 @@ def doctor(config, *, network=False, ssh=False, only=None, platform='all'):
 
 
 def doctor_network(settings, platforms, ssh, only, report):
-    def connect(spec):
-        name = spec['provider']
+    def connect(spec, name):
         try:
             provider = Provider.from_config(spec)
         except (SyncError, ValueError):
@@ -1598,9 +1972,11 @@ def doctor_network(settings, platforms, ssh, only, report):
         report('OK', f'{name} API', 'authenticated identity request succeeded')
         return provider
 
-    source = connect(settings['source'])
-    providers = [provider for target in platforms if target != 'local'
-                 if (provider := connect(settings['destinations'][target])) is not None]
+    source_kind = settings['source']['provider']
+    source = connect(settings['source'], source_kind)
+    providers = [(target, provider) for target in platforms
+                 if settings['destinations'][target]['provider'] != 'local'
+                 if (provider := connect(settings['destinations'][target], target)) is not None]
     if not ssh:
         return
     try:
@@ -1612,8 +1988,7 @@ def doctor_network(settings, platforms, ssh, only, report):
         report('ERROR', 'SSH', 'cannot select an accessible source repository')
         return
 
-    for index, provider in enumerate([source, *providers]):
-        name = provider.kind
+    for index, (name, provider) in enumerate([(source_kind, source), *providers]):
         try:
             if index == 0:
                 url = record['ssh_url']
@@ -1634,55 +2009,86 @@ def doctor_network(settings, platforms, ssh, only, report):
 
 # Command-line interface
 
+def add_destination_selector(parser, *, providers=False):
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--destination', action='append', help='Select a destination ID. Repeatable.')
+    if providers:
+        selection.add_argument('--platform', choices=['all', 'both', *PROVIDER_APIS, 'local'], default='all')
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='gitmirror', description='Resilient Git mirroring')
     parser.add_argument('--version', action='version', version=__version__)
     parser.add_argument('--config', default='config.yml', help='Path to YAML config')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', help='Validate YAML without connecting to providers')
-    sub.add_parser('init-backup', help='Initialize a configured local backup directory on its mounted volume')
+    initialization = sub.add_parser('init-backup', help='Initialize a configured local backup volume')
+    add_destination_selector(initialization)
     verification = sub.add_parser('verify-backup', help='Verify local backups and archives offline')
     verification.add_argument('--only', help='Verify the backup for one repository name')
+    add_destination_selector(verification)
+    recovery = sub.add_parser('restore', help='List or restore a verified generation offline')
+    recovery.add_argument('--list', action='store_true', help='List available generations')
+    recovery.add_argument('--repo', help='Repository name or ID')
+    recovery.add_argument('--generation', default='current', help='Generation from the listing, or current')
+    recovery.add_argument('--include-archive', action='store_true', help='Restore archived refs and their LFS data')
+    recovery.add_argument('--output', help='New output directory for the restored bare repository')
+    add_destination_selector(recovery)
+    cleanup = sub.add_parser('cleanup', help='Preview or apply configured local backup retention')
+    cleanup_mode = cleanup.add_mutually_exclusive_group()
+    cleanup_mode.add_argument('--apply', action='store_true', help='Remove verified eligible generations')
+    cleanup_mode.add_argument('--dry-run', action='store_true', help='Preview cleanup (default)')
+    add_destination_selector(cleanup)
     health = sub.add_parser('doctor', help='Check dependencies, configuration, and backup storage')
     health.add_argument('--network', action='store_true', help='Check provider credentials and API access')
     health.add_argument('--ssh', action='store_true', help='Check provider credentials and SSH Git read access')
     health.add_argument('--only', help='Repository to sample for the SSH check')
-    targets = ['all', 'both', *PROVIDER_APIS, 'local']
-    health.add_argument('--platform', choices=targets, default='all')
+    add_destination_selector(health, providers=True)
     for name in ('sync', 'run'):
         command = sub.add_parser(name)
         mode = command.add_mutually_exclusive_group()
         mode.add_argument('--apply', action='store_true', help='Make changes (default: dry-run)')
         mode.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
         command.add_argument('--only', help='Only one repository')
-        command.add_argument('--platform', choices=targets, default='all')
+        add_destination_selector(command, providers=True)
         command.add_argument('--verify-lfs', action='store_true', help='Recheck all archived and mirrored LFS objects (requires --apply)')
     args = parser.parse_args(argv)
     if args.command in ('sync', 'run') and args.verify_lfs and not args.apply:
         parser.error('--verify-lfs requires --apply')
+    if args.command == 'restore' and not args.list and (not args.repo or not args.output):
+        parser.error('restore requires --repo and --output, or --list')
+    if args.command == 'restore' and args.list and args.output:
+        parser.error('--list cannot be combined with --output')
     try:
         if args.command == 'doctor':
-            return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform)
+            return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform,
+                          identifiers=args.destination)
         cfg = load_config(args.config)
         if args.command == 'validate':
             print(f'Config valid: {Path(args.config).expanduser()}')
             return 0
         if args.command == 'init-backup':
-            return initialize_backup(cfg)
-        if args.command == 'verify-backup':
+            return initialize_backup(cfg, args.destination)
+        if args.command in ('verify-backup', 'restore', 'cleanup'):
             configure_runtime(cfg, apply=False)
             SSH_ENV['GIT_ALLOW_PROTOCOL'] = 'file'
             SSH_ENV['GIT_NO_LAZY_FETCH'] = '1'
-            return verify_local_backups(cfg, args.only)
+            if args.command == 'verify-backup':
+                return verify_local_backups(cfg, args.only, args.destination)
+            if args.command == 'cleanup':
+                return cleanup_backups(cfg, args.destination, apply=args.apply)
+            if args.list:
+                return select_restore_backup(cfg, args.destination, args.repo, args.generation, listing=True)
+            return restore_backup(cfg, args.destination, args.repo, args.generation, args.output, args.include_archive)
         def execute():
             if not args.apply:
-                return run(cfg, only=args.only, platform=args.platform)
+                return run(cfg, only=args.only, platform=args.platform, identifiers=args.destination)
             data = cfg['storage']['path']
             data.mkdir(parents=True, exist_ok=True)
             lock = FileLock(str(data / '.gitmirror.lock'), timeout=0)
             try:
                 with lock:
-                    return run(cfg, apply=True, only=args.only, platform=args.platform, full_lfs=args.verify_lfs)
+                    return run(cfg, apply=True, only=args.only, platform=args.platform, full_lfs=args.verify_lfs,
+                               identifiers=args.destination)
             except Timeout:
                 print('Another GitMirror process is running; no changes made.', file=sys.stderr)
                 return 2

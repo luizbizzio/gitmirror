@@ -62,3 +62,14 @@ def test_v2_rejects_unsafe_or_ambiguous_destinations(tmp_path, failure):
     path.write_text(yaml.safe_dump(spec), encoding='utf-8')
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+@pytest.mark.parametrize('policy', [{'keep': 0}, {'days': -1}, {'automatic': 'true'}, {'keep': True}])
+def test_retention_requires_explicit_safe_values(tmp_path, policy):
+    path = tmp_path / 'config.yml'
+    path.write_text(yaml.safe_dump({
+        'version': 2, 'source': {'provider': 'github', 'owner': 'source', 'token_env': 'SOURCE'},
+        'destinations': [{'id': 'backup', 'provider': 'local', 'path': str(tmp_path / 'backups'), 'retention': policy}],
+    }), encoding='utf-8')
+    with pytest.raises(ConfigError, match='keep and days'):
+        load_config(path)

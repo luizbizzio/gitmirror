@@ -40,7 +40,11 @@ Version 2 takes one GitHub, GitLab or Codeberg source and a list of destinations
 Choose any other host, local disk, or a combination. A different account on the
 same host can also be a destination. GitMirror rejects the source account as a
 destination and checks for Git URLs that resolve to the source repository.
-Each configuration allows one destination per provider, including local.
+Give each target a unique `id` to use multiple accounts, hosts or drives. An
+omitted `id` defaults to the provider name, so existing v2 configurations work
+as written. IDs start with a lowercase letter and can include lowercase letters,
+numbers, hyphens and underscores. Keep an ID stable to retain its working archive
+namespace and remote LFS verification records.
 
 ```yaml
 version: 2
@@ -52,8 +56,21 @@ destinations:
   - provider: github
     owner: my-github-account
     token_env: GITHUB_TOKEN
+  - id: company-gitlab
+    provider: gitlab
+    api_url: https://gitlab.example.com/api/v4
+    owner: company-backup-user
+    token_env: COMPANY_GITLAB_TOKEN
   - provider: local
+    id: disk-a
     path: /mnt/backups/gitmirror
+  - provider: local
+    id: disk-b
+    path: /mnt/second-disk/gitmirror
+    retention:
+      keep: 3
+      days: 30
+      automatic: false
 storage:
   path: ~/gitmirror-work
 ```
@@ -63,20 +80,24 @@ such as `'D:\Backups\GitMirror'` on Windows, and keep the working cache separate
 Both functions are enabled for local storage. The optional `mirror`, `archive` and
 `preserve_history` keys accept `true`. The destination account must match its
 authenticated user. Discovery targets the configured account's own repositories.
-Organization and group namespaces have not been validated.
+Set `api_url` to use self-hosted GitLab or a Codeberg-compatible Forgejo instance,
+for example `https://forge.example.com/api/v1`. Use separate, non-overlapping local
+paths. Organization and group namespaces have not been validated.
 
 Existing version 1 configurations still use their original working directories,
 remote credentials and protection journal. To migrate, convert the destination
 mapping into a list, add explicit owners and retain the schedule and retry options.
 Resolve any pending GitLab protection changes with the v1 configuration first.
 Version 2 uses a source-scoped working cache and a separate GitLab protection
-journal. It leaves the v1 cache and its archived refs available on disk.
+journal per GitLab account and API endpoint. It leaves the v1 cache and its
+archived refs available on disk. To add destinations in v2, keep existing IDs
+and paths and add entries with new IDs. Existing generations require no conversion.
 
 ```sh
 gitmirror --config config.yml validate
 gitmirror --config config.yml doctor
 gitmirror --config config.yml sync --only example-repo
-gitmirror --config config.yml sync --apply --only example-repo
+gitmirror --config config.yml sync --apply --only example-repo --destination disk-a --destination company-gitlab
 ```
 
 `python -m gitmirror` supports the same commands. The application source is `gitmirror.py`.
@@ -100,7 +121,9 @@ gitmirror --config config.yml doctor --ssh --only example-repo --platform gitlab
 `--ssh` also checks Git read access to one source repository and its existing destinations.
 Use `--only` to choose that repository. An SSH read cannot establish push permissions.
 For a local destination, `doctor` also checks its volume marker and available space.
-`--platform` selects one configured target. `all` selects every configured target.
+Omit destination selectors to use all configured targets. Repeat `--destination`
+to select by ID. On `sync`, `run` and `doctor`, `--platform gitlab` selects every
+GitLab destination. Use either `--destination` or `--platform` in one command.
 
 For regular sync every 12 hours:
 
@@ -189,7 +212,7 @@ backup root. If a drive is disconnected, an unmarked fallback directory is rejec
 
 ```sh
 gitmirror --config config.yml init-backup
-gitmirror --config config.yml sync --apply --platform local
+gitmirror --config config.yml sync --apply --destination disk-a
 gitmirror --config config.yml verify-backup
 ```
 
@@ -201,34 +224,85 @@ including deleted branches and replaced tags. Regular Git garbage collection
 keeps the objects reachable through those archive refs. Required LFS binaries are
 copied into the generation, including binaries referenced only by its archives.
 
-GitMirror checks the complete ref map, default branch, Git object database and
-every required LFS object's size and SHA-256 before advancing `CURRENT`.
-The previous generation remains available after an interruption or write failure.
-Historical generations are retained automatically, and changed snapshots can
-consume substantial space because each generation is independent. An interrupted
-write may leave a staging directory or an unreferenced generation.
+For a changed snapshot, GitMirror seeds a fresh bare repo with the previous Git
+object database and fetches the update incrementally. It carries forward only
+LFS objects reachable from the new heads, tags and archive refs. On Linux, it
+tries copy-on-write reflinks for existing Git objects and LFS files, with regular
+file copies on Windows and filesystems that decline reflinks. Reflinks give each
+generation its own files and save disk blocks until a file changes. A generation
+has all required Git and LFS data even after its predecessors and the working
+cache are removed. Every verification still reads and hashes the required objects.
 
-`verify-backup` checks the current generations offline. Use `--only NAME` to
-select a repository. The output gives the verified bare repository path. Choose
-that path, or a known-good older generation if the current copy is damaged.
-Replace the example file URL and `trunk` with the path and default branch in
-`gitmirror-backup.json`. A Windows file URL starts like `file:///D:/Backups/`.
+GitMirror checks the exact ref names and hashes, default branch, Git object
+database and every required LFS object's size and SHA-256 before atomically
+replacing `CURRENT`. Disk exhaustion or an interruption before that replacement
+leaves the previous generation current. An interrupted write can leave a staging
+directory or an unreferenced generation for inspection.
+
+#### Retention and disk usage
+
+Omit `retention` to keep every generation. Set `keep` to retain at least that
+many generations, including `CURRENT`. Add `days` to also retain generations
+younger than that many days. Set `automatic: true` to apply the policy after
+successful local backup verification. With `automatic: false` or omitted, the
+policy applies only when you run `cleanup --apply`. A candidate must be older
+than `CURRENT`, whose verified archive must still contain the candidate's exact
+refs and history, including LFS. Current, unreadable and uncovered generations
+are retained. Removing a generation drops a restore point from the list while
+retaining its historical content in the current archive. As historical Git and
+LFS objects remain reachable, usage can still grow. GitMirror keeps the existing
+backup if it runs out of room to publish a replacement.
 
 ```sh
-git init --bare restored.git
-git -C restored.git remote add backup file:///absolute/path/to/generation.git
-git -C restored.git fetch --no-tags backup 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' 'refs/archive/*:refs/archive/*'
-git -C restored.git symbolic-ref HEAD refs/heads/trunk
-git -C restored.git lfs fetch --all backup
-git -C restored.git fsck --full
+gitmirror --config config.yml cleanup --dry-run --destination disk-b
+gitmirror --config config.yml cleanup --apply --destination disk-b
 ```
 
-No hosting token, API or working cache is required for this restore. Store backups
-outside the source checkout and the Docker build context. Restrict write access
-to the backup volume since it holds private Git and LFS data. Integrity checks
-detect corruption against the stored manifest, which is local and unsigned.
-Network filesystems need reliable locking and atomic rename. Physical removable
-drives, network filesystems and power loss have not been exercised here.
+`cleanup` previews by default. Its storage report gives logical bytes across the
+backup root and free bytes on the mounted volume. Shared reflink blocks count in
+each file's logical size, and volume free space also reflects other files.
+
+#### Measured storage and publication time
+
+One Debian 12 amd64 VM benchmark compared the previous PR revision (`fe90a9f`)
+with reflink-aware backup. Each run published four verified generations of a
+synthetic repository with a 48 MiB Git blob, a 24 MiB LFS object and small edits
+between saves. Times include verification and flushes. Storage is the total after
+four generations, measured with `du` on ext4 and Btrfs data extents on Btrfs
+(excluding Btrfs metadata). Each set represents about 288 MiB of logical files.
+
+| Filesystem | Allocated space before → after | First generation before → after | Generations 2–4 before → after |
+| --- | ---: | ---: | ---: |
+| ext4, independent copies | 288.7 → 288.7 MiB | 3.18 → 3.71 s | 5.27 → 5.75 s |
+| Btrfs, reflinks | 288.1 → 72.0 MiB | 3.89 → 4.23 s | 10.02 → 6.17 s |
+
+On the Btrfs test volume, generations 2–4 reused 27 files through reflinks. The
+storage and timing gains depend on the filesystem, the volume and how much
+content changes between backups.
+
+#### Offline restore
+
+`verify-backup` checks current generations offline. Use `--only NAME` to verify
+one repository. `restore --list` shows available generations by destination,
+repository name and ID. You can restore a listed older generation even if
+`CURRENT` is damaged. Choose a path under an existing parent. GitMirror refuses
+all existing output paths and verifies the restored bare repository before
+publishing it.
+
+```sh
+gitmirror --config config.yml restore --list --destination disk-a
+gitmirror --config config.yml restore --repo example-repo --destination disk-a --output restored.git
+gitmirror --config config.yml restore --repo example-repo --destination disk-a --generation 20261119T120000Z-a1b2c3 --include-archive --output restored-with-history.git
+```
+
+Restores include branches, tags, their complete reachable history and the
+corresponding LFS binaries. `--include-archive` also restores historical refs and
+their LFS binaries. All of this uses only the YAML configuration and backup
+volume, including when the hosting account or working cache is gone. Store backups
+outside the source checkout and Docker build context and restrict write access to
+the volume. The integrity manifest is local and unsigned. Mounted NAS storage
+requires working file locks, atomic rename and flush semantics. NAS, physical
+removable drives and power loss remain to be validated.
 
 ### Restore a remote destination snapshot from the working archive
 
@@ -258,15 +332,17 @@ local destination and a second copy on another device for disk-loss recovery.
 
 | Environment | Validation |
 | --- | --- |
-| Windows x64, Python 3.13 | Full local suite with Git for Windows and Git LFS. |
-| Debian 12 amd64, Python 3.11 | Full local suite and an authenticated Git read against a local OpenSSH server with mocked provider APIs. |
-| Docker amd64, Python 3.12 | Built the image, ran the full suite as UID 10001, and exercised Compose configuration, mounts and the offline doctor. |
+| Windows 11 x64, Python 3.13 | 113 tests passed with Git for Windows and Git LFS. |
+| Debian 12 amd64, Python 3.11 | 113 tests passed. Also checked authenticated Git reads against a local OpenSSH server and verified a reflinked Btrfs generation after deleting its three predecessors. |
+| Docker amd64, Python 3.12 | 113 tests passed as UID 10001. Built the image, exercised both Compose configurations and the offline doctor, then verified and restored three backups from a fresh container with a read-only named volume and no network. |
 
 The local suite covers the six directions between distinct hosting providers,
-local-only backups from each, hybrid destinations, rewrites, branch and tag deletion, visibility checks,
-backup restoration and GitLab protection recovery with temporary repositories and
-mocked APIs. Authentication and writable-service integration with GitHub, GitLab and
-Codeberg and ARM64 deployment require separate validation. The original production script is unavailable
+local-only backups from each, two GitLab instances, two local volumes, rewrites,
+branch and tag deletion, visibility, interrupted writes, disk exhaustion, safe
+retention, offline restoration and GitLab protection recovery. Tests use temporary
+repositories and mocked APIs. The Docker base image publishes a Linux ARM64 build.
+GitMirror itself has yet to run on Raspberry Pi OS or ARM64. Live GitHub, GitLab,
+Codeberg and Forgejo account integration also requires validation. The original production script is unavailable
 for direct comparison. The current implementation preserves the documented 12-hour
 default and the Git, LFS, visibility and protection-management flows.
 
@@ -274,7 +350,6 @@ default and the Git, LFS, visibility and protection-management flows.
 
 1. Releases, release assets, descriptions, topics, and homepage.
 2. Portable archive for issues, pull requests, reviews and discussions.
-3. Verified restore tools and independent backup targets.
-4. Validate provider integration and ARM64 deployments.
+3. Validate provider integration, physical backup media, NAS and ARM64 deployments.
 
 License: Apache-2.0.
