@@ -24,6 +24,7 @@ py-modules = ["gitmirror"]
 
 [tool.setuptools.data-files]
 "share/gitmirror/web" = ["web/index.html", "web/style.css", "web/app.js"]
+"share/gitmirror/web/fonts" = ["web/fonts/LICENSE.md", "web/fonts/source-sans-pro-regular.woff2", "web/fonts/source-sans-pro-semibold.woff2", "web/fonts/source-sans-pro-bold.woff2", "web/fonts/source-sans-pro-italic.woff2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
