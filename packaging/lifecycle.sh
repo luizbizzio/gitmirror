@@ -159,6 +159,7 @@ fresh_install() {
         openssl x509 -noout -sha256 -fingerprint -in "$etc/tls/server.crt"
     fi
     cat -- "$state/setup-code"
+    printf '\nIf an experimental GitMirror cron or service is still running, stop it before enabling managed synchronization.\n'
 }
 
 # The installer owns both the directory and the lock entry. Never recreate an
