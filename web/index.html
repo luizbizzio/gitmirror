@@ -3,19 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light">
   <title>GitMirror</title>
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/app.js" defer></script>
 </head>
 <body>
   <noscript>Enable JavaScript to use the GitMirror dashboard.</noscript>
-  <main id="setup" class="setup-screen" hidden>
-    <div class="setup-title"><span class="brand-mark" aria-hidden="true">↟</span>
-      <h1>Set up GitMirror</h1><p>Use the one-time code from the installer to configure your account and first backup.</p>
+  <dialog id="setup" class="setup-dialog" aria-labelledby="setup-title">
+    <div class="setup-title">
+      <div>
+        <h1 id="setup-title">Initial setup</h1>
+        <p>Connect your source, add backup destinations and create an administrator account.</p>
+      </div>
+      <button id="setup-close" type="button" class="button secondary">Close</button>
     </div>
     <div id="setup-editor"></div>
-  </main>
+  </dialog>
   <main id="login" class="login" hidden>
     <form id="login-form" class="panel login-card">
       <span class="brand-mark" aria-hidden="true">↟</span>
@@ -29,27 +33,48 @@
   </main>
   <div id="shell" class="shell" hidden>
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark" aria-hidden="true">↟</span><strong>GitMirror</strong></div>
+      <div class="brand"><span class="brand-symbol" aria-hidden="true">G</span><strong>GitMirror</strong></div>
+      <div class="sidebar-status" aria-live="polite">
+        <span class="sidebar-status-caption">SYSTEM STATUS</span>
+        <strong id="system-state"><span class="status-dot"></span> Configuration required</strong>
+        <small id="system-detail">No source or backup destinations configured</small>
+      </div>
       <nav aria-label="Main navigation">
-        <button data-view="overview"><span aria-hidden="true">▤</span>Overview</button>
-        <button data-view="repositories"><span aria-hidden="true">⑂</span>Repositories</button>
-        <button data-view="destinations"><span aria-hidden="true">◇</span>Destinations</button>
-        <button data-view="backups"><span aria-hidden="true">⬡</span>Backups</button>
-        <button data-view="activity"><span aria-hidden="true">≡</span>Activity</button>
-        <button data-view="settings"><span aria-hidden="true">⚙</span>Settings</button>
+        <div class="nav-heading">OVERVIEW</div>
+        <button data-view="overview"><span class="nav-icon" aria-hidden="true">▦</span>Dashboard</button>
+        <button data-view="repositories"><span class="nav-icon" aria-hidden="true">☷</span>Repositories</button>
+        <button data-view="destinations"><span class="nav-icon" aria-hidden="true">⇄</span>Destinations</button>
+        <button data-view="backups"><span class="nav-icon" aria-hidden="true">▤</span>Backups</button>
+        <div class="nav-heading">SYSTEM</div>
+        <button data-view="activity"><span class="nav-icon" aria-hidden="true">◷</span>Activity log</button>
+        <button data-view="settings"><span class="nav-icon" aria-hidden="true">⚙</span>Settings</button>
       </nav>
-      <button id="logout" class="button secondary">Sign out</button>
+      <div class="sidebar-footer"><span>GitMirror</span><span id="sidebar-version">Web administration</span>
+        <button id="logout" class="button secondary" hidden>Sign out</button>
+      </div>
     </aside>
     <main class="main">
       <header class="topbar">
-        <span id="connection" class="connection">Connecting</span>
-        <button id="refresh" class="button secondary">Refresh</button>
+        <div class="topbar-title"><span class="topbar-product">GitMirror</span><span class="topbar-divider">/</span><span id="topbar-location">Dashboard</span></div>
+        <div class="topbar-actions">
+          <span id="connection" class="connection">Connecting</span>
+          <button id="refresh" class="button secondary">Refresh</button>
+          <button id="top-setup" class="button top-setup" type="button">Setup</button>
+        </div>
       </header>
       <div class="content">
-        <header class="page-heading"><h1 id="page-title">Overview</h1><p id="page-context"></p></header>
+        <header class="page-heading"><h1 id="page-title">Dashboard</h1><p id="page-context"></p></header>
         <p id="notice" class="notice" role="status" hidden></p>
         <section id="view-overview">
+          <div id="setup-banner" class="setup-banner" hidden>
+            <div class="setup-banner-copy"><strong>GitMirror is not configured</strong><p>Review the dashboard and settings first. Connect your accounts when you are ready.</p></div>
+            <button id="banner-setup" type="button" class="button primary">Start setup</button>
+          </div>
           <dl id="stats" class="stats"></dl>
+          <article class="panel chart-panel">
+            <header><div><h2>Synchronization activity</h2><p class="panel-description">Completed runs in the last 7 days</p></div><span id="chart-summary" class="muted">No activity yet</span></header>
+            <div id="activity-chart" class="activity-chart" aria-label="Last seven days of synchronization activity"></div>
+          </article>
           <div class="grid">
             <article class="panel">
               <header><h2>Active operations</h2><span id="active-count" class="pill"></span></header>
@@ -110,7 +135,19 @@
           </article>
         </section>
         <section id="view-settings" hidden>
-          <article class="panel">
+          <div id="settings-preview" class="settings-preview" hidden>
+            <article class="panel"><header><h2>System configuration</h2><span class="pill">Not configured</span></header>
+              <div class="setting-overview">
+                <div><strong>Source</strong><p>GitHub, GitLab or Codeberg</p></div>
+                <div><strong>Destinations</strong><p>Remote mirrors and local backups</p></div>
+                <div><strong>Schedule</strong><p>Automatic sync interval and status</p></div>
+                <div><strong>Security</strong><p>Administrator account and SSH access</p></div>
+              </div>
+              <p class="muted">These settings are available after initial setup. No repositories or credentials have been configured.</p>
+              <button id="settings-start" type="button" class="button primary">Open setup</button>
+            </article>
+          </div>
+          <article id="live-settings" class="panel">
             <header><h2>Configuration</h2><button id="edit-configuration" class="button secondary" hidden>Edit configuration</button></header>
             <div id="settings"></div>
             <form id="check-connections" class="action-form" hidden>
