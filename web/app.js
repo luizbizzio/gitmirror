@@ -955,6 +955,16 @@ function openConfiguration(initial, data) {
       }
     });
     form.addEventListener("submit", (event) => {
+      // Pressing Enter on an earlier step must not bypass the review screen.
+      if (current !== sections.length) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (validate(sections[current])) {
+          furthest = Math.max(furthest, current + 1);
+          showWizardStep(current + 1);
+        }
+        return;
+      }
       for (let i = 0; i < sections.length; i++) {
         sections[i].hidden = false;
         const valid = validate(sections[i]);
