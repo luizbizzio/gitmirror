@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>GitMirror</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <noscript>Enable JavaScript to use the GitMirror dashboard.</noscript>
+  <main id="login" class="login" hidden>
+    <form id="login-form" class="panel login-card">
+      <span class="brand-mark" aria-hidden="true">↟</span>
+      <h1>GitMirror</h1>
+      <p>Sign in to manage your mirrors and backups.</p>
+      <label for="login-password">Dashboard password</label>
+      <input id="login-password" type="password" autocomplete="current-password" maxlength="1024" required>
+      <button class="button primary" type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </main>
+  <div id="shell" class="shell" hidden>
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">↟</span><strong>GitMirror</strong></div>
+      <nav aria-label="Main navigation">
+        <button data-view="overview"><span aria-hidden="true">▤</span>Overview</button>
+        <button data-view="repositories"><span aria-hidden="true">⑂</span>Repositories</button>
+        <button data-view="destinations"><span aria-hidden="true">◇</span>Destinations</button>
+        <button data-view="backups"><span aria-hidden="true">⬡</span>Backups</button>
+        <button data-view="activity"><span aria-hidden="true">≡</span>Activity</button>
+        <button data-view="settings"><span aria-hidden="true">⚙</span>Settings</button>
+      </nav>
+      <button id="logout" class="button secondary">Sign out</button>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <span id="connection" class="connection">Connecting</span>
+        <button id="refresh" class="button secondary">Refresh</button>
+      </header>
+      <div class="content">
+        <header class="page-heading"><h1 id="page-title">Overview</h1><p id="page-context"></p></header>
+        <p id="notice" class="notice" role="status" hidden></p>
+        <section id="view-overview">
+          <dl id="stats" class="stats"></dl>
+          <div class="grid">
+            <article class="panel">
+              <header><h2>Active operations</h2><span id="active-count" class="pill"></span></header>
+              <div id="active-list"></div>
+            </article>
+            <article class="panel">
+              <header><h2>Local backup health</h2><button data-go="backups" class="link">Open backups</button></header>
+              <div id="health"></div>
+            </article>
+          </div>
+          <div class="grid">
+            <article class="panel">
+              <header><h2>Recent errors</h2></header>
+              <div id="errors"></div>
+            </article>
+            <article class="panel">
+              <header><h2>Recent activity</h2><button data-go="activity" class="link">View all</button></header>
+              <div id="recent"></div>
+            </article>
+          </div>
+        </section>
+        <section id="view-repositories" hidden>
+          <article class="panel">
+            <header><h2>Source inventory</h2><button id="discover" class="button secondary">Read source inventory</button></header>
+            <p id="inventory-time" class="muted"></p>
+            <div class="filters">
+              <label>Search <input id="repo-search" type="search" placeholder="Repository name"></label>
+              <label>Visibility <select id="repo-filter"><option value="">All</option><option>public</option><option>private</option><option>internal</option></select></label>
+              <label>Sync status <select id="status-filter"><option value="">All</option><option value="succeeded">Succeeded</option><option value="failed">Failed or blocked</option><option value="unobserved">Unobserved</option></select></label>
+            </div>
+            <div id="repositories" class="table-wrap"></div>
+          </article>
+          <article class="panel">
+            <header><h2>Manual synchronization</h2></header>
+            <form id="sync-form" class="action-form">
+              <label>Repository<input id="sync-repo" maxlength="100" placeholder="All repositories"></label>
+              <label>Mode<select id="sync-mode"><option value="dry">Dry-run</option><option value="apply">Apply changes</option></select></label>
+              <fieldset id="sync-targets"><legend>Destinations</legend><p>All configured destinations.</p></fieldset>
+              <label id="sync-confirm-label" hidden><span id="sync-required"></span><input id="sync-confirm" autocomplete="off"></label>
+              <div class="form-footer"><p id="actions-help"></p><button id="sync-submit" class="button primary">Start dry-run</button></div>
+            </form>
+          </article>
+        </section>
+        <section id="view-destinations" hidden><div id="destinations" class="grid"></div></section>
+        <section id="view-backups" hidden><div id="backups"></div></section>
+        <section id="view-activity" hidden>
+          <article class="panel">
+            <header><h2>Run history</h2>
+              <label>Origin <select id="activity-filter"><option value="">All</option><option value="web">Web</option><option value="cli">CLI</option><option value="cron">Cron</option><option value="scheduled">Scheduler</option></select></label>
+            </header>
+            <div id="activity" class="table-wrap"></div>
+          </article>
+          <article class="panel" id="log-panel" hidden>
+            <header><h2>Run output</h2><span id="log-status" class="pill"></span></header>
+            <p id="log-progress"></p>
+            <div id="log-results" class="table-wrap"></div>
+            <pre id="log" tabindex="0" aria-label="GitMirror log"></pre>
+          </article>
+        </section>
+        <section id="view-settings" hidden>
+          <article class="panel"><header><h2>Configuration</h2></header><div id="settings"></div></article>
+        </section>
+      </div>
+    </main>
+  </div>
+  <dialog id="details-dialog">
+    <div class="dialog-head"><h2 id="details-title">Repository details</h2><button data-close="details-dialog" class="button secondary">Close</button></div>
+    <div id="details-content"></div>
+  </dialog>
+  <dialog id="restore-dialog">
+    <div class="dialog-head"><h2>Restore backup</h2><button data-close="restore-dialog" class="button secondary">Cancel</button></div>
+    <form id="restore-form" class="action-form">
+      <p id="restore-summary"></p>
+      <label>New directory name<input id="restore-name" required maxlength="100" autocomplete="off" placeholder="restored.git"></label>
+      <label class="check"><input id="restore-archive" type="checkbox">Include historical refs and their LFS data</label>
+      <label>Type RESTORE to confirm<input id="restore-confirm" required autocomplete="off"></label>
+      <p>The restored repository is written to the server’s configured restore directory. Existing paths are protected.</p>
+      <p id="restore-error" class="error" role="alert"></p>
+      <button class="button primary">Restore</button>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field, replace
 import datetime as dt
 import errno
@@ -12,11 +12,14 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1323,7 +1326,7 @@ def preserve_local_backup(path, volume, scope, source, record, working, refs, ob
                     if retention and retention['automatic']:
                         cleanup_repository(directory, retention, apply=True, confirm_volume=confirm_volume)
                     print(f'  {identifier}: verified current backup {previous}')
-                    return
+                    return previous
                 archived = {key: oid for key, oid in old['refs'].items() if key.startswith('refs/archive/')}
                 archived.update({f'refs/archive/{previous.stem}/{ref.removeprefix("refs/")}': oid
                                  for ref, oid in before.items()})
@@ -1370,6 +1373,7 @@ def preserve_local_backup(path, volume, scope, source, record, working, refs, ob
             print(f'  {identifier}: verified and published {published} ({copy.cloned} reflinks, {copy.copied} file copies)')
             if retention and retention['automatic']:
                 cleanup_repository(directory, retention, apply=True, confirm_volume=confirm_volume)
+            return published
     except (OSError, Timeout) as exc:
         raise SyncError(f'Could not complete local backup at {path}: {exc}') from exc
 
@@ -1394,7 +1398,7 @@ def backup_matches(directory, manifest, only):
     return not only or only == directory.name or only.casefold() == manifest['name'].casefold()
 
 
-def verify_local_backups(settings, only, identifiers=None):
+def verify_local_backups(settings, only, identifiers=None, *, activity=None):
     confirmed = 0
     failed = False
     for name, spec in local_destinations(settings, identifiers).items():
@@ -1408,7 +1412,14 @@ def verify_local_backups(settings, only, identifiers=None):
                 manifest = backup_manifest(repo)
                 if not backup_matches(entry, manifest, only):
                     continue
-                verify_local_generation(repo, manifest)
+                try:
+                    verify_local_generation(repo, manifest)
+                except (OSError, SyncError) as exc:
+                    if activity:
+                        activity.backup(name, entry.name, repo, 'failed', str(exc))
+                    raise
+                if activity:
+                    activity.backup(name, entry.name, repo, 'verified')
                 print(f'{name}: Verified {manifest["name"]} at {repo}')
                 confirmed += 1
             if backup_volume(path) != volume:
@@ -1419,6 +1430,20 @@ def verify_local_backups(settings, only, identifiers=None):
     if not confirmed:
         print('No matching local backup could be verified on the configured volumes')
     return 2 if failed or not confirmed else 0
+
+
+def verify_backup_selection(settings, identifiers, only, generation, *, activity=None):
+    name, repo, manifest = select_restore_backup(settings, identifiers, only, generation, listing=False)
+    try:
+        verify_local_generation(repo, manifest)
+    except (SyncError, OSError) as exc:
+        if activity:
+            activity.backup(name, repo.parent.parent.name, repo, 'failed', str(exc))
+        raise
+    if activity:
+        activity.backup(name, repo.parent.parent.name, repo, 'verified')
+    print(f'{name}: Verified {manifest["name"]} at {repo}')
+    return 0
 
 
 def generation_created(repo, manifest):
@@ -1559,7 +1584,7 @@ def select_restore_backup(settings, identifiers, only, generation, *, listing):
     return selected[0]
 
 
-def restore_backup(settings, identifiers, only, generation, output_path, include_archive):
+def restore_backup(settings, identifiers, only, generation, output_path, include_archive, *, activity=None):
     name, repo, manifest = select_restore_backup(settings, identifiers, only, generation, listing=False)
     output = Path(output_path).expanduser().absolute()
     if output.exists() or output.is_symlink() or not output.parent.is_dir():
@@ -1567,7 +1592,12 @@ def restore_backup(settings, identifiers, only, generation, output_path, include
     if any(output.resolve().is_relative_to(spec['path']) for spec in local_destinations(settings).values()):
         raise SyncError('Restore output must be outside all configured backup volumes')
 
-    verify_local_generation(repo, manifest)
+    try:
+        verify_local_generation(repo, manifest)
+    except (SyncError, OSError) as exc:
+        if activity:
+            activity.backup(name, repo.parent.parent.name, repo, 'failed', str(exc))
+        raise
     expected = {ref: oid for ref, oid in manifest['refs'].items()
                 if include_archive or not ref.startswith('refs/archive/')}
     with tempfile.TemporaryDirectory(prefix='.gitmirror-restore-', dir=output.parent) as scratch:
@@ -1597,6 +1627,8 @@ def restore_backup(settings, identifiers, only, generation, output_path, include
                 raise
         fsync_directory(output.parent)
     print(f'{name}: Restored and verified {manifest["name"]} from {repo.stem} at {output}')
+    if activity:
+        activity.backup(name, repo.parent.parent.name, repo, 'verified')
     return 0
 
 
@@ -1711,7 +1743,7 @@ def sync_destination(record, source, repo, provider, destination, src, source_lf
     print(f'  {remote}: SYNCED (Git refs, default branch, Git LFS and visibility verified)')
 
 
-def sync_repository(record, source, providers, volumes, settings, apply, *, full_lfs=False):
+def sync_repository(record, source, providers, volumes, settings, apply, *, full_lfs=False, activity=None):
     name = record['name']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise SyncError(f'Unsupported repository name: {name}')
@@ -1732,10 +1764,16 @@ def sync_repository(record, source, providers, volumes, settings, apply, *, full
     resolved_urls = set()
     successes = failures = 0
     active = len(providers) + len(volumes)
+
+    def observe(identifier, state, detail=None):
+        if activity:
+            activity.result(name, identifier, state, detail)
+
     if not apply:
         for identifier, (path, _) in volumes.items():
             print(f'  {identifier}: would verify and preserve {len(gh)} refs at {path}')
             successes += 1
+            observe(identifier, 'checked')
     for identifier, provider in providers.items():
         try:
             destination = provider.read_destination(name, create=apply)
@@ -1750,6 +1788,7 @@ def sync_repository(record, source, providers, volumes, settings, apply, *, full
                     describe_destination_plan(provider.kind, destination, gh, source_default, priv,
                                               provider.headers, identifier=identifier)
                 successes += 1
+                observe(identifier, 'checked')
                 continue
             if priv and destination.visibility != 'private':
                 source.confirm_source(record)
@@ -1757,10 +1796,12 @@ def sync_repository(record, source, providers, volumes, settings, apply, *, full
             destinations[identifier] = destination
         except SourceStateError as exc:
             print(f'  {identifier}: BLOCKED: {exc}')
+            observe(identifier, 'blocked', str(exc))
             return successes, active - successes
         except (SyncError, OSError) as exc:
             print(f'  {identifier}: BLOCKED: {exc}')
             failures += 1
+            observe(identifier, 'blocked', str(exc))
     if not apply or (not destinations and not volumes):
         return successes, failures
 
@@ -1792,27 +1833,38 @@ def sync_repository(record, source, providers, volumes, settings, apply, *, full
 
     for identifier, (path, volume) in volumes.items():
         try:
-            preserve_local_backup(path, volume, scope, source, record, repo, src, source_lfs,
-                                  identifier=identifier, retention=settings['destinations'][identifier]['retention'])
+            retention = settings['destinations'][identifier]['retention']
+            if os.getenv('GITMIRROR_WEB_JOB'):
+                retention = None
+            generation = preserve_local_backup(path, volume, scope, source, record, repo, src, source_lfs,
+                                                identifier=identifier, retention=retention)
+            if activity and generation is not None:
+                activity.backup(identifier, str(record['id']), generation, 'verified')
             successes += 1
+            observe(identifier, 'succeeded')
         except SourceStateError as exc:
             print(f'  {identifier}: BLOCKED: {exc}')
+            observe(identifier, 'blocked', str(exc))
             return successes, active - successes
         except (SyncError, OSError) as exc:
             print(f'  {identifier}: FAILED: {exc}')
             failures += 1
+            observe(identifier, 'failed', str(exc))
     for identifier, destination in destinations.items():
         try:
             with protection_scope(settings, settings['destinations'][identifier]):
                 sync_destination(record, source, repo, providers[identifier], destination, src, source_lfs,
                                  full_lfs, identifier=identifier)
             successes += 1
+            observe(identifier, 'succeeded')
         except SourceStateError as exc:
             print(f'  {identifier}: BLOCKED: {exc}')
+            observe(identifier, 'blocked', str(exc))
             return successes, active - successes
         except (SyncError, OSError) as exc:
             print(f'  {identifier}: FAILED without deleting project: {exc}')
             failures += 1
+            observe(identifier, 'failed', str(exc))
     return successes, failures
 
 
@@ -1831,7 +1883,7 @@ def selected_platforms(settings, platform, identifiers=None):
     return matches
 
 
-def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, identifiers=None):
+def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, identifiers=None, activity=None):
     configure_runtime(settings, apply=apply)
     for executable in ('git', 'ssh', 'git-lfs'):
         if shutil.which(executable) is None:
@@ -1861,12 +1913,16 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, ide
         except (SyncError, OSError) as exc:
             print(f'{target}: BLOCKED: {exc}')
             failures += 1
+            if activity:
+                activity.result('', target, 'blocked', str(exc))
     active = len(providers) + len(volumes)
     if not active:
         print(f'SUMMARY: repositories=0, successful/checked destinations=0, failed={failures}')
         return 1
 
     repos = source.discover()
+    if activity:
+        activity.inventory(repos)
     print(f'{source.label}: {source.owner} -> {", ".join(platforms)}')
     print(f'Mode: {"APPLY" if apply else "DRY RUN"} | Discovered: {len(repos)} | Run: {RUN_ID}')
     if only:
@@ -1875,13 +1931,20 @@ def run(settings, *, apply=False, only=None, platform='all', full_lfs=False, ide
             raise SyncError(f'{only} not found among accessible {source.label} repositories; no changes made')
     for n, repo in enumerate(repos, 1):
         print(f'\n[{n}/{len(repos)}] {repo["name"]}')
+        if activity:
+            activity.progress(repo['name'], n, len(repos))
+        error = 'Stopped before processing this destination'
         try:
-            ok, bad = sync_repository(repo, source, providers, volumes, settings, apply, full_lfs=full_lfs)
+            ok, bad = sync_repository(repo, source, providers, volumes, settings, apply,
+                                      full_lfs=full_lfs, activity=activity)
             successes += ok
             failures += bad
         except (SyncError, OSError) as exc:
             print(f'  FAILED safely: {exc}')
             failures += active
+            error = str(exc)
+        if activity:
+            activity.unreported(repo['name'], platforms, error)
     print(f'\nSUMMARY: repositories={len(repos)}, successful/checked destinations={successes}, '
           f'failed={failures}, mode={"apply" if apply else "dry-run"}')
     print('Missing source repositories are never deleted from destinations.')
@@ -2015,16 +2078,907 @@ def add_destination_selector(parser, *, providers=False):
     if providers:
         selection.add_argument('--platform', choices=['all', 'both', *PROVIDER_APIS, 'local'], default='all')
 
+
+# Dashboard activity journal, shared by independent CLI and web processes
+
+class DashboardJournal:
+    def __init__(self, settings, *, initialize=False):
+        self.directory = settings['storage']['path'] / 'web-dashboard'
+        self.logs = self.directory / 'logs'
+        self.path = self.directory / 'activity.sqlite3'
+        self.change = self.directory / 'revision'
+        self.scope = scope_id(settings['source'])
+        if initialize:
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.logs.mkdir(exist_ok=True, mode=0o700)
+            if os.name != 'nt':
+                self.directory.chmod(0o700)
+                self.logs.chmod(0o700)
+            with closing(self.connect()) as db:
+                db.executescript("""
+                    CREATE TABLE IF NOT EXISTS operations (
+                        id TEXT PRIMARY KEY, scope TEXT NOT NULL, started REAL NOT NULL,
+                        ended REAL, heartbeat REAL NOT NULL, operation TEXT NOT NULL,
+                        origin TEXT NOT NULL, mode TEXT NOT NULL, repository TEXT,
+                        destinations TEXT NOT NULL, state TEXT NOT NULL, exit_code INTEGER,
+                        error TEXT, progress TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS started_operations ON operations(scope, started DESC);
+                    CREATE TABLE IF NOT EXISTS results (
+                        run TEXT NOT NULL, repository TEXT NOT NULL, destination TEXT NOT NULL,
+                        state TEXT NOT NULL, detail TEXT, at REAL NOT NULL,
+                        PRIMARY KEY (run, repository, destination)
+                    );
+                    CREATE INDEX IF NOT EXISTS recent_results ON results(repository, at DESC);
+                    CREATE TABLE IF NOT EXISTS inventory (
+                        scope TEXT PRIMARY KEY, checked REAL NOT NULL, repositories TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS verification (
+                        scope TEXT NOT NULL, destination TEXT NOT NULL, repository TEXT NOT NULL,
+                        generation TEXT NOT NULL, stamp TEXT NOT NULL, state TEXT NOT NULL,
+                        at REAL NOT NULL, detail TEXT,
+                        PRIMARY KEY(scope, destination, repository, generation)
+                    );
+                    CREATE TABLE IF NOT EXISTS schedules (
+                        scope TEXT NOT NULL, id TEXT NOT NULL, due REAL NOT NULL, lease REAL NOT NULL,
+                        PRIMARY KEY(scope, id)
+                    );
+                """)
+            if os.name != 'nt':
+                self.path.chmod(0o600)
+            self.import_legacy()
+            self.touch()
+
+    def connect(self):
+        db = sqlite3.connect(self.path.as_uri() + '?mode=rw' if self.path.exists() else self.path,
+                             uri=self.path.exists(), timeout=3)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def read(self, sql, args=()):
+        with closing(self.connect()) as db:
+            return [dict(row) for row in db.execute(sql, args)]
+
+    def write(self, sql, args):
+        with closing(self.connect()) as db, db:
+            db.execute(sql, args)
+        self.touch()
+
+    def touch(self):
+        self.change.touch(mode=0o600, exist_ok=True)
+
+    def revision(self):
+        try:
+            return self.change.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def import_legacy(self):
+        legacy = self.directory / 'runs.sqlite3'
+        if not legacy.is_file():
+            return
+        with closing(sqlite3.connect(legacy.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
+            runs = db.execute('SELECT id,started,ended,mode,repository,destinations,state,exit_code,error FROM runs')
+            with closing(self.connect()) as current, current:
+                for identifier, started, ended, mode, repo, dests, state, code, error in runs:
+                    if re.fullmatch(r'[a-f0-9]{20}', identifier):
+                        current.execute('INSERT OR IGNORE INTO operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                        (identifier, self.scope, started, ended, ended or started, 'sync',
+                                         'web', mode, repo, dests,
+                                         'interrupted' if state == 'running' else state, code,
+                                         'Legacy run failed' if error else None, None))
+        # Legacy logs were captured without credential redaction.
+
+    def begin(self, identifier, operation, mode, origin, repository, destinations, *, state='running'):
+        now = time.time()
+        self.write('INSERT INTO operations (id,scope,started,heartbeat,operation,origin,mode,repository,'
+                   'destinations,state) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                   (identifier, self.scope, now, now, operation, origin, mode, repository,
+                    json.dumps(destinations), state))
+
+    def finish(self, identifier, code, *, error=None, only_unfinished=False):
+        where = " AND state IN ('queued','running')" if only_unfinished else ''
+        self.write(f'UPDATE operations SET ended=?, state=?, exit_code=?, error=COALESCE(error,?) WHERE id=?{where}',
+                   (time.time(), 'succeeded' if code == 0 else 'interrupted' if code == 130 else 'failed',
+                    code, error, identifier))
+
+    def operations(self):
+        rows = self.read('SELECT * FROM operations WHERE scope=? ORDER BY started DESC LIMIT 100', (self.scope,))
+        for row in rows:
+            row['destinations'] = json.loads(row['destinations'])
+            row['progress'] = json.loads(row['progress']) if row['progress'] else None
+            if row['state'] in ('running', 'queued') and row['heartbeat'] < time.time() - 75:
+                row['state'] = 'interrupted'
+                row['error'] = 'Activity lease expired; inspect the operation before retrying'
+        return rows
+
+
+def redact_dashboard_log(message, values=()):
+    for value in values:
+        if value:
+            message = message.replace(value, '[redacted]').replace(urllib.parse.quote(value, safe=''), '[redacted]')
+    message = re.sub(r'(?i)\b((?:https?|ssh|git)://)[^/\s@]+@', r'\1[redacted]@', message)
+    message = re.sub(r'(?i)\b(authorization|private-token|(?:access_|oauth_)?token|password)(\s*[:=]\s*)'
+                     r'(?:(?:bearer|basic)\s+)?[^\s&,;]+', r'\1\2[redacted]', message)
+    message = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]', '', message)
+    return message
+
+
+def dashboard_secret_values(settings):
+    values = set()
+    for spec in (settings['source'], *settings['destinations'].values()):
+        if spec['provider'] != 'local':
+            try:
+                values.update(token(spec).splitlines())
+            except (SyncError, UnicodeError):
+                pass
+    return sorted(values, key=len, reverse=True)
+
+
+class ObservedOutput:
+    """Record complete redacted lines, with bounded log size and normal terminal output."""
+
+    def __init__(self, stream, activity, log):
+        self.stream, self.activity, self.log = stream, activity, log
+        self.pending = ''
+
+    def write(self, text):
+        self.pending += text
+        lines = self.pending.split('\n')
+        self.pending = lines.pop()
+        for line in lines:
+            self.emit(line + '\n')
+        return len(text)
+
+    def emit(self, text):
+        safe = self.activity.redact(text)
+        if re.search(r'(?i)\b(failed|blocked|another gitmirror process)\b', safe):
+            self.activity.last_error = safe.strip()[:2048]
+        self.stream.write(safe)
+        if self.log is None:
+            return
+        try:
+            if self.log.tell() < 1_048_576:
+                self.log.write(safe[:8192])
+                self.log.flush()
+                if time.monotonic() - self.activity.log_changed > 1:
+                    self.activity.log_changed = time.monotonic()
+                    self.activity.journal.touch()
+        except OSError:
+            self.log = None
+
+    def flush(self):
+        if self.pending:
+            self.emit(self.pending)
+            self.pending = ''
+        self.stream.flush()
+
+
+class DashboardOperation:
+    def __init__(self, journal, identifier, settings, operation, mode, origin):
+        self.journal, self.id, self.origin = journal, identifier, origin
+        self.values = dashboard_secret_values(settings) if operation == 'sync' else ()
+        self.log_changed = 0
+        self.last_error = None
+        self.seen, self.unavailable = set(), set()
+        self.stop = threading.Event()
+
+    def redact(self, message):
+        return redact_dashboard_log(message, self.values)
+
+    def write(self, sql, args):
+        try:
+            self.journal.write(sql, args)
+        except (OSError, sqlite3.Error):
+            # Telemetry failure must never interrupt repository safety checks.
+            pass
+
+    def heartbeat(self):
+        while not self.stop.wait(20):
+            self.write('UPDATE operations SET heartbeat=? WHERE id=?', (time.time(), self.id))
+
+    def inventory(self, records):
+        entries = [{key: repo[key] for key in ('id', 'name', 'default_branch', 'visibility')} for repo in records]
+        self.write('INSERT OR REPLACE INTO inventory VALUES (?,?,?)',
+                   (self.journal.scope, time.time(), json.dumps(entries)))
+
+    def progress(self, repository, index, total):
+        value = json.dumps({'repository': repository, 'index': index, 'total': total})
+        self.write('UPDATE operations SET progress=? WHERE id=?', (value, self.id))
+
+    def result(self, repository, destination, state, detail=None):
+        self.seen.add((repository, destination))
+        if not repository:
+            self.unavailable.add(destination)
+        self.write('INSERT OR REPLACE INTO results VALUES (?,?,?,?,?,?)',
+                   (self.id, repository, destination, state, self.redact(detail)[:2048] if detail else None, time.time()))
+
+    def unreported(self, repository, destinations, detail):
+        for destination in destinations:
+            if (repository, destination) not in self.seen:
+                self.result(repository, destination, 'blocked', 'Destination unavailable for this run'
+                            if destination in self.unavailable else detail)
+
+    def backup(self, destination, repository, generation, state, detail=None):
+        self.write('INSERT OR REPLACE INTO verification VALUES (?,?,?,?,?,?,?,?)',
+                   (self.journal.scope, destination, repository, generation.stem, generation_stamp(generation),
+                    state, time.time(), self.redact(detail)[:2048] if detail else None))
+
+
+def generation_stamp(generation):
+    try:
+        return hashlib.sha256((generation / BACKUP_MANIFEST).read_bytes()).hexdigest()
+    except OSError:
+        return ''
+
+
+def observe_dashboard_operation(settings, operation, mode, origin, repository, destinations, execute, *, enabled):
+    if not enabled:
+        return execute(None)
+    journal = DashboardJournal(settings)
+    if not journal.path.is_file():
+        return execute(None)
+    web_id = os.getenv('GITMIRROR_WEB_JOB', '')
+    try:
+        attached = (re.fullmatch(r'[a-f0-9]{32}', web_id)
+                    and journal.read("SELECT id FROM operations WHERE id=? AND scope=? AND state='queued'",
+                                     (web_id, journal.scope)))
+        identifier = web_id if attached else uuid.uuid4().hex
+        if attached:
+            origin = 'web'
+            journal.write("UPDATE operations SET state='running', heartbeat=? WHERE id=?", (time.time(), identifier))
+        else:
+            journal.begin(identifier, operation, mode, origin, repository, destinations or [])
+    except (OSError, sqlite3.Error):
+        return execute(None)
+
+    activity = DashboardOperation(journal, identifier, settings, operation, mode, origin)
+    heartbeat = threading.Thread(target=activity.heartbeat, daemon=True)
+    heartbeat.start()
+    code, error, log = 2, None, None
+    try:
+        try:
+            log = (journal.logs / f'{identifier}.log').open('x', encoding='utf-8', errors='replace')
+            if os.name != 'nt':
+                os.fchmod(log.fileno(), 0o600)
+        except OSError:
+            if log:
+                log.close()
+            log = None
+        out, err = ObservedOutput(sys.stdout, activity, log), ObservedOutput(sys.stderr, activity, log)
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = execute(activity)
+            except (ConfigError, SyncError, OSError, Timeout) as exc:
+                error = activity.redact(str(exc))[:2048]
+                print(f'GitMirror: {error}', file=sys.stderr)
+            except KeyboardInterrupt:
+                code = 130
+            finally:
+                out.flush()
+                err.flush()
+        return code
+    finally:
+        activity.stop.set()
+        heartbeat.join()
+        if log:
+            log.close()
+        try:
+            detail = (error or activity.last_error or f'GitMirror exit {code}') if code else None
+            if attached:
+                # The launcher publishes a terminal state after the child exits and releases its queue lock.
+                journal.write('UPDATE operations SET exit_code=?, error=? WHERE id=?', (code, detail, identifier))
+            else:
+                journal.finish(identifier, code, error=detail)
+        except (OSError, sqlite3.Error):
+            pass
+
+
+def wait_for_dashboard_schedule(settings, delay, *, monitored):
+    journal = DashboardJournal(settings)
+    if not monitored or not journal.path.is_file():
+        time.sleep(delay)
+        return
+    identifier, due = uuid.uuid4().hex, time.time() + delay
+    until = time.monotonic() + delay
+    try:
+        while (remaining := until - time.monotonic()) > 0:
+            try:
+                journal.write('INSERT OR REPLACE INTO schedules VALUES (?,?,?,?)',
+                              (journal.scope, identifier, due, time.time() + 75))
+            except (OSError, sqlite3.Error):
+                pass
+            time.sleep(min(remaining, 30))
+    finally:
+        try:
+            journal.write('DELETE FROM schedules WHERE scope=? AND id=?', (journal.scope, identifier))
+        except (OSError, sqlite3.Error):
+            pass
+
+
+def dashboard_destination(spec, identifier):
+    return {'id': identifier, 'provider': spec['provider'], 'owner': spec.get('owner'),
+            'path': str(spec['path']) if spec['provider'] == 'local' else None,
+            'api_url': spec.get('api_url'), 'retention': spec.get('retention')}
+
+
+def dashboard_backups(settings, journal, sizes):
+    verified = {(row['destination'], row['repository'], row['generation']): row for row in
+                journal.read('SELECT * FROM verification WHERE scope=?', (journal.scope,))}
+    output = []
+    for identifier, spec in settings['destinations'].items():
+        if spec['provider'] != 'local':
+            continue
+        path = spec['path']
+        item = {'id': identifier, 'path': str(path), 'free': None, 'used': None, 'error': None, 'repositories': []}
+        output.append(item)
+        try:
+            volume = backup_volume(path)
+            item['free'] = shutil.disk_usage(path).free
+            if identifier not in sizes or sizes[identifier][0] != volume or sizes[identifier][1] < time.monotonic() - 60:
+                total = sum(file.stat().st_size for file in path.rglob('*') if not file.is_symlink() and file.is_file())
+                sizes[identifier] = volume, time.monotonic(), total
+            item['used'] = sizes[identifier][2]
+            for directory in backup_directories(path, journal.scope):
+                status = {'id': directory.name, 'name': directory.name, 'error': None, 'generations': []}
+                item['repositories'].append(status)
+                try:
+                    current = current_backup(directory)
+                except SyncError:
+                    current = None
+                    status['error'] = 'CURRENT is invalid; select an older generation'
+                for generation in reversed(backup_generations(directory)):
+                    row = verified.get((identifier, directory.name, generation.stem))
+                    stamp = generation_stamp(generation)
+                    if row and row['stamp'] != stamp:
+                        row = None
+                    integrity = row['state'] if row else 'unverified'
+                    created = None
+                    try:
+                        manifest = backup_manifest(generation)
+                        status['name'] = manifest['name']
+                        created = generation_created(generation, manifest) / 1e9
+                    except (SyncError, OSError, ValueError):
+                        integrity = 'failed'
+                    status['generations'].append({'id': generation.stem, 'current': generation == current,
+                                                  'created': created, 'integrity': integrity,
+                                                  'verified': row['at'] if row else None})
+            if backup_volume(path) != volume:
+                raise SyncError('Backup volume changed during inspection')
+        except (SyncError, OSError) as exc:
+            item['error'] = redact_dashboard_log(str(exc))
+    return output
+
+
+# Optional self-hosted dashboard
+
+def create_web_app(settings, config_file, *, password, allow_actions=False, assets_dir=None,
+                   allowed_hosts=None, restore_dir=None, public_origin=None, session_ttl=43200):
+    try:
+        from fastapi import FastAPI, HTTPException, Request
+        from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+    except ImportError as exc:
+        raise SyncError('Web dashboard requires: pip install "gitmirror-resilient[web]"') from exc
+    import asyncio
+    import hmac
+    from collections import deque
+
+    globals()['_GitMirrorWebRequest'] = Request
+    root = Path(assets_dir) if assets_dir else Path(__file__).resolve().parent / 'web'
+    if not (root / 'index.html').is_file():
+        root = Path(sys.prefix) / 'share' / 'gitmirror' / 'web'
+    if not all((root / name).is_file() for name in ('index.html', 'style.css', 'app.js')):
+        raise SyncError('Web assets are missing; install GitMirror with the web extra')
+    if not isinstance(password, str) or not 12 <= len(password) <= 1024:
+        raise SyncError('Web password must contain 12 to 1024 characters')
+    try:
+        config_digest = hashlib.sha256(Path(config_file).read_bytes()).digest()
+    except OSError as exc:
+        raise SyncError('Cannot read dashboard configuration') from exc
+    if restore_dir is not None:
+        restore_dir = Path(restore_dir).expanduser().resolve()
+        if not restore_dir.is_dir() or any(restore_dir.is_relative_to(spec['path'])
+                                          for spec in settings['destinations'].values() if spec['provider'] == 'local'):
+            raise SyncError('Restore directory must exist outside the configured backup roots')
+
+    salt = secrets.token_bytes(32)
+
+    def hash_password(entered):
+        return hashlib.scrypt(entered.encode('utf-8'), salt=salt, n=16384, r=8, p=1)
+
+    password_hash = hash_password(password)
+    journal = DashboardJournal(settings, initialize=True)
+    app = FastAPI(title='GitMirror Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
+    allowed = {'localhost', '127.0.0.1', '::1', *(h.casefold() for h in allowed_hosts or ())}
+    if public_origin:
+        permitted = urlsplit_origin(public_origin)
+        if not permitted or permitted.scheme != 'https' or permitted.hostname not in allowed:
+            raise SyncError('Public origin must be HTTPS and use an allowed hostname')
+    sessions, attempts = {}, {}
+    global_attempts = deque()
+    auth_lock = threading.Lock()
+    login_slots = threading.BoundedSemaphore(2)
+    backup_lock = threading.Lock()
+    discovery_lock = threading.Lock()
+    backup_cache = (0, None, None)
+    sizes = {}
+    cookie = 'gm_session'
+
+    def session(request):
+        key = request.cookies.get(cookie, '')
+        with auth_lock:
+            active = sessions.get(key)
+            if active and active[0] > time.monotonic():
+                return active
+            sessions.pop(key, None)
+        return None
+
+    def auth(request, *, csrf=False):
+        active = session(request)
+        if not active:
+            raise HTTPException(401, 'Sign in required')
+        if csrf and not hmac.compare_digest(active[1].encode('ascii'),
+                                            request.headers.get('X-CSRF-Token', '').encode('utf-8')):
+            raise HTTPException(403, 'Invalid session verification token')
+        return active
+
+    async def body(request):
+        if request.headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
+            raise HTTPException(415, 'Use application/json')
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 16384:
+                raise HTTPException(413, 'Request too large')
+            data.extend(chunk)
+        try:
+            value = json.loads(data)
+            if not isinstance(value, dict):
+                raise ValueError
+            return value
+        except (ValueError, RecursionError) as exc:
+            raise HTTPException(400, 'Invalid JSON request') from exc
+
+    @app.middleware('http')
+    async def security(request: _GitMirrorWebRequest, call_next):
+        host = request.headers.get('host', '')
+        home = urlsplit_origin(f'{request.url.scheme}://{host}')
+        origin = request.headers.get('origin')
+        expected = public_origin or f'{request.url.scheme}://{host}'
+        if not home or home.hostname not in allowed:
+            response = JSONResponse({'detail': 'Unapproved dashboard hostname'}, status_code=400)
+        elif origin is not None and origin.lower() != expected.lower():
+            response = JSONResponse({'detail': 'Cross-origin request blocked'}, status_code=403)
+        else:
+            response = await call_next(request)
+        response.headers.update({
+            'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+            'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; "
+                                       "connect-src 'self'; img-src 'self'; frame-ancestors 'none'; "
+                                       "base-uri 'none'; form-action 'self'",
+        })
+        return response
+
+    @app.get('/')
+    def home():
+        return FileResponse(root / 'index.html', media_type='text/html')
+
+    @app.get('/assets/{filename}')
+    def asset(filename: str):
+        media = {'style.css': 'text/css', 'app.js': 'text/javascript'}
+        if filename not in media:
+            raise HTTPException(404, 'Asset not found')
+        return FileResponse(root / filename, media_type=media[filename])
+
+    @app.post('/api/login')
+    async def login(request: _GitMirrorWebRequest):
+        ip = request.client.host if request.client else 'unknown'
+        entered = (await body(request)).get('password')
+        now = time.monotonic()
+        with auth_lock:
+            while global_attempts and global_attempts[0] <= now - 300:
+                global_attempts.popleft()
+            for key in [key for key, data in attempts.items() if data[-1] <= now - 300]:
+                del attempts[key]
+            recent = [t for t in attempts.get(ip, ()) if t > now - 300]
+            if len(recent) >= 5 or len(global_attempts) >= 30 or not login_slots.acquire(blocking=False):
+                raise HTTPException(429, 'Too many attempts. Try again later.', headers={'Retry-After': '300'})
+            attempts[ip] = [*recent, now]
+            global_attempts.append(now)
+        try:
+            valid = False
+            if isinstance(entered, str) and len(entered) <= 1024:
+                try:
+                    valid = hmac.compare_digest(await asyncio.to_thread(hash_password, entered), password_hash)
+                except UnicodeError:
+                    pass
+        finally:
+            login_slots.release()
+        if not valid:
+            raise HTTPException(401, 'Invalid password')
+        key = secrets.token_urlsafe(32)
+        with auth_lock:
+            attempts.pop(ip, None)
+            sessions.pop(request.cookies.get(cookie, ''), None)
+            for expired in [k for k, value in sessions.items() if value[0] <= now]:
+                del sessions[expired]
+            if len(sessions) >= 128:
+                sessions.pop(next(iter(sessions)))
+            sessions[key] = (time.monotonic() + session_ttl, secrets.token_urlsafe(32))
+        secure = bool(public_origin or request.url.scheme == 'https')
+        response = JSONResponse({'authenticated': True})
+        response.set_cookie(cookie, key, httponly=True, samesite='strict', secure=secure,
+                            max_age=session_ttl, path='/')
+        return response
+
+    @app.get('/api/session')
+    def get_session(request: _GitMirrorWebRequest):
+        return {'csrf': auth(request)[1]}
+
+    @app.post('/api/logout')
+    def logout(request: _GitMirrorWebRequest):
+        auth(request, csrf=True)
+        with auth_lock:
+            sessions.pop(request.cookies.get(cookie, ''), None)
+        response = JSONResponse({'ok': True})
+        response.delete_cookie(cookie, path='/', secure=bool(public_origin or request.url.scheme == 'https'),
+                               httponly=True, samesite='strict')
+        return response
+
+    def local_data():
+        nonlocal backup_cache
+        with backup_lock:
+            last = journal.read('SELECT MAX(at) AS latest FROM verification WHERE scope=?', (journal.scope,))[0]['latest']
+            if backup_cache[0] < time.monotonic() - 12 or backup_cache[1] != last or backup_cache[2] is None:
+                backup_cache = time.monotonic(), last, dashboard_backups(settings, journal, sizes)
+            return backup_cache[2]
+
+    def inventory():
+        rows = journal.read('SELECT checked,repositories FROM inventory WHERE scope=?', (journal.scope,))
+        return (rows[0]['checked'], json.loads(rows[0]['repositories'])) if rows else (None, None)
+
+    @app.get('/api/overview')
+    def overview(request: _GitMirrorWebRequest):
+        auth(request)
+        recent = journal.operations()
+        counts = journal.read(
+            "SELECT state,COUNT(*) AS total,MAX(ended) AS last FROM operations "
+            "WHERE scope=? AND operation='sync' AND mode='apply' GROUP BY state", (journal.scope,))
+        summary = {row['state']: row for row in counts}
+        next_runs = journal.read('SELECT MIN(due) AS next FROM schedules WHERE scope=? AND lease>?',
+                                 (journal.scope, time.time()))
+        try:
+            free = shutil.disk_usage(settings['storage']['path']).free
+        except OSError:
+            free = None
+        checked, repositories = inventory()
+        _, current = backup_health(local_data())
+        return {'source': {key: settings['source'][key] for key in ('provider', 'owner', 'api_url')},
+                'destinations': [dashboard_destination(s, k) for k, s in settings['destinations'].items()],
+                'schedule_hours': settings['schedule']['interval_hours'],
+                'storage': {'path': str(settings['storage']['path']), 'free': free},
+                'web': {'allow_actions': allow_actions, 'restore_enabled': bool(restore_dir),
+                        'secure': bool(public_origin or request.url.scheme == 'https')},
+                'inventory_at': checked, 'total_repositories': None if repositories is None else len(repositories),
+                'successful': summary.get('succeeded', {}).get('total', 0),
+                'failed': summary.get('failed', {}).get('total', 0),
+                'last_success': summary.get('succeeded', {}).get('last'),
+                'next_run': next_runs[0]['next'], 'backup': current,
+                'runs': recent, 'active': [r for r in recent if r['state'] in ('running','queued')],
+                'errors': journal.read("SELECT r.repository,r.destination,r.detail,r.at FROM results r "
+                                       "JOIN operations o ON o.id=r.run WHERE o.scope=? AND r.detail IS NOT NULL "
+                                       "UNION ALL SELECT repository,'',error,ended FROM operations o "
+                                       "WHERE scope=? AND error IS NOT NULL AND NOT EXISTS "
+                                       "(SELECT 1 FROM results r WHERE r.run=o.id AND r.detail IS NOT NULL) "
+                                       "ORDER BY at DESC LIMIT 8", (journal.scope, journal.scope))}
+
+    @app.get('/api/repositories')
+    def repositories(request: _GitMirrorWebRequest):
+        auth(request)
+        at, records = inventory()
+        last = journal.read(
+            "SELECT repository,destination,state,detail,at,mode FROM (SELECT r.*,o.mode,"
+            "ROW_NUMBER() OVER(PARTITION BY r.repository,r.destination ORDER BY r.at DESC) AS newest "
+            "FROM results r JOIN operations o ON o.id=r.run WHERE o.scope=? AND r.repository!='' "
+            "AND (o.mode='apply' OR NOT EXISTS (SELECT 1 FROM results a JOIN operations p ON p.id=a.run "
+            "WHERE a.repository=r.repository AND a.destination=r.destination AND p.scope=o.scope AND p.mode='apply')))"
+            " WHERE newest=1", (journal.scope,))
+        details = {}
+        for result in last:
+            details.setdefault(result['repository'].casefold(), []).append(result)
+        backups, _ = backup_health(local_data())
+        for record in records or []:
+            record['destinations'] = details.get(record['name'].casefold(), [])
+            record['last_backup'] = backups.get(str(record['id']))
+        return {'checked': at, 'repositories': records}
+
+    @app.post('/api/repositories/refresh')
+    def refresh_repositories(request: _GitMirrorWebRequest):
+        auth(request, csrf=True)
+        if not discovery_lock.acquire(blocking=False):
+            raise HTTPException(409, 'Inventory refresh is already running')
+        try:
+            at, records = inventory()
+            if at is not None and at >= time.time() - 30:
+                return {'checked': at, 'total': len(records)}
+            records = Provider.from_config(settings['source']).authenticate().discover()
+            entries = [{key: repo[key] for key in ('id', 'name', 'default_branch', 'visibility')} for repo in records]
+            at = time.time()
+            journal.write('INSERT OR REPLACE INTO inventory VALUES (?,?,?)', (journal.scope, at, json.dumps(entries)))
+            return {'checked': at, 'total': len(entries)}
+        except (SyncError, OSError, sqlite3.Error):
+            raise HTTPException(502, 'Cannot read repository inventory; check source credentials and connectivity')
+        finally:
+            discovery_lock.release()
+
+    @app.get('/api/backups')
+    def backups(request: _GitMirrorWebRequest):
+        auth(request)
+        return {'destinations': local_data()}
+
+    @app.get('/api/runs/{run_id}/log')
+    def run_log(run_id: str, request: _GitMirrorWebRequest):
+        auth(request)
+        if not re.fullmatch(r'(?:[a-f0-9]{20}|[a-f0-9]{32})', run_id):
+            raise HTTPException(404, 'Unknown run')
+        runs = journal.read('SELECT id,state,progress,error FROM operations WHERE id=? AND scope=?',
+                            (run_id, journal.scope))
+        if not runs:
+            raise HTTPException(404, 'Unknown run')
+        log = ''
+        if len(run_id) == 32:
+            try:
+                with (journal.logs / (run_id + '.log')).open('rb') as file:
+                    file.seek(0, os.SEEK_END)
+                    file.seek(max(0, file.tell() - 65536))
+                    log = file.read(65536).decode('utf-8', 'replace')
+            except FileNotFoundError:
+                pass
+        run = runs[0]
+        run['progress'] = json.loads(run['progress']) if run['progress'] else None
+        return {**run, 'log': log,
+                'results': journal.read('SELECT repository,destination,state,detail,at FROM results '
+                                        'WHERE run=? ORDER BY at LIMIT 1000', (run_id,))}
+
+    @app.get('/api/events')
+    async def events(request: _GitMirrorWebRequest):
+        auth(request)
+
+        async def stream():
+            revision, last = None, time.monotonic()
+            while session(request) and not await request.is_disconnected():
+                current = journal.revision()
+                if revision != current:
+                    revision = current
+                    yield f'data: {revision}\n\n'
+                if time.monotonic() - last >= 15:
+                    last = time.monotonic()
+                    yield ': keepalive\n\n'
+                await asyncio.sleep(2)
+            if not session(request):
+                yield 'event: expired\ndata: 0\n\n'
+        return StreamingResponse(stream(), media_type='text/event-stream',
+                                 headers={'X-Accel-Buffering': 'no'})
+
+    def execute(job_id, command, lock):
+        code, error = 2, None
+        try:
+            environment = {**os.environ, 'GITMIRROR_WEB_JOB': job_id, 'PYTHONUNBUFFERED': '1'}
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, env=environment)
+            code = process.wait()
+            if code:
+                error = 'CLI exited before recording a result'
+        except OSError:
+            error = 'Could not start or monitor the GitMirror CLI'
+        finally:
+            lock.release()
+        try:
+            journal.finish(job_id, code, error=error, only_unfinished=True)
+        except (OSError, sqlite3.Error):
+            pass
+
+    def start(operation, mode, repository, targets, arguments):
+        config = Path(config_file).resolve()
+        try:
+            unchanged = hashlib.sha256(config.read_bytes()).digest() == config_digest
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            raise HTTPException(409, 'Configuration changed; validate it and restart the dashboard')
+        job_id = uuid.uuid4().hex
+        lock = FileLock(str(journal.directory / '.action.lock'), timeout=0, thread_local=False)
+        try:
+            lock.acquire()
+        except Timeout:
+            raise HTTPException(409, 'Another dashboard operation is running')
+        try:
+            journal.begin(job_id, operation, mode, 'web', repository or None, targets, state='queued')
+            cli = [sys.executable, '-u', str(Path(__file__).resolve()), '--config', str(config), *arguments]
+            threading.Thread(target=execute, args=(job_id, cli, lock), daemon=True).start()
+        except Exception:
+            lock.release()
+            raise
+        return {'id': job_id, 'state': 'queued', 'mode': mode}
+
+    def require_action(request):
+        auth(request, csrf=True)
+        if not allow_actions:
+            raise HTTPException(403, 'Start the dashboard with --allow-actions')
+
+    def selected(data, *, local=False):
+        targets = data.get('destinations', [])
+        if (not isinstance(targets, list) or len(targets) > len(settings['destinations'])
+                or any(not isinstance(v, str) or v not in settings['destinations'] for v in targets)
+                or (local and (len(targets) != 1 or settings['destinations'][targets[0]]['provider'] != 'local'))):
+            raise HTTPException(400, 'Select configured destinations')
+        return list(dict.fromkeys(targets))
+
+    def repo_name(data):
+        repo = data.get('repo', '')
+        if not isinstance(repo, str) or (repo and not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', repo)):
+            raise HTTPException(400, 'Invalid repository name or ID')
+        return repo
+
+    def backup_args(data, targets):
+        repository = repo_name(data)
+        generation = data.get('generation', 'current')
+        if not repository or not isinstance(generation, str) or (
+                generation != 'current' and not BACKUP_GENERATION.fullmatch(generation + '.git')):
+            raise HTTPException(400, 'Choose a repository and backup generation')
+        return repository, generation, ['--generation', generation, '--destination', targets[0], '--monitor']
+
+    @app.post('/api/sync')
+    async def start_sync(request: _GitMirrorWebRequest):
+        require_action(request)
+        data = await body(request)
+        if type(data.get('apply')) is not bool:
+            raise HTTPException(400, 'An explicit sync mode is required')
+        repository, targets = repo_name(data), selected(data)
+        applied = data['apply']
+        required = 'SYNC' if repository else 'SYNC ALL'
+        if applied and data.get('confirmation') != required:
+            raise HTTPException(400, f'Type {required} to confirm this applied sync')
+        mode = 'apply' if applied else 'dry-run'
+        args = ['sync', '--monitor', f'--{mode}']
+        if repository:
+            args.append(f'--only={repository}')
+        for target in targets:
+            args.extend(('--destination', target))
+        return await asyncio.to_thread(start, 'sync', mode, repository, targets, args)
+
+    @app.post('/api/backups/verify')
+    async def verify(request: _GitMirrorWebRequest):
+        require_action(request)
+        data = await body(request)
+        targets = selected(data, local=True)
+        repository, _, options = backup_args(data, targets)
+        args = ['verify-backup', f'--only={repository}', *options]
+        return await asyncio.to_thread(start, 'verify', 'verify', repository, targets, args)
+
+    @app.post('/api/backups/restore')
+    async def restore(request: _GitMirrorWebRequest):
+        require_action(request)
+        if restore_dir is None:
+            raise HTTPException(403, 'Configure a restore directory on the server')
+        data = await body(request)
+        targets = selected(data, local=True)
+        repository, _, options = backup_args(data, targets)
+        name, archive = data.get('output'), data.get('include_archive', False)
+        if data.get('confirmation') != 'RESTORE':
+            raise HTTPException(400, 'Type RESTORE to confirm')
+        if (not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', name)
+                or name.endswith('.') or type(archive) is not bool
+                or re.fullmatch(r'CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]', name.split('.')[0], re.I)):
+            raise HTTPException(400, 'Use a new directory name without a path')
+        output = restore_dir / name
+        if output.exists() or output.is_symlink() or output.resolve().parent != restore_dir:
+            raise HTTPException(409, 'Restore output must be a new directory')
+        args = ['restore', f'--repo={repository}', f'--output={output}', *options]
+        if archive:
+            args.append('--include-archive')
+        return await asyncio.to_thread(start, 'restore', 'restore', repository, targets, args)
+
+    return app
+
+
+def backup_health(volumes):
+    last = {}
+    counts = {'verified': 0, 'unverified': 0, 'failed': 0}
+    for volume in volumes:
+        if volume['error']:
+            counts['failed'] += 1
+            continue
+        for repository in volume['repositories']:
+            if repository['error']:
+                counts['failed'] += 1
+            for generation in repository['generations']:
+                if generation['current']:
+                    counts[generation['integrity']] += 1
+                if generation['integrity'] == 'verified' and generation['created']:
+                    identifier = repository['id']
+                    last[identifier] = max(last.get(identifier, 0), generation['created'])
+    used = [volume['used'] for volume in volumes if volume['used'] is not None and not volume['error']]
+    counts['logical_bytes'] = sum(used) if used else None
+    counts['available_volumes'] = len(used)
+    counts['configured_volumes'] = len(volumes)
+    return last, counts
+
+
+def urlsplit_origin(value):
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username
+                or parsed.password or parsed.path or parsed.query or parsed.fragment
+                or not re.fullmatch(r'(?:\[[a-fA-F0-9:]+\]|[A-Za-z0-9.-]+)(?::[0-9]{1,5})?', parsed.netloc)
+                or parsed.port == 0):
+            return None
+        return parsed
+    except ValueError:
+        return None
+
+
+def serve_web(config_file, *, host='127.0.0.1', port=8787, password_file=None, allow_lan=False,
+              allowed_hosts=None, allow_actions=False, restore_dir=None, tls_cert=None, tls_key=None,
+              public_origin=None, allow_insecure_http=False):
+    """Keep the dashboard optional and leave scheduling to the CLI."""
+    loopback = host in ('127.0.0.1', '::1', 'localhost')
+    if not loopback and not allow_lan:
+        raise SyncError('Non-loopback binding requires --allow-lan')
+    if not loopback and not (tls_cert or public_origin or allow_insecure_http):
+        raise SyncError('Non-loopback binding requires TLS or explicit --allow-insecure-http')
+    if bool(tls_cert) != bool(tls_key) or not 1 <= port <= 65535:
+        raise SyncError('Provide both TLS files and a valid port')
+    if not password_file:
+        raise SyncError('Set --password-file to a private file with a strong dashboard password')
+    path = Path(password_file).expanduser()
+    try:
+        info = path.stat()
+        if not path.is_file() or info.st_size > 8192 or (os.name != 'nt' and info.st_mode & 0o077):
+            raise SyncError('Web password file must be a small regular file restricted to its owner (chmod 600)')
+        password = path.read_text(encoding='utf-8').rstrip('\r\n')
+    except (OSError, UnicodeError) as exc:
+        raise SyncError('Cannot read dashboard password file') from exc
+    settings = load_config(config_file)
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise SyncError('Install web dependencies: pip install "gitmirror-resilient[web]"') from exc
+    app = create_web_app(settings, Path(config_file).expanduser().resolve(), password=password,
+                         allow_actions=allow_actions, allowed_hosts=allowed_hosts, restore_dir=restore_dir,
+                         public_origin=public_origin)
+    print(f'GitMirror dashboard listening on {"https" if tls_cert else "http"}:{port} (actions '
+          f'{"enabled" if allow_actions else "disabled"})')
+    uvicorn.run(app, host=host, port=port, log_level='warning', proxy_headers=False,
+                access_log=False, ssl_certfile=tls_cert, ssl_keyfile=tls_key, timeout_keep_alive=5)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='gitmirror', description='Resilient Git mirroring')
     parser.add_argument('--version', action='version', version=__version__)
     parser.add_argument('--config', default='config.yml', help='Path to YAML config')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', help='Validate YAML without connecting to providers')
+    web = sub.add_parser('web', help='Start the optional self-hosted dashboard')
+    web.add_argument('--host', default='127.0.0.1', help='Bind address (default: localhost)')
+    web.add_argument('--port', type=int, default=8787)
+    web.add_argument('--allow-lan', action='store_true', help='Allow a non-loopback bind address')
+    web.add_argument('--allowed-host', action='append', help='Hostname or LAN IP permitted in Host header')
+    web.add_argument('--password-file', required=False, help='Restricted file containing the dashboard password')
+    web.add_argument('--allow-actions', action='store_true', help='Enable dashboard operations')
+    web.add_argument('--restore-dir', help='Allow restoration under this existing directory')
+    web.add_argument('--tls-cert', help='PEM TLS certificate')
+    web.add_argument('--tls-key', help='PEM TLS private key')
+    web.add_argument('--public-origin', help='HTTPS origin when serving behind a reverse proxy')
+    web.add_argument('--allow-insecure-http', action='store_true', help='Allow explicit non-loopback HTTP')
+
     initialization = sub.add_parser('init-backup', help='Initialize a configured local backup volume')
     add_destination_selector(initialization)
     verification = sub.add_parser('verify-backup', help='Verify local backups and archives offline')
     verification.add_argument('--only', help='Verify the backup for one repository name')
+    verification.add_argument('--generation', help='Verify a specific generation; requires --only')
+    verification.add_argument('--monitor', action='store_true', help='Record the operation in dashboard activity')
     add_destination_selector(verification)
     recovery = sub.add_parser('restore', help='List or restore a verified generation offline')
     recovery.add_argument('--list', action='store_true', help='List available generations')
@@ -2032,6 +2986,7 @@ def main(argv=None):
     recovery.add_argument('--generation', default='current', help='Generation from the listing, or current')
     recovery.add_argument('--include-archive', action='store_true', help='Restore archived refs and their LFS data')
     recovery.add_argument('--output', help='New output directory for the restored bare repository')
+    recovery.add_argument('--monitor', action='store_true', help='Record the operation in dashboard activity')
     add_destination_selector(recovery)
     cleanup = sub.add_parser('cleanup', help='Preview or apply configured local backup retention')
     cleanup_mode = cleanup.add_mutually_exclusive_group()
@@ -2049,6 +3004,7 @@ def main(argv=None):
         mode.add_argument('--apply', action='store_true', help='Make changes (default: dry-run)')
         mode.add_argument('--dry-run', action='store_true', help='Plan changes without writing')
         command.add_argument('--only', help='Only one repository')
+        command.add_argument('--monitor', action='store_true', help='Record dry-runs in dashboard activity')
         add_destination_selector(command, providers=True)
         command.add_argument('--verify-lfs', action='store_true', help='Recheck all archived and mirrored LFS objects (requires --apply)')
     args = parser.parse_args(argv)
@@ -2058,7 +3014,15 @@ def main(argv=None):
         parser.error('restore requires --repo and --output, or --list')
     if args.command == 'restore' and args.list and args.output:
         parser.error('--list cannot be combined with --output')
+    if args.command == 'verify-backup' and args.generation and not args.only:
+        parser.error('--generation requires --only')
     try:
+        if args.command == 'web':
+            return serve_web(args.config, host=args.host, port=args.port,
+                             password_file=args.password_file, allow_lan=args.allow_lan,
+                             allowed_hosts=args.allowed_host, allow_actions=args.allow_actions,
+                             restore_dir=args.restore_dir, tls_cert=args.tls_cert, tls_key=args.tls_key,
+                             public_origin=args.public_origin, allow_insecure_http=args.allow_insecure_http)
         if args.command == 'doctor':
             return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform,
                           identifiers=args.destination)
@@ -2072,32 +3036,47 @@ def main(argv=None):
             configure_runtime(cfg, apply=False)
             SSH_ENV['GIT_ALLOW_PROTOCOL'] = 'file'
             SSH_ENV['GIT_NO_LAZY_FETCH'] = '1'
-            if args.command == 'verify-backup':
-                return verify_local_backups(cfg, args.only, args.destination)
             if args.command == 'cleanup':
                 return cleanup_backups(cfg, args.destination, apply=args.apply)
-            if args.list:
+            if args.command == 'restore' and args.list:
                 return select_restore_backup(cfg, args.destination, args.repo, args.generation, listing=True)
-            return restore_backup(cfg, args.destination, args.repo, args.generation, args.output, args.include_archive)
-        def execute():
+            origin = 'cron' if os.getenv('GITMIRROR_TRIGGER') == 'cron' else 'cli'
+            if args.command == 'verify-backup':
+                def verify(activity):
+                    if args.generation:
+                        return verify_backup_selection(cfg, args.destination, args.only, args.generation, activity=activity)
+                    return verify_local_backups(cfg, args.only, args.destination, activity=activity)
+                return observe_dashboard_operation(cfg, 'verify', 'verify', origin, args.only, args.destination,
+                                                  verify, enabled=args.monitor)
+            def recover(activity):
+                return restore_backup(cfg, args.destination, args.repo, args.generation, args.output,
+                                      args.include_archive, activity=activity)
+            return observe_dashboard_operation(cfg, 'restore', 'restore', origin, args.repo, args.destination,
+                                              recover, enabled=True)
+        def execute(activity):
             if not args.apply:
-                return run(cfg, only=args.only, platform=args.platform, identifiers=args.destination)
+                return run(cfg, only=args.only, platform=args.platform, identifiers=args.destination, activity=activity)
             data = cfg['storage']['path']
             data.mkdir(parents=True, exist_ok=True)
             lock = FileLock(str(data / '.gitmirror.lock'), timeout=0)
             try:
                 with lock:
                     return run(cfg, apply=True, only=args.only, platform=args.platform, full_lfs=args.verify_lfs,
-                               identifiers=args.destination)
+                               identifiers=args.destination, activity=activity)
             except Timeout:
                 print('Another GitMirror process is running; no changes made.', file=sys.stderr)
                 return 2
-        if args.command == 'sync':
-            return execute()
+        origin = ('scheduled' if args.command == 'run'
+                  else 'cron' if os.getenv('GITMIRROR_TRIGGER') == 'cron' else 'cli')
+        monitored = args.apply or args.monitor
+        mode = 'apply' if args.apply else 'dry-run'
         while True:
-            result = execute()
+            result = observe_dashboard_operation(cfg, 'sync', mode, origin, args.only,
+                                                 args.destination, execute, enabled=monitored)
+            if args.command == 'sync' or result == 130:
+                return result
             print(f'Sync cycle finished with status {result}', flush=True)
-            time.sleep(cfg['schedule']['interval_hours'] * 3600)
+            wait_for_dashboard_schedule(cfg, cfg['schedule']['interval_hours'] * 3600, monitored=monitored)
     except (ConfigError, SyncError, OSError, Timeout) as exc:
         print(f'GitMirror: {exc}', file=sys.stderr)
         return 2

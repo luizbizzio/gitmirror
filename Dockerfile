@@ -6,10 +6,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE NOTICE.txt ./
 COPY gitmirror.py ./
-RUN pip install --no-cache-dir . \
+COPY web/ ./web/
+RUN pip install --no-cache-dir ".[web]" \
  && useradd --create-home --uid 10001 gitmirror \
- && mkdir -p /data /config \
- && chown -R gitmirror:gitmirror /data /config
+ && mkdir -p /data /config /restores \
+ && chown -R gitmirror:gitmirror /data /config /restores
 USER gitmirror
 ENV HOME=/home/gitmirror PYTHONUNBUFFERED=1
 VOLUME ["/data"]

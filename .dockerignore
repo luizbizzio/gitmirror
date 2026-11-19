@@ -12,3 +12,5 @@ __pycache__/
 gitmirror-data/
 dist/
 build/
+
+docker/web-password

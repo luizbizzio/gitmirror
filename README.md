@@ -133,6 +133,95 @@ gitmirror --config config.yml run --apply
 
 `run` starts a sync at once, then runs again after the configured number of hours. For Linux, an external cron job is also possible. Do not run the internal scheduler and cron for the same data directory at the same time.
 
+## Optional self-hosted web dashboard
+
+The dashboard is optional. The CLI works without FastAPI and Uvicorn. The dashboard
+shows source inventory, applied sync outcomes, the next observed scheduler cycle,
+work and backup storage, and integrity per backup generation. An available volume
+can contain unverified backups. Verification reports the last observed check; use
+Verify to recheck the selected generation. The repository view filters by name,
+visibility and last observed status, with details per destination.
+
+The dashboard and CLI share an activity journal under `storage.path/web-dashboard`.
+After the dashboard initializes it, applied CLI syncs, scheduler cycles and web
+operations appear in Activity. For traditional cron, set `GITMIRROR_TRIGGER=cron`
+on the existing invocation to identify the scheduler. The indicated next time
+comes from a running `gitmirror run` scheduler. An external cron installation
+does not report its next time.
+
+An ordinary CLI dry-run remains read-only. Add `--monitor` to a dry-run or to
+`verify-backup` to record that operation in an existing journal. Web actions
+automatically record their results. Recent activity and redacted logs survive
+restarts. The API returns the latest 100 operations and up to 64 KiB of output
+per run. Restrict access to the journal directory. Older, unredacted dashboard
+logs from the preview stay on disk and are unavailable through the web API.
+
+### Install and run locally
+
+```sh
+python -m pip install -e ".[web]"
+mkdir -p ~/.config/gitmirror
+umask 077
+printf '%s\n' 'replace-with-a-strong-unique-password' > ~/.config/gitmirror/web-password
+chmod 600 ~/.config/gitmirror/web-password
+gitmirror --config config.yml web --password-file ~/.config/gitmirror/web-password
+```
+
+Open **http://127.0.0.1:8787** on the same machine.
+
+Start with `--allow-actions` to enable dry-run, applied sync and verification.
+Applied sync requires typing `SYNC` for one repository or `SYNC ALL` for every
+selected repository. The dashboard launches the existing CLI with its normal
+synchronization lock. Web-initiated operations leave historical backups in place.
+To enable restores, give the server `--restore-dir` pointing to an existing
+directory outside the backup roots. Pick a generation, enter a new directory name
+and type `RESTORE`. The CLI verifies the restored repository before publishing it
+and refuses existing paths. Settings shows the active YAML configuration with
+credentials omitted. Restart the service after validating a YAML change.
+
+On a remote Raspberry Pi, prefer an SSH tunnel to expose the loopback service to your computer:
+
+```sh
+ssh -L 8787:127.0.0.1:8787 rpi5@YOUR_PI_IP
+```
+
+Then browse to `http://127.0.0.1:8787` on your computer.
+
+For direct LAN access, give a non-loopback listener explicit permission and an
+HTTPS certificate trusted by your clients. Allow the hostnames and IPs you actually use.
+
+```sh
+gitmirror --config config.yml web --host 0.0.0.0 --allow-lan \
+  --allowed-host rpi5.local --tls-cert server.crt --tls-key server.key \
+  --password-file ~/.config/gitmirror/web-password
+```
+
+Behind a local HTTPS reverse proxy, pass `--public-origin https://rpi5.local`
+and `--allowed-host rpi5.local`. Preserve the Host header and keep the upstream
+HTTP listener reachable only by the proxy. Sessions expire after 12 hours or on
+server restart and are invalidated at sign-out. HTTPS sets the Secure cookie
+attribute. The server also checks the Host, request Origin and CSRF token and
+limits login attempts. Use a dedicated service account and protect credential and
+backup files with OS permissions.
+
+### Optional Docker Compose service
+
+The main `gitmirror` service remains unchanged. The opt-in `gitmirror-web` service uses the same persistent data volume and is bound to the Docker host's loopback address:
+
+```sh
+# Create a strong secret; on Linux it must be readable by container UID 10001.
+umask 077
+printf '%s\n' 'replace-with-a-strong-unique-password' > docker/web-password
+sudo chown 10001:10001 docker/web-password
+chmod 600 docker/web-password
+docker compose --profile web up -d gitmirror-web
+```
+
+Open `http://127.0.0.1:8787` on the Docker host or forward the port through SSH.
+The service allows HTTP on the container network and publishes the port to host
+loopback only. Leave the container on a trusted network. The Compose example
+starts with actions disabled and gives optional restores their own named volume.
+
 ## Docker
 
 Copy `docker/config.example.yml` for remote destinations or
