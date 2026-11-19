@@ -142,6 +142,16 @@ can contain unverified backups. Verification reports the last observed check; us
 Verify to recheck the selected generation. The repository view filters by name,
 visibility and last observed status, with details per destination.
 
+### Guided Linux installation
+
+The managed installer and browser setup are documented in the [installation and
+maintenance guide](INSTALL.md). It describes the pending release command, verified
+release artifacts, localhost and LAN HTTPS, staged migration, upgrades, rollback
+and uninstall. Package and systemd support target Debian 12+ and Raspberry Pi OS
+ARM64. Use the standalone installation below for Windows or Docker.
+
+### Activity and monitoring
+
 The dashboard and CLI share an activity journal under `storage.path/web-dashboard`.
 After the dashboard initializes it, applied CLI syncs, scheduler cycles and web
 operations appear in Activity. For traditional cron, set `GITMIRROR_TRIGGER=cron`
@@ -156,7 +166,7 @@ restarts. The API returns the latest 100 operations and up to 64 KiB of output
 per run. Restrict access to the journal directory. Older, unredacted dashboard
 logs from the preview stay on disk and are unavailable through the web API.
 
-### Install and run locally
+### Install the optional dashboard with Python
 
 ```sh
 python -m pip install -e ".[web]"

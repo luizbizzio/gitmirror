@@ -10,6 +10,12 @@
 </head>
 <body>
   <noscript>Enable JavaScript to use the GitMirror dashboard.</noscript>
+  <main id="setup" class="setup-screen" hidden>
+    <div class="setup-title"><span class="brand-mark" aria-hidden="true">↟</span>
+      <h1>Set up GitMirror</h1><p>Use the one-time code from the installer to configure your account and first backup.</p>
+    </div>
+    <div id="setup-editor"></div>
+  </main>
   <main id="login" class="login" hidden>
     <form id="login-form" class="panel login-card">
       <span class="brand-mark" aria-hidden="true">↟</span>
@@ -104,7 +110,16 @@
           </article>
         </section>
         <section id="view-settings" hidden>
-          <article class="panel"><header><h2>Configuration</h2></header><div id="settings"></div></article>
+          <article class="panel">
+            <header><h2>Configuration</h2><button id="edit-configuration" class="button secondary" hidden>Edit configuration</button></header>
+            <div id="settings"></div>
+            <form id="check-connections" class="action-form" hidden>
+              <label>Sample repository<input id="check-repository" placeholder="First accessible repository" maxlength="100"></label>
+              <label class="check"><input id="check-ssh" type="checkbox" checked>Include SSH read access</label>
+              <div class="form-footer"><p>Checks provider identity and Git read access. It leaves repositories unchanged.</p><button class="button secondary" type="submit">Verify connections</button></div>
+            </form>
+          </article>
+          <div id="settings-editor"></div>
         </section>
       </div>
     </main>
@@ -125,5 +140,53 @@
       <button class="button primary">Restore</button>
     </form>
   </dialog>
+  <template id="configuration-template">
+    <form class="configuration">
+      <article class="panel admin-settings">
+        <header><h2>Administrator</h2></header>
+        <div class="action-form">
+          <label class="setup-code">One-time setup code<input name="code" autocomplete="one-time-code" maxlength="128"></label>
+          <label class="current-password">Current password <input name="current_password" type="password" autocomplete="current-password"></label>
+          <label>New password<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024"></label>
+        </div>
+      </article>
+      <article class="panel"><header><h2>Source</h2></header><div class="source-fields"></div></article>
+      <article class="panel">
+        <header><h2>Destinations</h2><button type="button" class="button secondary add-target">Add destination</button></header>
+        <div class="target-fields"></div>
+      </article>
+      <article class="panel">
+        <header><h2>SSH keys</h2></header>
+        <p>Add this public key to the source and each remote destination account. Give it write access only where GitMirror pushes.</p>
+        <pre data-public-key></pre>
+        <div class="action-form">
+          <label>SSH hostname<input name="ssh_host" placeholder="codeberg.org" autocomplete="off"></label>
+          <label>Port<input name="ssh_port" type="number" min="1" max="65535" value="22"></label>
+          <label>Published SHA256 fingerprint<input name="ssh_fingerprint" placeholder="SHA256:…" autocomplete="off"></label>
+          <div><button type="button" class="button secondary verify-host">Verify and add host</button></div>
+        </div>
+        <p data-host-status role="status"></p>
+        <label>Verified SSH host keys
+          <textarea name="known_hosts" rows="4" required maxlength="24576" placeholder="hostname ssh-ed25519 public-host-key"></textarea>
+        </label>
+        <p>Use the host fingerprint or public host key published by your provider or instance administrator.
+          <a href="https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints" rel="noreferrer" target="_blank">GitHub</a> ·
+          <a href="https://docs.gitlab.com/user/gitlab_com/#ssh-host-keys-fingerprints" rel="noreferrer" target="_blank">GitLab</a> ·
+          <a href="https://docs.codeberg.org/security/ssh-fingerprint/" rel="noreferrer" target="_blank">Codeberg</a>
+        </p>
+      </article>
+      <article class="panel">
+        <header><h2>Repositories and schedule</h2></header>
+        <label>Repository names, one per line<textarea name="repositories" rows="3" placeholder="Leave empty to include all owned repositories"></textarea></label>
+        <div class="action-form">
+          <label>Interval in hours<input name="hours" type="number" min="0.1" max="720" step="any" value="12" required></label>
+          <label class="check"><input name="enabled" type="checkbox">Start scheduled applied synchronizations</label>
+        </div>
+        <p data-schedule-note>Enabling the schedule starts synchronization after setup is saved.</p>
+      </article>
+      <div class="form-footer"><p data-config-error class="error" role="alert"></p>
+        <button type="submit" class="button primary">Save configuration</button></div>
+    </form>
+  </template>
 </body>
 </html>

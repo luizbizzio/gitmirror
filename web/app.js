@@ -106,6 +106,7 @@ function stat(label, value, note) {
 }
 
 function runName(run) {
+  if (run.operation === "doctor") return "Verify connections";
   if (run.operation !== "sync") return run.operation === "restore" ? "Restore" : "Verify backup";
   return run.mode === "apply" ? "Synchronization" : "Dry-run";
 }
@@ -153,13 +154,16 @@ function renderDestinations(data) {
 }
 
 function renderSettings(data) {
+  $("#edit-configuration").hidden = !data.web.managed;
+  $("#check-connections").hidden = !data.web.managed;
+  $("#check-connections button").disabled = busy;
   $("#settings").innerHTML = list([["Source", `${data.source.provider} / ${data.source.owner}`],
     ["Source API", data.source.api_url], ["Schedule interval", `${data.schedule_hours} hours`],
     ["Next observed run", date(data.next_run, "Unavailable")], ["Working path", data.storage.path],
-    ["Web actions", data.web.allow_actions ? "Enabled" : "Read-only"],
+    ["Web actions", data.web.writes_paused ? "Applied sync paused" : data.web.allow_actions ? "Enabled" : "Read-only"],
     ["Web restores", data.web.restore_enabled ? "Enabled" : "Disabled"],
     ["Access", data.web.secure ? "HTTPS secure session" : "HTTP local session"]])
-    + empty("This dashboard reads the server’s configuration. Changes take effect after a dashboard restart.");
+    + (data.web.managed ? "" : empty("This dashboard reads the server’s configuration. Changes take effect after a dashboard restart."));
 }
 
 function renderSyncTargets() {
@@ -407,4 +411,183 @@ $("#restore-form").addEventListener("submit", async (event) => {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh().catch(report);
 });
-boot().catch(signOut);
+
+function providerInput(spec = {}, destination = false) {
+  const fieldset = document.createElement("fieldset");
+  const choices = destination ? ["github", "gitlab", "codeberg", "local"] : ["github", "gitlab", "codeberg"];
+  fieldset.innerHTML = `
+    ${destination ? '<div class="target-head"><button type="button" class="link remove-target">Remove</button></div>' : ""}
+    <div class="action-form">
+      ${destination ? '<label>Destination ID<input name="id" pattern="[a-z][a-z0-9_\\-]{0,62}" maxlength="63" required></label>' : ""}
+      <label>Provider<select name="provider">${choices.map((p) => `<option>${p}</option>`).join("")}</select></label>
+    </div>
+    <div class="action-form remote-section">
+      <label>Account<input name="owner" maxlength="100" autocomplete="off"></label>
+      <label>API URL (optional)<input name="api_url" type="url" autocomplete="off" placeholder="Provider default"></label>
+      <label>API token<input name="token" type="password" autocomplete="new-password" maxlength="4096"></label>
+    </div>
+    <div class="action-form local-section">
+      <label>Backup directory<input name="path" placeholder="Use managed backup directory"></label>
+      <label>Minimum generations to keep<input name="keep" type="number" min="1" step="1" placeholder="Keep all"></label>
+      <label>Minimum age in days<input name="days" type="number" min="1" step="1" placeholder="Optional"></label>
+      <label class="check"><input name="automatic" type="checkbox">Apply retention on scheduled syncs</label>
+    </div>`;
+  const control = (name) => fieldset.querySelector(`[name="${name}"]`);
+  control("provider").value = spec.provider ?? (destination ? "local" : "github");
+  for (const key of ["id", "owner", "api_url", "path"]) {
+    if (control(key)) control(key).value = spec[key] ?? "";
+  }
+  if (spec.retention) {
+    control("keep").value = spec.retention.keep ?? "";
+    control("days").value = spec.retention.days ?? "";
+    control("automatic").checked = spec.retention.automatic;
+  }
+  function syncFields() {
+    const local = control("provider").value === "local";
+    const localFields = fieldset.querySelector(".local-section");
+    const remoteFields = fieldset.querySelector(".remote-section");
+    localFields.hidden = !local;
+    remoteFields.hidden = local;
+    for (const input of localFields.querySelectorAll("input")) input.disabled = !local;
+    for (const input of remoteFields.querySelectorAll("input")) input.disabled = local;
+    control("owner").required = !local;
+    control("keep").required = local && (control("days").value !== "" || control("automatic").checked);
+  }
+  fieldset.addEventListener("input", syncFields);
+  fieldset.addEventListener("change", syncFields);
+  fieldset.querySelector(".remove-target")?.addEventListener("click", () => fieldset.remove());
+  syncFields();
+  return fieldset;
+}
+
+function readProvider(fieldset) {
+  const control = (name) => fieldset.querySelector(`[name="${name}"]`);
+  const clean = {provider: control("provider").value};
+  if (control("id")) clean.id = control("id").value.trim();
+  if (clean.provider === "local") {
+    clean.path = control("path").value.trim() || null;
+    if (control("keep").value) {
+      clean.retention = {keep: Number(control("keep").value), days: Number(control("days").value) || null,
+        automatic: control("automatic").checked};
+    }
+  } else {
+    clean.owner = control("owner").value.trim();
+    clean.api_url = control("api_url").value.trim() || null;
+    clean.token = control("token").value.trim();
+  }
+  return clean;
+}
+
+async function waitForConfiguration(revision) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      const response = await fetch("/api/setup", {credentials: "same-origin"});
+      if (response.ok && (await response.json()).revision === revision) return;
+    } catch {
+      // The listener briefly restarts when a new validated configuration is published.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  throw new Error("Configuration was saved. Reload this page when the server is available.");
+}
+
+function openConfiguration(initial, data) {
+  const wrapper = initial ? $("#setup-editor") : $("#settings-editor");
+  wrapper.replaceChildren($("#configuration-template").content.cloneNode(true));
+  const form = wrapper.querySelector("form");
+  form.querySelector(".setup-code").hidden = !initial;
+  form.querySelector(".current-password").hidden = initial;
+  form.elements.code.required = initial;
+  form.elements.password.required = initial;
+  form.elements.hours.value = data.schedule?.interval_hours ?? 12;
+  form.elements.enabled.checked = data.schedule?.enabled ?? false;
+  form.elements.enabled.disabled = Boolean(data.migration_pending);
+  if (data.migration_pending) {
+    form.elements.enabled.checked = false;
+    form.querySelector("[data-schedule-note]").textContent = "Complete the legacy cutover before enabling the schedule.";
+  }
+  form.elements.repositories.value = (data.repositories ?? []).join("\n");
+  form.elements.known_hosts.value = data.known_hosts ?? "";
+  form.querySelector("[data-public-key]").textContent = data.public_key;
+  form.querySelector(".source-fields").append(providerInput(data.source));
+  const destinations = form.querySelector(".target-fields");
+  const addTarget = (dest) => destinations.append(providerInput(dest, true));
+  for (const dest of data.destinations ?? [{id: "local", provider: "local"}]) addTarget(dest);
+  form.querySelector(".add-target").addEventListener("click", () => addTarget({}));
+  form.querySelector(".verify-host").addEventListener("click", async (event) => {
+    const trigger = event.currentTarget;
+    const feedback = form.querySelector("[data-host-status]");
+    trigger.disabled = true;
+    try {
+      const result = await post("/api/managed/ssh-host", {code: form.elements.code.value.trim(),
+        host: form.elements.ssh_host.value.trim(), port: Number(form.elements.ssh_port.value),
+        fingerprint: form.elements.ssh_fingerprint.value.trim()});
+      const entries = form.elements.known_hosts.value.split("\n").map((line) => line.trim()).filter(Boolean);
+      form.elements.known_hosts.value = [...new Set([...entries, result.known_host])].join("\n");
+      feedback.textContent = "Host key verified and added.";
+    } catch (failure) { feedback.textContent = failure.message; }
+    finally { trigger.disabled = false; }
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = form.querySelector("button[type=submit]");
+    const error = form.querySelector("[data-config-error]");
+    submit.disabled = true;
+    error.textContent = "";
+    const configuration = {
+      code: form.elements.code.value.trim(),
+      password: form.elements.password.value,
+      current_password: form.elements.current_password.value,
+      revision: data.revision,
+      source: readProvider(form.querySelector(".source-fields fieldset")),
+      destinations: [...destinations.querySelectorAll("fieldset")].map(readProvider),
+      known_hosts: form.elements.known_hosts.value,
+      repositories: form.elements.repositories.value.split("\n").map((name) => name.trim()).filter(Boolean),
+      schedule: {enabled: form.elements.enabled.checked, interval_hours: Number(form.elements.hours.value)},
+    };
+    try {
+      const saved = await post(initial ? "/api/setup" : "/api/managed/settings", configuration);
+      error.textContent = "Saved. Reloading the dashboard…";
+      stream?.close();
+      await waitForConfiguration(saved.revision);
+      wrapper.replaceChildren();
+      $("#setup").hidden = true;
+      // The managed service reloads its validated configuration after sending the response.
+      signOut();
+      $("#login-error").textContent = "Configuration saved. Sign in with the admin password.";
+    } catch (failure) {
+      error.textContent = failure.message;
+      submit.disabled = false;
+    }
+  });
+  wrapper.scrollIntoView({block: "start"});
+}
+
+async function startDashboard() {
+  const response = await fetch("/api/setup", {credentials: "same-origin"});
+  if (response.ok) {
+    const data = await response.json();
+    if (data.required) {
+      $("#setup").hidden = false;
+      openConfiguration(true, data);
+      return;
+    }
+  }
+  await boot();
+}
+
+$("#edit-configuration").addEventListener("click", () => api("/api/managed/settings")
+  .then((data) => openConfiguration(false, data)).catch(report));
+$("#check-connections").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const trigger = event.currentTarget.querySelector("button");
+  trigger.disabled = true;
+  try {
+    const job = await post("/api/managed/check", {repo: $("#check-repository").value.trim(), ssh: $("#check-ssh").checked});
+    await afterStart(job);
+  } catch (failure) {
+    report(failure);
+    trigger.disabled = false;
+  }
+});
+startDashboard().catch(signOut);
