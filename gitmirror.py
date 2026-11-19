@@ -2015,12 +2015,410 @@ def add_destination_selector(parser, *, providers=False):
     if providers:
         selection.add_argument('--platform', choices=['all', 'both', *PROVIDER_APIS, 'local'], default='all')
 
+
+# Optional self-hosted web dashboard. The sync engine stays in this one Python file.
+def create_web_app(settings, config_file, *, password, allow_actions=False,
+                   assets_dir=None, allowed_hosts=None):
+    """Build an authenticated, local-first dashboard without a second sync engine."""
+    try:
+        from fastapi import FastAPI, HTTPException, Request
+        from fastapi.responses import FileResponse, StreamingResponse
+    except ImportError as exc:
+        raise SyncError('Web dashboard requires: pip install "gitmirror-resilient[web]"') from exc
+    import asyncio
+    import base64
+    from contextlib import closing
+    import hmac
+    import secrets
+    import sqlite3
+    import threading
+
+    # FastAPI resolves postponed endpoint annotations against module globals.
+    globals()['_GitMirrorWebRequest'] = Request
+    root = Path(assets_dir) if assets_dir else Path(__file__).resolve().parent / 'web'
+    if not (root / 'index.html').is_file():
+        root = Path(sys.prefix) / 'share' / 'gitmirror' / 'web'
+    if not all((root / name).is_file() for name in ('index.html', 'style.css', 'app.js')):
+        raise SyncError('Web assets are missing; install the web extra or run from the repository checkout')
+    if not isinstance(password, str) or len(password) < 12:
+        raise SyncError('Web password must contain at least 12 characters')
+
+    state_dir = settings['storage']['path'] / 'web-dashboard'
+    logs_dir = state_dir / 'logs'
+    logs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != 'nt':
+        os.chmod(state_dir, 0o700)
+        os.chmod(logs_dir, 0o700)
+    database = state_dir / 'runs.sqlite3'
+    secret = secrets.token_bytes(32)
+    password_hash = hashlib.sha256(password.encode('utf-8')).digest()
+    active_lock = threading.Lock()
+    active = {'id': None}
+    attempts_lock = threading.Lock()
+    attempts = {}
+    repo_cache = {'at': 0, 'rows': None}
+    repo_cache_lock = threading.Lock()
+    allowed = {'localhost', '127.0.0.1', '::1'}
+    allowed.update(str(name).casefold() for name in (allowed_hosts or ()))
+    app = FastAPI(title='GitMirror Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
+
+    def connection():
+        db = sqlite3.connect(database, timeout=10)
+        db.row_factory = sqlite3.Row
+        return db
+
+    with closing(connection()) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, started REAL NOT NULL, '
+                   'ended REAL, mode TEXT NOT NULL, repository TEXT, destinations TEXT NOT NULL, '
+                   'state TEXT NOT NULL, exit_code INTEGER, error TEXT)')
+        db.execute("UPDATE runs SET state='interrupted', ended=? WHERE state='running'",
+                   (time.time(),))
+        db.commit()
+    if os.name != 'nt':
+        os.chmod(database, 0o600)
+
+    def write_db(sql, params):
+        with closing(connection()) as db:
+            db.execute(sql, params)
+            db.commit()
+
+    def read_db(sql, params=()):
+        with closing(connection()) as db:
+            return [dict(row) for row in db.execute(sql, params).fetchall()]
+
+    def rows():
+        output = read_db('SELECT * FROM runs ORDER BY started DESC LIMIT 40')
+        for record in output:
+            record['destinations'] = json.loads(record['destinations'])
+        return output
+
+    def session(request):
+        cookie = request.cookies.get('gm_session', '')
+        try:
+            payload, signature = cookie.rsplit('.', 1)
+            expected = hmac.new(secret, payload.encode('ascii'), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, signature):
+                return None
+            raw = base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4))
+            timestamp, nonce = raw.decode('ascii').split(':', 1)
+            if not nonce or not re.fullmatch(r'[a-f0-9]{32}', nonce):
+                return None
+            age = time.time() - int(timestamp)
+            if not 0 <= age < 12 * 3600:
+                return None
+            return payload
+        except (ValueError, UnicodeError, TypeError):
+            return None
+
+    def authenticated(request):
+        value = session(request)
+        if not value:
+            raise HTTPException(status_code=401, detail='Sign in required')
+        return value
+
+    def csrf_check(request):
+        payload = authenticated(request)
+        expected = hmac.new(secret, ('csrf:' + payload).encode('ascii'), hashlib.sha256).hexdigest()
+        actual = request.headers.get('X-CSRF-Token', '')
+        if not hmac.compare_digest(expected, actual):
+            raise HTTPException(status_code=403, detail='Invalid session verification token')
+        origin = request.headers.get('origin')
+        if origin:
+            parsed = urllib.parse.urlsplit(origin)
+            if (parsed.scheme not in ('http', 'https')
+                    or parsed.netloc.casefold() != request.headers.get('host', '').casefold()):
+                raise HTTPException(status_code=403, detail='Cross-origin action blocked')
+
+    @app.middleware('http')
+    async def security(request: _GitMirrorWebRequest, call_next):
+        host = (request.url.hostname or '').casefold()
+        if host not in allowed:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({'detail': 'Unapproved dashboard hostname'}, status_code=400)
+        response = await call_next(request)
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+            "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        return response
+
+    @app.get('/')
+    async def home():
+        return FileResponse(root / 'index.html', media_type='text/html')
+
+    @app.get('/assets/{filename}')
+    async def asset(filename: str):
+        media = {'style.css': 'text/css', 'app.js': 'text/javascript'}
+        if filename not in media:
+            raise HTTPException(status_code=404, detail='Asset not found')
+        return FileResponse(root / filename, media_type=media[filename])
+
+    @app.post('/api/login')
+    async def login(request: _GitMirrorWebRequest):
+        ip = request.client.host if request.client else 'unknown'
+        now = time.monotonic()
+        with attempts_lock:
+            recent = [t for t in attempts.get(ip, ()) if now - t < 300]
+            if len(recent) >= 5:
+                raise HTTPException(status_code=429, detail='Too many attempts. Try again later.')
+            attempts[ip] = recent
+        try:
+            data = await request.json()
+        except ValueError:
+            data = {}
+        entered = data.get('password') if isinstance(data, dict) else None
+        valid = isinstance(entered, str) and hmac.compare_digest(
+            hashlib.sha256(entered.encode('utf-8')).digest(), password_hash)
+        if not valid:
+            with attempts_lock:
+                attempts[ip].append(now)
+            raise HTTPException(status_code=401, detail='Invalid password')
+        with attempts_lock:
+            attempts.pop(ip, None)
+        payload = base64.urlsafe_b64encode(
+            f'{int(time.time())}:{secrets.token_hex(16)}'.encode('ascii')).decode('ascii').rstrip('=')
+        signed = hmac.new(secret, payload.encode('ascii'), hashlib.sha256).hexdigest()
+        from fastapi.responses import JSONResponse
+        response = JSONResponse({'authenticated': True})
+        response.set_cookie('gm_session', payload + '.' + signed, httponly=True,
+                            samesite='strict', max_age=43200, path='/',
+                            secure=request.url.scheme == 'https')
+        return response
+
+    @app.get('/api/session')
+    async def get_session(request: _GitMirrorWebRequest):
+        payload = authenticated(request)
+        verification = hmac.new(secret, ('csrf:' + payload).encode('ascii'), hashlib.sha256).hexdigest()
+        return {'authenticated': True, 'csrf': verification, 'allow_actions': allow_actions}
+
+    @app.post('/api/logout')
+    async def logout(request: _GitMirrorWebRequest):
+        csrf_check(request)
+        from fastapi.responses import JSONResponse
+        response = JSONResponse({'ok': True})
+        response.delete_cookie('gm_session', path='/')
+        return response
+
+    def overview_data():
+        recent = rows()
+        with active_lock:
+            running = active['id']
+        destinations = []
+        for identifier, spec in settings['destinations'].items():
+            destinations.append({'id': identifier, 'provider': spec['provider'],
+                                 'owner': spec.get('owner'), 'path': str(spec['path']) if spec['provider'] == 'local' else None,
+                                 'api_url': spec.get('api_url')})
+        try:
+            usage = shutil.disk_usage(settings['storage']['path'])
+            free = usage.free
+        except OSError:
+            free = None
+        return {'source': {'provider': settings['source']['provider'], 'owner': settings['source']['owner']},
+                'destinations': destinations, 'schedule_hours': settings['schedule']['interval_hours'],
+                'storage': {'path': str(settings['storage']['path']), 'free': free},
+                'web': {'allow_actions': allow_actions},
+                'runs': recent, 'latest': recent[0] if recent else None,
+                'active': {'id': running} if running else None}
+
+    @app.get('/api/overview')
+    async def overview(request: _GitMirrorWebRequest):
+        authenticated(request)
+        return overview_data()
+
+    @app.get('/api/repositories')
+    async def repositories(request: _GitMirrorWebRequest):
+        authenticated(request)
+        def discover():
+            with repo_cache_lock:
+                if repo_cache['rows'] is not None and time.time() - repo_cache['at'] < 60:
+                    return repo_cache['rows']
+                provider = Provider.from_config(settings['source']).authenticate()
+                records = provider.discover()
+                result = [{'name': r['name'], 'visibility': r['visibility'],
+                           'default_branch': r['default_branch']} for r in records]
+                repo_cache.update({'rows': result, 'at': time.time()})
+                return result
+        try:
+            records = await asyncio.to_thread(discover)
+        except (SyncError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f'Cannot read source repositories: {exc}') from exc
+        return {'repositories': records}
+
+    @app.get('/api/backups')
+    async def backups(request: _GitMirrorWebRequest):
+        authenticated(request)
+        output = []
+        def check():
+            for identifier, spec in settings['destinations'].items():
+                if spec['provider'] != 'local':
+                    continue
+                item = {'id': identifier, 'path': str(spec['path']),
+                        'repositories': 0, 'generations': 0, 'free': None, 'error': None}
+                try:
+                    backup_volume(spec['path'])
+                    for directory in backup_directories(spec['path'], scope_id(settings['source'])):
+                        current = current_backup(directory)
+                        if current:
+                            item['repositories'] += 1
+                            item['generations'] += len(backup_generations(directory))
+                    item['free'] = shutil.disk_usage(spec['path']).free
+                except (SyncError, OSError) as exc:
+                    item['error'] = str(exc)
+                output.append(item)
+        await asyncio.to_thread(check)
+        return {'destinations': output}
+
+    @app.get('/api/runs/{run_id}/log')
+    async def run_log(run_id: str, request: _GitMirrorWebRequest):
+        authenticated(request)
+        if not re.fullmatch(r'[0-9a-f]{20}', run_id) or not read_db('SELECT id FROM runs WHERE id=?', (run_id,)):
+            raise HTTPException(status_code=404, detail='Unknown run')
+        filename = logs_dir / (run_id + '.log')
+        try:
+            with open(filename, 'rb') as file:
+                file.seek(0, os.SEEK_END)
+                file.seek(max(0, file.tell() - 160000))
+                content = file.read().decode('utf-8', 'replace')
+        except FileNotFoundError:
+            content = ''
+        return {'log': content}
+
+    @app.get('/api/events')
+    async def events(request: _GitMirrorWebRequest):
+        authenticated(request)
+        async def stream():
+            while not await request.is_disconnected():
+                with active_lock:
+                    run_id = active['id']
+                yield 'data: ' + json.dumps({'active': run_id, 'at': time.time()}) + '\n\n'
+                await asyncio.sleep(2.5)
+        return StreamingResponse(stream(), media_type='text/event-stream',
+                                 headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'})
+
+    def execute(job_id, command):
+        error = None
+        code = 1
+        try:
+            with (logs_dir / (job_id + '.log')).open('w', encoding='utf-8') as log:
+                if os.name != 'nt':
+                    os.chmod(logs_dir / (job_id + '.log'), 0o600)
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, encoding='utf-8', errors='replace', bufsize=1)
+                assert process.stdout is not None
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                code = process.wait()
+                error = None if code == 0 else f'GitMirror exited with code {code}'
+        except (OSError, ValueError) as exc:
+            error = f'Cannot start or monitor the CLI: {exc}'
+        finally:
+            try:
+                write_db('UPDATE runs SET ended=?, state=?, exit_code=?, error=? WHERE id=?',
+                         (time.time(), 'succeeded' if code == 0 and not error else 'failed', code, error, job_id))
+            finally:
+                with active_lock:
+                    if active['id'] == job_id:
+                        active['id'] = None
+
+    @app.post('/api/sync')
+    async def start_sync(request: _GitMirrorWebRequest):
+        csrf_check(request)
+        if not allow_actions:
+            raise HTTPException(status_code=403, detail='Start the web service with --allow-actions')
+        try:
+            data = await request.json()
+        except ValueError:
+            raise HTTPException(status_code=400, detail='Invalid JSON request')
+        if not isinstance(data, dict) or type(data.get('apply')) is not bool:
+            raise HTTPException(status_code=400, detail='An explicit sync mode is required')
+        repository = data.get('repo') or ''
+        if not isinstance(repository, str) or (repository and not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', repository)):
+            raise HTTPException(status_code=400, detail='Invalid repository name')
+        destinations = data.get('destinations', [])
+        if (not isinstance(destinations, list) or any(not isinstance(d, str) or d not in settings['destinations']
+                                                     for d in destinations) or len(destinations) > len(settings['destinations'])):
+            raise HTTPException(status_code=400, detail='Select configured destinations only')
+        destinations = list(dict.fromkeys(destinations))
+        apply = data['apply']
+        required = 'SYNC' if repository else 'SYNC ALL'
+        if apply and data.get('confirmation') != required:
+            raise HTTPException(status_code=400, detail=f'Type {required} to confirm this applied sync')
+        command = [sys.executable, str(Path(__file__).resolve()), '--config', str(config_file),
+                   'sync', '--apply' if apply else '--dry-run']
+        if repository:
+            command += ['--only', repository]
+        for destination in destinations:
+            command += ['--destination', destination]
+        job_id = secrets.token_hex(10)
+        with active_lock:
+            if active['id'] is not None:
+                raise HTTPException(status_code=409, detail='Another dashboard job is running')
+            active['id'] = job_id
+            try:
+                write_db('INSERT INTO runs (id, started, mode, repository, destinations, state) '
+                         'VALUES (?, ?, ?, ?, ?, ?)',
+                         (job_id, time.time(), 'apply' if apply else 'dry-run', repository or None,
+                          json.dumps(destinations), 'running'))
+                threading.Thread(target=execute, args=(job_id, command), daemon=True,
+                                 name='gitmirror-web-' + job_id).start()
+            except Exception:
+                active['id'] = None
+                raise
+        return {'id': job_id, 'state': 'running', 'mode': 'apply' if apply else 'dry-run'}
+
+    return app
+
+
+def serve_web(config_file, *, host='127.0.0.1', port=8787, password_file=None,
+              allow_lan=False, allowed_hosts=None, allow_actions=False):
+    """Web is optional. It never changes the existing CLI scheduler."""
+    loopback = host in ('127.0.0.1', '::1', 'localhost')
+    if not loopback and not allow_lan:
+        raise SyncError('Non-loopback binding needs --allow-lan and an explicit password')
+    if not 1 <= port <= 65535:
+        raise SyncError('Invalid web port')
+    if not password_file:
+        raise SyncError('Set --password-file to a private file with a strong dashboard password')
+    path = Path(password_file).expanduser()
+    try:
+        info = path.stat()
+        if not path.is_file() or (os.name != 'nt' and info.st_mode & 0o077):
+            raise SyncError('Web password file must be a regular file restricted to its owner (chmod 600)')
+        password = path.read_text(encoding='utf-8').strip()
+    except OSError as exc:
+        raise SyncError(f'Cannot read dashboard password file: {exc}') from exc
+    settings = load_config(config_file)
+    app = create_web_app(settings, Path(config_file).expanduser().resolve(),
+                         password=password, allow_actions=allow_actions, allowed_hosts=allowed_hosts)
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise SyncError('Install web dependencies: pip install "gitmirror-resilient[web]"') from exc
+    if not loopback:
+        print('WARNING: LAN access is plain HTTP. Use a trusted LAN, VPN or HTTPS reverse proxy.')
+    print(f'GitMirror dashboard listening on http://{host}:{port} (actions={"enabled" if allow_actions else "disabled"})')
+    uvicorn.run(app, host=host, port=port, log_level='warning', proxy_headers=False)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='gitmirror', description='Resilient Git mirroring')
     parser.add_argument('--version', action='version', version=__version__)
     parser.add_argument('--config', default='config.yml', help='Path to YAML config')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('validate', help='Validate YAML without connecting to providers')
+    web = sub.add_parser('web', help='Start the optional self-hosted dashboard')
+    web.add_argument('--host', default='127.0.0.1', help='Bind address (default: localhost)')
+    web.add_argument('--port', type=int, default=8787)
+    web.add_argument('--allow-lan', action='store_true', help='Allow a non-loopback bind address')
+    web.add_argument('--allowed-host', action='append', help='Hostname or LAN IP permitted in Host header')
+    web.add_argument('--password-file', required=False, help='Restricted file containing the dashboard password')
+    web.add_argument('--allow-actions', action='store_true', help='Enable manual dry-run and applied syncs')
+
     initialization = sub.add_parser('init-backup', help='Initialize a configured local backup volume')
     add_destination_selector(initialization)
     verification = sub.add_parser('verify-backup', help='Verify local backups and archives offline')
@@ -2059,6 +2457,10 @@ def main(argv=None):
     if args.command == 'restore' and args.list and args.output:
         parser.error('--list cannot be combined with --output')
     try:
+        if args.command == 'web':
+            return serve_web(args.config, host=args.host, port=args.port,
+                             password_file=args.password_file, allow_lan=args.allow_lan,
+                             allowed_hosts=args.allowed_host, allow_actions=args.allow_actions)
         if args.command == 'doctor':
             return doctor(args.config, network=args.network, ssh=args.ssh, only=args.only, platform=args.platform,
                           identifiers=args.destination)
