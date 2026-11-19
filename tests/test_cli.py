@@ -33,6 +33,9 @@ def doctor_config(tmp_path, monkeypatch):
     settings = yaml.safe_load(sample.read_text(encoding='utf-8'))
     settings['storage']['path'] = str(tmp_path / 'pristine')
     settings['source']['owner'] = 'demo'
+    for destination in settings['destinations']:
+        if destination['provider'] == 'gitlab':
+            destination['owner'] = 'demo'
     config = tmp_path / 'doctor.yml'
     config.write_text(yaml.safe_dump(settings), encoding='utf-8')
 
@@ -79,7 +82,8 @@ def test_doctor_opt_in_uses_only_api_get_and_ssh_read(doctor_config, capsys, mon
         if url == 'https://gitlab.com/api/v4/user':
             return 200, {'username': 'demo'}
         if 'user/repos?' in url:
-            return 200, [{'name': 'demo', 'private': False, 'owner': {'login': 'demo'},
+            return 200, [{'id': 45, 'name': 'demo', 'private': False, 'owner': {'login': 'demo'},
+                          'default_branch': 'main',
                           'ssh_url': 'git@github.example.invalid:demo/demo.git'}]
         if url.endswith('/projects/demo%2Fdemo'):
             return 200, {'id': 123, 'ssh_url_to_repo': 'git@gitlab.example.invalid:demo/demo.git',

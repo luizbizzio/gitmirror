@@ -67,3 +67,15 @@ def test_lfs_retry_rechecks_source_before_starting_another_upload(monkeypatch):
     with pytest.raises(gitmirror.SourceStateError, match='visibility changed'):
         gitmirror.git('lfs', 'push', '--all', 'gitlab', before_retry=source_changed)
     assert len(attempts) == 1
+
+
+def test_provider_credentials_are_not_redirected_across_origins():
+    from urllib.error import HTTPError
+    from urllib.request import Request
+
+    from gitmirror import SameOriginRedirect
+
+    request = Request('https://api.example.invalid/v1/user', headers={'PRIVATE-TOKEN': 'synthetic'})
+    with pytest.raises(HTTPError):
+        SameOriginRedirect().redirect_request(request, None, 302, '', {},
+                                              'https://other.example.invalid/v1/user')

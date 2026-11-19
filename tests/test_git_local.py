@@ -21,8 +21,7 @@ def local_git_only(tmp_path, monkeypatch):
     monkeypatch.setenv('GIT_CONFIG_NOSYSTEM', '1')
     monkeypatch.setenv('GIT_CONFIG_GLOBAL', str(tmp_path / 'gitconfig'))
     monkeypatch.setenv('GIT_ALLOW_PROTOCOL', 'file')
-    for key in ('ROOT', 'GH_OWNER', 'CB_OWNER', 'GH_API', 'GL_API', 'CB_API',
-                'JOURNAL_DIR', 'RETRY_DELAYS', 'RUN_ID', 'SSH_ENV'):
+    for key in ('ROOT', 'GL_API', 'JOURNAL_DIR', 'RETRY_DELAYS', 'RUN_ID', 'SSH_ENV'):
         monkeypatch.setattr(gitmirror, key, getattr(gitmirror, key))
     monkeypatch.setattr(gitmirror, 'SSH_ENV', dict(os.environ))
 
@@ -137,7 +136,7 @@ def test_dry_run_does_not_create_storage_or_modify_repos(mirror, command, flags,
         assert delay == 12 * 3600
         raise KeyboardInterrupt
 
-    monkeypatch.setattr('gitmirror.time.sleep', stop_after_first_cycle)
+    monkeypatch.setattr(gitmirror, 'time', SimpleNamespace(sleep=stop_after_first_cycle, time=gitmirror.time.time))
     monkeypatch.setenv('GIT_SSH_COMMAND', 'ssh -o StrictHostKeyChecking=no')
     cmd('update-ref', 'refs/heads/destination-only', 'refs/heads/main', cwd=mirror.dest)
     source_before = gitmirror.remote_refs(mirror.source.as_uri())
@@ -698,9 +697,10 @@ def test_new_destination_is_private_until_default_and_refs_are_verified(mirror, 
     assert state.created and state.default == 'trunk' and state.visibility == 'public'
 
 
-def test_default_change_dry_run_never_updates_branches(mirror, default_change, capsys):
+@pytest.mark.parametrize('platform', ['gitlab', 'codeberg'])
+def test_default_change_dry_run_never_updates_branches(mirror, default_change, capsys, platform):
     state, previous = default_change
-    assert main([*mirror.args, 'sync', '--dry-run']) == 0
+    assert main([*mirror.args, 'sync', '--dry-run', '--platform', platform]) == 0
     assert 'WOULD verify trunk, then set it as default' in capsys.readouterr().out
     assert not state.switches
     assert gitmirror.remote_refs(mirror.dest.as_uri()) == previous
