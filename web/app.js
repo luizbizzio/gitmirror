@@ -847,6 +847,14 @@ function openConfiguration(initial, data) {
       '<div class="wizard-buttons"><button type="button" class="button secondary wizard-previous">Back</button>' +
       '<button type="button" class="button primary wizard-next">Continue</button></div>';
     form.insertBefore(controls, footer);
+    const reviewLink = document.createElement("button");
+    reviewLink.type = "button";
+    reviewLink.className = "configuration-jump";
+    reviewLink.textContent = "Review";
+    reviewLink.addEventListener("click", () => {
+      if (showWizardStep) showWizardStep(sections.length);
+    });
+    index.append(reviewLink);
     let current = 0, furthest = 0;
     const choices = [...index.querySelectorAll("button")];
     const validate = (section) => {
