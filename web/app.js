@@ -30,6 +30,7 @@ let csrf = "", view = "overview", snapshot = null, stream = null, refreshTimer =
 let repositories = [], targetSignature = "", currentRun = "", restoreSelection = null, targets = [];
 let loading = false, refreshPending = false, logRequest = 0, busy = false;
 let previewMode = false, initialSetupData = null;
+let inventoryWarmupAttempted = false;
 const mobileNavigation = window.matchMedia("(max-width: 760px)");
 let compactNavigation = false;
 
@@ -510,6 +511,22 @@ async function loadLog() {
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
 
+async function warmupInventory() {
+  if (inventoryWarmupAttempted || !csrf || previewMode || !snapshot) return;
+  const rows = snapshot.repository_storage?.repositories ?? [];
+  if (snapshot.inventory_at && rows.every((repo) => repo.bytes !== undefined)) return;
+  inventoryWarmupAttempted = true;
+  try {
+    await post("/api/repositories/refresh", {});
+    await refresh();
+  } catch {
+    if (view === "overview") {
+      $("#source-storage-chart").innerHTML = chartPlaceholder(
+        "Source inventory unavailable. Open Repositories to retry.");
+    }
+  }
+}
+
 async function refresh() {
   if (previewMode || !csrf) return;
   if (loading) { refreshPending = true; return; }
@@ -519,7 +536,10 @@ async function refresh() {
     busy = snapshot.active.some((run) => run.origin === "web");
     renderContext();
     switch (view) {
-      case "overview": renderOverview(snapshot); break;
+      case "overview":
+        renderOverview(snapshot);
+        if (!inventoryWarmupAttempted) warmupInventory();
+        break;
       case "destinations": renderDestinations(snapshot); break;
       case "settings": renderSettings(snapshot); break;
       case "activity": renderActivity(); await loadLog(); break;
@@ -559,6 +579,7 @@ async function boot() {
   csrf = session.csrf;
   previewMode = false;
   initialSetupData = null;
+  inventoryWarmupAttempted = false;
   $("#login").hidden = true;
   $("#shell").hidden = false;
   $("#setup-banner").hidden = true;
