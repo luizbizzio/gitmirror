@@ -11,5 +11,19 @@ services:
       - ./docker/ssh:/home/gitmirror/.ssh:ro
     command: ["--config", "/config/config.yml", "run"]
 
+  gitmirror-web:
+    build: .
+    profiles: ["web"]
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./config.yml:/config/config.yml:ro
+      - ./docker/web-password:/config/web-password:ro
+      - gitmirror-data:/data
+      - ./docker/ssh:/home/gitmirror/.ssh:ro
+    command: ["--config", "/config/config.yml", "web", "--host", "0.0.0.0", "--allow-lan", "--port", "8787", "--password-file", "/config/web-password"]
+
 volumes:
   gitmirror-data:
