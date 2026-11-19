@@ -155,6 +155,12 @@ def test_dev_source_packages_allowlisted_files_and_identifies_commit(tmp_path):
         [[ -f output/source/gitmirror.py ]]
         [[ ! -e output/source/.git ]]
         [[ "$(tar -tzf output/release.tar.gz | wc -l)" == "${#files[@]}" ]]
+        previous="$checksum"
+        mkdir again
+        tag= checksum= artifact=
+        development_source again
+        [[ "$checksum" == "$previous" ]]
+        cmp -s output/release.tar.gz again/release.tar.gz
     """
     env = {**os.environ, 'PROJECT': str(ROOT), 'FIXTURE': str(project), 'EXPECTED': actual}
     result = subprocess.run(['bash', '-c',
@@ -209,6 +215,28 @@ def test_upgrade_switch_and_failed_health_rollback(tmp_path, startup):
     assert (result.returncode == 0) is (startup == 'success'), result.stderr
     assert (tmp_path / 'app/current').resolve().name == ('new' if startup == 'success' else 'old')
     assert not (tmp_path / 'etc/maintenance-pending').exists()
+
+
+def test_upgrade_skips_same_version_only_when_digest_matches(tmp_path):
+    source = """
+        source "$PROJECT/packaging/lifecycle.sh"
+        app="$PWD/app"
+        mkdir -p "$app/current"
+        printf 'dev-123456789abc\\n' >"$app/current/version"
+        printf 'correct-digest\\n' >"$app/current/digest"
+        tag=dev-123456789abc
+        checksum=correct-digest
+        confirm() { echo unexpected-confirmation; exit 1; }
+        build_release() { echo unexpected-build; exit 1; }
+        switch_release() { echo unexpected-switch; exit 1; }
+        upgrade
+    """
+    matched = shell(source, tmp_path)
+    assert matched.returncode == 0, matched.stderr
+    assert 'already up to date' in matched.stdout
+    mismatched = shell(source.replace('checksum=correct-digest', 'checksum=other-digest'), tmp_path)
+    assert mismatched.returncode != 0
+    assert 'archive digest differs' in mismatched.stderr
 
 
 def test_uninstall_does_not_touch_configuration_or_archives(tmp_path):
