@@ -4116,8 +4116,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         if not isinstance(value, str) or len(value) > 1024:
             return False
         try:
-            salt, digest = managed.credentials(revision_for_password) if managed else (salt, password_hash)
-            return hmac.compare_digest(scrypt_password(value, salt), digest)
+            check_salt, digest = managed.credentials(revision_for_password) if managed else (salt, password_hash)
+            return hmac.compare_digest(scrypt_password(value, check_salt), digest)
         except (OSError, ValueError, UnicodeError, TypeError, SyncError, OAuthError):
             return False
 
@@ -4209,6 +4209,77 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         return response
 
     if managed:
+        @app.get('/api/security')
+        def security_status(request: _GitMirrorWebRequest):
+            auth(request)
+            state = private_security(managed.root)
+            return {'enabled': state['enabled'], 'pending': bool(
+                not state['enabled'] and state.get('pending_until', 0) > time.time()),
+                'recovery_remaining': len(state.get('recovery', [])) if state['enabled'] else 0}
+
+        @app.post('/api/security/totp/start')
+        async def security_start(request: _GitMirrorWebRequest):
+            if pending_setup or not (public_origin or request.url.scheme == 'https'):
+                raise HTTPException(403, 'Complete setup and use HTTPS before enabling 2FA')
+            auth(request, csrf=True)
+            data = await body(request)
+            if not await asyncio.to_thread(verify_password, data.get('password'), revision):
+                raise HTTPException(403, 'Current password is incorrect')
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                state = private_security(managed.root)
+                if state['enabled']:
+                    raise HTTPException(409, 'Two-factor authentication is already enabled')
+                secret = base64.b32encode(secrets.token_bytes(20)).decode('ascii').rstrip('=')
+                state = {'enabled': False, 'pending_secret': secret, 'pending_until': time.time() + 600}
+                store_oauth(managed.root / 'security.json', state)
+            uri = ('otpauth://totp/GitMirror:admin?secret=' + secret +
+                   '&issuer=GitMirror&algorithm=SHA1&digits=6&period=30')
+            return {'secret': secret, 'uri': uri, 'expires_in': 600}
+
+        @app.post('/api/security/totp/confirm')
+        async def security_confirm(request: _GitMirrorWebRequest):
+            if pending_setup:
+                raise HTTPException(409, 'Complete initial setup first')
+            auth(request, csrf=True)
+            data = await body(request)
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                state = private_security(managed.root)
+                if state['enabled'] or state.get('pending_until', 0) <= time.time():
+                    raise HTTPException(409, 'Authenticator setup has expired. Start again')
+                secret = state.get('pending_secret', '')
+                if totp_counter(secret, data.get('code')) is None:
+                    raise HTTPException(400, 'Invalid six-digit authenticator code')
+                recovery = [secrets.token_urlsafe(12) for _ in range(8)]
+                state = {'enabled': True, 'secret': secret, 'last_counter': -1,
+                         'recovery': [hashlib.sha256(code.encode('ascii')).hexdigest() for code in recovery]}
+                store_oauth(managed.root / 'security.json', state)
+            return {'enabled': True, 'recovery_codes': recovery}
+
+        @app.post('/api/security/totp/cancel')
+        def security_cancel(request: _GitMirrorWebRequest):
+            auth(request, csrf=True)
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                state = private_security(managed.root)
+                if not state['enabled']:
+                    store_oauth(managed.root / 'security.json', {'enabled': False})
+            return {'cancelled': True}
+
+        @app.post('/api/security/totp/disable')
+        async def security_disable(request: _GitMirrorWebRequest):
+            if pending_setup:
+                raise HTTPException(409, 'Complete initial setup first')
+            auth(request, csrf=True)
+            data = await body(request)
+            if not await asyncio.to_thread(verify_password, data.get('password'), revision):
+                raise HTTPException(403, 'Current password is incorrect')
+            if not private_security(managed.root)['enabled']:
+                raise HTTPException(409, 'Two-factor authentication is not enabled')
+            if not await asyncio.to_thread(security_verify, managed.root, data.get('code')):
+                raise HTTPException(403, 'Invalid authenticator or recovery code')
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                store_oauth(managed.root / 'security.json', {'enabled': False})
+            return {'enabled': False}
+
         oauth_cookie = '__Host-gm_oauth'
 
         def oauth_authorized(key):
