@@ -138,7 +138,7 @@ async function api(path, { data, method = "GET" } = {}) {
   } catch {
     throw new Error("Cannot reach the GitMirror dashboard.");
   }
-  if (response.status === 401 && path !== "/api/login") {
+  if (response.status === 401 && !["/api/login", "/api/login/2fa"].includes(path)) {
     signOut();
     throw new Error("Sign in again to continue.");
   }
