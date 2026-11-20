@@ -87,9 +87,19 @@ forwarding.
 
 ## Setup in the browser
 
-Open the printed URL and select **Setup**. Enter the one-time code and choose the administrator password, source, destinations, repositories and schedule. For each remote account, choose **Connect account** if its OAuth app is registered, or **Configure manually (API token)**. Add the dashboard’s SSH public key to each account and verify each server’s host key against its published fingerprint. **Settings → Verify connections** can check the API and sample an SSH read. Enable scheduled applied synchronization after checking access.
+Open the printed URL and sign in with the temporary password shown in the installer output. Set a permanent administrator password before opening **Setup**. Then choose the source, destinations, repositories and schedule. For each remote account, choose **Connect account** if its OAuth app is registered, or **Configure manually (API token)**. Add the dashboard’s SSH public key to each account and verify each server’s host key against its published fingerprint. **Settings → Verify connections** can check the API and sample an SSH read. Enable scheduled applied synchronization after checking access.
 
 A managed local destination gets its own directory automatically. External disks and NAS paths must already be mounted and writable by the service account. The advanced CLI is available at `/opt/gitmirror-managed/current/venv/bin/gitmirror`.
+
+## Dashboard password and optional two-factor authentication
+
+On first installation, GitMirror prints a random temporary password in the terminal. Enter it on the dashboard's first sign-in screen. Before using the configuration wizard, replace it with a permanent password of **at least six characters**. Numeric-only passwords are allowed and there are no required character categories. A six-digit numeric password is weak; use a longer passphrase when possible, particularly if the dashboard is accessible beyond localhost.
+
+After completing setup, open **Settings → Two-factor authentication** on the managed HTTPS dashboard. Enter your current password, add the displayed setup key to an authenticator app (TOTP, SHA1, six digits, 30-second interval), and enter a current code to enable 2FA.
+
+GitMirror shows eight single-use recovery codes only once. Save them away from the Raspberry Pi before closing the screen. Subsequent sign-ins require the dashboard password and a six-digit authenticator code, or one unused recovery code. Disabling 2FA requires the current password and a valid second factor. A lost authenticator can be replaced using a recovery code.
+
+2FA is supported in the managed HTTPS dashboard. The separate standalone dashboard continues to use its configured password file. Login rate limits remain enabled. GitMirror keeps 2FA credentials in a private file under the managed state directory with owner-only permissions.
 
 ## Register OAuth apps for browser authorization
 

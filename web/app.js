@@ -30,6 +30,7 @@ let csrf = "", view = "overview", snapshot = null, stream = null, refreshTimer =
 let repositories = [], targetSignature = "", currentRun = "", restoreSelection = null, targets = [];
 let loading = false, refreshPending = false, logRequest = 0, busy = false;
 let previewMode = false, initialSetupData = null;
+let securityEnrollment = false, securityRecovery = false;
 let inventoryWarmupAttempted = false;
 const mobileNavigation = window.matchMedia("(max-width: 760px)");
 let compactNavigation = false;
@@ -116,6 +117,12 @@ function signOut() {
   closeMobileNavigation();
   $("#shell").hidden = true;
   $("#login").hidden = false;
+  $("#login-form").hidden = false;
+  $("#first-password-form").hidden = true;
+  $("#mfa-form").hidden = true;
+  $("#login-label").textContent = "Dashboard password";
+  $("#login-description").textContent = "Sign in to manage your mirrors and backups.";
+  securityEnrollment = securityRecovery = false;
   for (const dialog of all("dialog[open]")) dialog.close();
   $("#login-password").focus();
 }
@@ -131,7 +138,7 @@ async function api(path, { data, method = "GET" } = {}) {
   } catch {
     throw new Error("Cannot reach the GitMirror dashboard.");
   }
-  if (response.status === 401 && path !== "/api/login") {
+  if (response.status === 401 && !["/api/login", "/api/login/2fa"].includes(path)) {
     signOut();
     throw new Error("Sign in again to continue.");
   }
@@ -430,6 +437,7 @@ function renderDestinations(data) {
 }
 
 function renderSettings(data) {
+  $("#security-panel").hidden = !data.web.managed;
   $("#edit-configuration").hidden = !data.web.managed;
   $("#check-connections").hidden = !data.web.managed;
   $("#check-connections button").disabled = busy;
@@ -572,7 +580,7 @@ async function refresh() {
         if (!inventoryWarmupAttempted) warmupInventory();
         break;
       case "destinations": renderDestinations(snapshot); break;
-      case "settings": renderSettings(snapshot); break;
+      case "settings": renderSettings(snapshot); if (snapshot.web.managed) await loadSecurity(); break;
       case "activity": renderActivity(); await loadLog(); break;
       case "backups": renderBackups(await api("/api/backups")); break;
       case "repositories": {
@@ -693,17 +701,91 @@ document.addEventListener("click", (event) => {
   }
 });
 
+function showFirstPassword() {
+  $("#shell").hidden = true;
+  $("#login").hidden = false;
+  $("#login-form").hidden = true;
+  $("#mfa-form").hidden = true;
+  $("#first-password-form").hidden = false;
+  $("#first-password").focus();
+}
+
+function showSecondFactor() {
+  $("#login-form").hidden = true;
+  $("#first-password-form").hidden = true;
+  $("#mfa-form").hidden = false;
+  $("#mfa-code").value = "";
+  $("#mfa-code").focus();
+}
+
+async function finishLogin() {
+  const status = await api("/api/session");
+  csrf = status.csrf;
+  if (status.first_login) {
+    showFirstPassword();
+    return;
+  }
+  // A completed setup may have restarted the server since the login page was opened.
+  const response = await fetch("/api/setup", {credentials: "same-origin"});
+  if (response.ok) {
+    const setup = await response.json();
+    if (setup.required) {
+      enterPreview(setup);
+      return;
+    }
+  }
+  initialSetupData = null;
+  await boot();
+}
+
 $("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const control = event.currentTarget.querySelector("button");
   control.disabled = true;
   $("#login-error").textContent = "";
   try {
-    await post("/api/login", {password: $("#login-password").value});
+    const result = await post("/api/login", {password: $("#login-password").value});
     $("#login-password").value = "";
-    await boot();
+    if (result.mfa_required) showSecondFactor();
+    else await finishLogin();
   } catch (error) { $("#login-error").textContent = error.message; }
   finally { control.disabled = false; }
+});
+
+$("#first-password-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const password = $("#first-password").value;
+  $("#first-password-error").textContent = "";
+  if (password !== $("#first-confirm").value) {
+    $("#first-password-error").textContent = "Passwords do not match.";
+    return;
+  }
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    await post("/api/setup/password", {password});
+    $("#first-password").value = $("#first-confirm").value = "";
+    await finishLogin();
+  } catch (error) { $("#first-password-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+$("#mfa-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#mfa-error").textContent = "";
+  try {
+    await post("/api/login/2fa", {code: $("#mfa-code").value.trim()});
+    $("#mfa-code").value = "";
+    await finishLogin();
+  } catch (error) { $("#mfa-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+$("#mfa-back").addEventListener("click", () => {
+  $("#mfa-form").hidden = true;
+  $("#login-form").hidden = false;
+  $("#login-password").focus();
 });
 
 $("#logout").addEventListener("click", () => post("/api/logout", {}).then(signOut).catch(report));
@@ -1064,8 +1146,10 @@ function openConfiguration(initial, data) {
   wrapper.replaceChildren($("#configuration-template").content.cloneNode(true));
   const form = wrapper.querySelector("form");
   let showWizardStep = null;
-  const sectionNames = ["Administrator", "Source", "Destinations", "SSH keys", "Schedule"];
-  const sections = [...form.querySelectorAll(":scope > article.panel")];
+  const sectionNames = initial ? ["Source", "Destinations", "SSH keys", "Schedule"] :
+    ["Administrator", "Source", "Destinations", "SSH keys", "Schedule"];
+  const sections = [...form.querySelectorAll(":scope > article.panel")].slice(initial ? 1 : 0);
+  form.querySelector(".admin-settings").hidden = initial;
   const index = document.createElement("nav");
   index.className = "configuration-nav";
   index.setAttribute("aria-label", "Configuration sections");
@@ -1085,10 +1169,11 @@ function openConfiguration(initial, data) {
     index.append(link);
   }
   form.prepend(index);
-  form.querySelector(".setup-code").hidden = !initial;
+  form.querySelector(".setup-code").hidden = true;
   form.querySelector(".current-password").hidden = initial;
-  form.elements.code.required = initial;
-  form.elements.password.required = initial;
+  form.querySelector(".new-password").hidden = initial;
+  form.elements.code.required = false;
+  form.elements.password.required = false;
   form.elements.hours.value = data.schedule?.interval_hours ?? 12;
   form.elements.enabled.checked = data.schedule?.enabled ?? false;
   form.elements.repositories.value = (data.repositories ?? []).join("\n");
@@ -1266,6 +1351,90 @@ function openConfiguration(initial, data) {
   if (!initial) wrapper.scrollIntoView({block: "start"});
 }
 
+async function loadSecurity() {
+  if (securityEnrollment || securityRecovery) return;
+  const state = await api("/api/security");
+  $("#security-state").textContent = state.enabled ? "Enabled" : "Disabled";
+  $("#security-start").hidden = state.enabled;
+  $("#security-disable").hidden = !state.enabled;
+  $("#security-enroll").hidden = true;
+  $("#security-recovery").hidden = true;
+}
+
+$("#security-start").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#security-error").textContent = "";
+  try {
+    const result = await post("/api/security/totp/start", {password: $("#security-start-password").value});
+    $("#security-start-password").value = "";
+    $("#security-secret").textContent = result.secret;
+    securityEnrollment = true;
+    $("#security-start").hidden = true;
+    $("#security-enroll").hidden = false;
+    $("#security-state").textContent = "Waiting for confirmation";
+  } catch (error) { $("#security-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+$("#security-confirm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#security-error").textContent = "";
+  try {
+    const result = await post("/api/security/totp/confirm", {code: $("#security-confirm-code").value.trim()});
+    $("#security-confirm-code").value = "";
+    $("#security-secret").textContent = "";
+    securityEnrollment = false;
+    securityRecovery = true;
+    $("#security-enroll").hidden = true;
+    $("#security-recovery").hidden = false;
+    $("#security-codes").textContent = result.recovery_codes.join("\n");
+    $("#security-state").textContent = "Enabled";
+  } catch (error) { $("#security-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+$("#security-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("#security-secret").textContent);
+    $("#security-error").textContent = "Setup key copied.";
+  } catch {
+    $("#security-error").textContent = "Copy unavailable. Select the setup key above.";
+  }
+});
+
+$("#security-cancel").addEventListener("click", async () => {
+  try {
+    await post("/api/security/totp/cancel", {});
+    $("#security-secret").textContent = "";
+    securityEnrollment = false;
+    await loadSecurity();
+  } catch (error) { $("#security-error").textContent = error.message; }
+});
+
+$("#security-recovery-done").addEventListener("click", async () => {
+  $("#security-codes").textContent = "";
+  securityRecovery = false;
+  await loadSecurity().catch(report);
+});
+
+$("#security-disable").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#security-error").textContent = "";
+  try {
+    await post("/api/security/totp/disable", {password: $("#security-disable-password").value,
+      code: $("#security-disable-code").value.trim()});
+    $("#security-disable-password").value = $("#security-disable-code").value = "";
+    await loadSecurity();
+  } catch (error) { $("#security-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
 async function startDashboard() {
   const response = await fetch("/api/setup", {credentials: "same-origin"});
   // Standalone dashboards have no managed setup endpoint.
@@ -1276,7 +1445,19 @@ async function startDashboard() {
   if (!response.ok) throw new Error("The GitMirror server is unavailable.");
   const data = await response.json();
   if (data.required) {
-    enterPreview(data);
+    initialSetupData = data;
+    try {
+      const current = await api("/api/session");
+      csrf = current.csrf;
+      if (current.first_login) showFirstPassword();
+      else enterPreview(data);
+    } catch {
+      signOut();
+      $("#login-label").textContent = data.password_ready ? "Dashboard password" : "Temporary password";
+      $("#login-description").textContent = data.password_ready
+        ? "Sign in to continue the initial configuration."
+        : "Enter the temporary password printed by the GitMirror installer.";
+    }
     return;
   }
   await boot();

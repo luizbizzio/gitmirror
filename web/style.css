@@ -796,3 +796,18 @@ input:not([type=checkbox]):focus, select:focus, textarea:focus {
   .wizard-controls { flex-direction: column; align-items: stretch; }
   .wizard-buttons { justify-content: space-between; }
 }
+
+/* Managed login security controls */
+.security-secret {
+  margin: 12px 0;
+  padding: 12px;
+  background: #111d27;
+  border: 1px solid #3b5364;
+  border-radius: 5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+#security-panel .action-form { margin-top: 14px; }
+#security-enroll > p, #security-recovery > p { margin: 12px 0; }
+#security-copy { margin-bottom: 12px; }

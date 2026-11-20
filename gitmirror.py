@@ -10,6 +10,7 @@ import datetime as dt
 import errno
 import fnmatch
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
@@ -3522,6 +3523,67 @@ def scrypt_password(password, salt):
     return hashlib.scrypt(password.encode('utf-8'), salt=salt, n=16384, r=8, p=1)
 
 
+def valid_admin_password(password):
+    """An unrestricted 6+ character password; rate limiting and optional TOTP protect login."""
+    return isinstance(password, str) and 6 <= len(password) <= 1024
+
+
+def totp_at(secret, counter):
+    key = base64.b32decode(secret, casefold=True)
+    digest = hmac.new(key, int(counter).to_bytes(8, 'big'), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0f
+    number = int.from_bytes(digest[offset:offset + 4], 'big') & 0x7fffffff
+    return f'{number % 1000000:06d}'
+
+
+def totp_counter(secret, code, now=None):
+    if not isinstance(code, str) or not re.fullmatch(r'[0-9]{6}', code):
+        return None
+    current = int((time.time() if now is None else now) // 30)
+    try:
+        for counter in (current - 1, current, current + 1):
+            if counter >= 0 and hmac.compare_digest(totp_at(secret, counter), code):
+                return counter
+    except (binascii.Error, ValueError, TypeError):
+        pass
+    return None
+
+
+def private_security(root):
+    path = root / 'security.json'
+    try:
+        state = oauth_private_file(path)
+    except FileNotFoundError:
+        return {'enabled': False}
+    if not isinstance(state, dict) or type(state.get('enabled')) is not bool:
+        raise SyncError('Dashboard 2FA settings are invalid')
+    return state
+
+
+def security_verify(root, code):
+    """Accept a fresh TOTP or one disposable recovery code, atomically."""
+    path = root / 'security.json'
+    with FileLock(str(root / '.security.lock'), timeout=25):
+        state = private_security(root)
+        if not state['enabled']:
+            return True
+        current = totp_counter(state.get('secret', ''), code)
+        if current is not None and current > state.get('last_counter', -1):
+            state['last_counter'] = current
+            store_oauth(path, state)
+            return True
+        if isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_-]{16}', code):
+            digest = hashlib.sha256(code.encode('ascii')).hexdigest()
+            hashes = state.get('recovery', [])
+            matched = next((i for i, value in enumerate(hashes) if hmac.compare_digest(value, digest)), None)
+            if matched is not None:
+                state['recovery'] = hashes[:matched] + hashes[matched + 1:]
+                store_oauth(path, state)
+                return True
+        return False
+
+
+
 def ssh_host_key_line(line):
     parts = line.split()
     if (len(parts) < 3 or not re.fullmatch(r'[A-Za-z0-9.\[\]:,_|+=-]+', parts[0])
@@ -3563,6 +3625,7 @@ class ManagedInstallation:
         self.volumes = self.root / 'backups'
         self.restores = self.root / 'restores'
         self.bootstrap = self.root / 'setup-code'
+        self.pending_admin = self.root / 'initial-admin.json'
         self.identity = self.root / 'identity'
         self.pointer = self.root / 'active.json'
         self.previous = self.root / 'previous.json'
@@ -3575,7 +3638,7 @@ class ManagedInstallation:
             if not self.identity.is_file():
                 subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.identity)],
                                check=True, timeout=20, capture_output=True)
-            if self.active() is None and not self.bootstrap.exists():
+            if self.active() is None and not self.bootstrap.exists() and not self.pending_admin.exists():
                 private_text(self.bootstrap, secrets.token_urlsafe(24) + '\n')
 
     def active(self):
@@ -3617,11 +3680,23 @@ class ManagedInstallation:
                 'public_key': self.public_key()}
 
     def credentials(self, revision):
-        content = json.loads((revision.path / 'admin.json').read_text('utf-8'))
+        path = revision.path / 'admin.json' if revision else self.pending_admin
+        content = oauth_private_file(path)
         salt, digest = bytes.fromhex(content['salt']), bytes.fromhex(content['password'])
         if len(salt) != 32 or len(digest) != 64:
             raise SyncError('Managed admin authentication data is invalid')
         return salt, digest
+
+    def set_initial_password(self, password):
+        if not valid_admin_password(password):
+            raise ConfigError('Password must contain 6 to 1024 characters')
+        with FileLock(str(self.root / '.configuration.lock'), timeout=0):
+            if self.active() or self.pending_admin.exists() or not self.bootstrap.is_file():
+                raise SyncError('Initial password has already been configured')
+            salt = secrets.token_bytes(32)
+            private_text(self.pending_admin, json.dumps({
+                'salt': salt.hex(), 'password': scrypt_password(password, salt).hex()}))
+            self.bootstrap.unlink()
 
     def authorize_setup(self, code):
         if self.active():
@@ -3697,17 +3772,20 @@ class ManagedInstallation:
         with FileLock(str(self.root / '.configuration.lock'), timeout=0):
             active = self.active()
             if bootstrap:
-                self.authorize_setup(payload.get('code'))
+                if not self.pending_admin.exists():
+                    self.authorize_setup(payload.get('code'))
             elif not active:
                 raise SyncError('Complete the initial setup first')
             old = load_config(active.config) if active else None
             if active and payload.get('revision') != active.identifier:
                 raise SyncError('Configuration changed in another session; reload before saving')
             password = payload.get('password', '')
-            if not isinstance(password, str) or (password and not 12 <= len(password) <= 1024):
-                raise ConfigError('Admin password must contain 12 to 1024 characters')
-            if bootstrap and not password:
+            if not isinstance(password, str) or (password and not valid_admin_password(password)):
+                raise ConfigError('Admin password must contain 6 to 1024 characters')
+            if bootstrap and not self.pending_admin.exists() and not password:
                 raise ConfigError('Set an admin password to finish setup')
+            if bootstrap and self.pending_admin.exists() and password:
+                raise ConfigError('Initial admin password is already configured')
             if password and not bootstrap:
                 current = payload.get('current_password')
                 salt, verifier = self.credentials(active)
@@ -3733,6 +3811,7 @@ class ManagedInstallation:
                             shutil.rmtree(folder)
             if bootstrap:
                 self.bootstrap.unlink(missing_ok=True)
+                self.pending_admin.unlink(missing_ok=True)
             return revision.identifier
 
     def write_revision(self, revision, payload, old, active, password):
@@ -3905,8 +3984,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
     elif managed:
         salt, password_hash = managed.credentials(revision)
     else:
-        if not isinstance(password, str) or not 12 <= len(password) <= 1024:
-            raise SyncError('Web password must contain 12 to 1024 characters')
+        if not valid_admin_password(password):
+            raise SyncError('Web password must contain 6 to 1024 characters')
         salt = secrets.token_bytes(32)
         password_hash = scrypt_password(password, salt)
     journal = DashboardJournal(settings, initialize=True)
@@ -3917,6 +3996,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         if not permitted or permitted.scheme != 'https' or permitted.hostname not in allowed:
             raise SyncError('Public origin must be HTTPS and use an allowed hostname')
     sessions, attempts = {}, {}
+    mfa_pending = {}
     global_attempts = deque()
     auth_lock = threading.Lock()
     login_slots = threading.BoundedSemaphore(2)
@@ -3935,9 +4015,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             sessions.pop(key, None)
         return None
 
-    def auth(request, *, csrf=False):
+    def auth(request, *, csrf=False, bootstrap=False):
         active = session(request)
-        if not active:
+        if not active or (len(active) > 2 and active[2] != 'auth' and not bootstrap):
             raise HTTPException(401, 'Sign in required')
         if csrf and not hmac.compare_digest(active[1].encode('ascii'),
                                             request.headers.get('X-CSRF-Token', '').encode('utf-8')):
@@ -4014,41 +4094,116 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             global_attempts.append(now)
         return ip, now
 
-    @app.post('/api/login')
-    async def login(request: _GitMirrorWebRequest):
-        if pending_setup:
-            raise HTTPException(409, 'Complete initial setup first')
-        entered = (await body(request)).get('password')
-        ip, now = reserve_attempt(request)
-        try:
-            valid = False
-            if isinstance(entered, str) and len(entered) <= 1024:
-                try:
-                    valid = hmac.compare_digest(await asyncio.to_thread(scrypt_password, entered, salt), password_hash)
-                except UnicodeError:
-                    pass
-        finally:
-            login_slots.release()
-        if not valid:
-            raise HTTPException(401, 'Invalid password')
+    def issue_session(request, stage='auth'):
+        now = time.monotonic()
+        lifetime = min(session_ttl, 600) if stage == 'bootstrap' else session_ttl
         key = secrets.token_urlsafe(32)
         with auth_lock:
+            ip = request.client.host if request.client else 'unknown'
             attempts.pop(ip, None)
             sessions.pop(request.cookies.get(cookie, ''), None)
             for expired in [k for k, value in sessions.items() if value[0] <= now]:
                 del sessions[expired]
             if len(sessions) >= 128:
                 sessions.pop(next(iter(sessions)))
-            sessions[key] = (time.monotonic() + session_ttl, secrets.token_urlsafe(32))
+            sessions[key] = (now + lifetime, secrets.token_urlsafe(32), stage)
         secure = bool(public_origin or request.url.scheme == 'https')
-        response = JSONResponse({'authenticated': True})
+        response = JSONResponse({'authenticated': stage == 'auth', 'first_login': stage == 'bootstrap'})
         response.set_cookie(cookie, key, httponly=True, samesite='strict', secure=secure,
+                            max_age=lifetime, path='/')
+        return response
+
+    def verify_password(value, revision_for_password):
+        if not isinstance(value, str) or len(value) > 1024:
+            return False
+        try:
+            check_salt, digest = managed.credentials(revision_for_password) if managed else (salt, password_hash)
+            return hmac.compare_digest(scrypt_password(value, check_salt), digest)
+        except (OSError, ValueError, UnicodeError, TypeError, SyncError, OAuthError):
+            return False
+
+    @app.post('/api/login')
+    async def login(request: _GitMirrorWebRequest):
+        entered = (await body(request)).get('password')
+        ip, stamp = reserve_attempt(request)
+        try:
+            if pending_setup and managed and not managed.pending_admin.is_file():
+                try:
+                    managed.authorize_setup(entered)
+                    valid, stage = True, 'bootstrap'
+                except (PermissionError, OSError, SyncError, UnicodeError):
+                    valid, stage = False, 'bootstrap'
+            else:
+                valid = await asyncio.to_thread(verify_password, entered, revision)
+                stage = 'auth'
+        finally:
+            login_slots.release()
+        if not valid:
+            raise HTTPException(401, 'Invalid password')
+        if stage == 'auth' and managed and not pending_setup and private_security(managed.root)['enabled']:
+            challenge = secrets.token_urlsafe(32)
+            now = time.monotonic()
+            with auth_lock:
+                sessions.pop(request.cookies.get(cookie, ''), None)
+                if len(mfa_pending) > 128:
+                    mfa_pending.clear()
+                mfa_pending[challenge] = (now + 180, ip)
+            response = JSONResponse({'mfa_required': True})
+            response.set_cookie('gm_2fa', challenge, httponly=True, secure=True, samesite='strict',
+                                max_age=180, path='/api/login')
+            return response
+        return issue_session(request, stage)
+
+    @app.post('/api/login/2fa')
+    async def login_second_factor(request: _GitMirrorWebRequest):
+        data = await body(request)
+        ip, stamp = reserve_attempt(request)
+        try:
+            challenge = request.cookies.get('gm_2fa', '')
+            with auth_lock:
+                pending = mfa_pending.get(challenge)
+            if (not pending or pending[0] < time.monotonic() or pending[1] != ip or
+                    not managed or pending_setup or not private_security(managed.root)['enabled']):
+                raise HTTPException(401, 'Start a new sign-in')
+            passed = await asyncio.to_thread(security_verify, managed.root, data.get('code'))
+            if not passed:
+                raise HTTPException(401, 'Invalid authenticator or recovery code')
+            with auth_lock:
+                mfa_pending.pop(challenge, None)
+            response = issue_session(request)
+            response.delete_cookie('gm_2fa', httponly=True, secure=True, samesite='strict', path='/api/login')
+            return response
+        finally:
+            login_slots.release()
+
+    @app.post('/api/setup/password')
+    async def setup_password(request: _GitMirrorWebRequest):
+        if not pending_setup or not managed:
+            raise HTTPException(409, 'Initial setup is already complete')
+        active = auth(request, csrf=True, bootstrap=True)
+        if len(active) < 3 or active[2] != 'bootstrap':
+            raise HTTPException(409, 'Temporary password already replaced')
+        data = await body(request)
+        try:
+            await asyncio.to_thread(managed.set_initial_password, data.get('password'))
+        except ConfigError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except (SyncError, OSError, Timeout):
+            raise HTTPException(409, 'Initial password setup is unavailable') from None
+        with auth_lock:
+            key = request.cookies.get(cookie, '')
+            if key in sessions:
+                sessions[key] = (time.monotonic() + session_ttl, sessions[key][1], 'auth')
+        response = JSONResponse({'saved': True})
+        response.set_cookie(cookie, key, httponly=True, samesite='strict',
+                            secure=bool(public_origin or request.url.scheme == 'https'),
                             max_age=session_ttl, path='/')
         return response
 
     @app.get('/api/session')
     def get_session(request: _GitMirrorWebRequest):
-        return {'csrf': auth(request)[1]}
+        active = auth(request, bootstrap=True)
+        return {'csrf': active[1], 'first_login': len(active) > 2 and active[2] == 'bootstrap'}
 
     @app.post('/api/logout')
     def logout(request: _GitMirrorWebRequest):
@@ -4061,6 +4216,85 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         return response
 
     if managed:
+        @app.get('/api/security')
+        def security_status(request: _GitMirrorWebRequest):
+            auth(request)
+            state = private_security(managed.root)
+            return {'enabled': state['enabled'], 'pending': bool(
+                not state['enabled'] and state.get('pending_until', 0) > time.time()),
+                'recovery_remaining': len(state.get('recovery', [])) if state['enabled'] else 0}
+
+        @app.post('/api/security/totp/start')
+        async def security_start(request: _GitMirrorWebRequest):
+            if pending_setup or not (public_origin or request.url.scheme == 'https'):
+                raise HTTPException(403, 'Complete setup and use HTTPS before enabling 2FA')
+            auth(request, csrf=True)
+            data = await body(request)
+            if not await asyncio.to_thread(verify_password, data.get('password'), revision):
+                raise HTTPException(403, 'Current password is incorrect')
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                state = private_security(managed.root)
+                if state['enabled']:
+                    raise HTTPException(409, 'Two-factor authentication is already enabled')
+                secret = base64.b32encode(secrets.token_bytes(20)).decode('ascii').rstrip('=')
+                state = {'enabled': False, 'pending_secret': secret, 'pending_until': time.time() + 600}
+                store_oauth(managed.root / 'security.json', state)
+            uri = ('otpauth://totp/GitMirror:admin?secret=' + secret +
+                   '&issuer=GitMirror&algorithm=SHA1&digits=6&period=30')
+            return {'secret': secret, 'uri': uri, 'expires_in': 600}
+
+        @app.post('/api/security/totp/confirm')
+        async def security_confirm(request: _GitMirrorWebRequest):
+            if pending_setup:
+                raise HTTPException(409, 'Complete initial setup first')
+            auth(request, csrf=True)
+            data = await body(request)
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                state = private_security(managed.root)
+                if state['enabled'] or state.get('pending_until', 0) <= time.time():
+                    raise HTTPException(409, 'Authenticator setup has expired. Start again')
+                secret = state.get('pending_secret', '')
+                if totp_counter(secret, data.get('code')) is None:
+                    raise HTTPException(400, 'Invalid six-digit authenticator code')
+                recovery = [secrets.token_urlsafe(12) for _ in range(8)]
+                state = {'enabled': True, 'secret': secret, 'last_counter': -1,
+                         'recovery': [hashlib.sha256(code.encode('ascii')).hexdigest() for code in recovery]}
+                store_oauth(managed.root / 'security.json', state)
+            with auth_lock:
+                key = request.cookies.get(cookie, '')
+                for other in [item for item in sessions if item != key]:
+                    del sessions[other]
+            return {'enabled': True, 'recovery_codes': recovery}
+
+        @app.post('/api/security/totp/cancel')
+        def security_cancel(request: _GitMirrorWebRequest):
+            auth(request, csrf=True)
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                state = private_security(managed.root)
+                if not state['enabled']:
+                    store_oauth(managed.root / 'security.json', {'enabled': False})
+            return {'cancelled': True}
+
+        @app.post('/api/security/totp/disable')
+        async def security_disable(request: _GitMirrorWebRequest):
+            if pending_setup:
+                raise HTTPException(409, 'Complete initial setup first')
+            auth(request, csrf=True)
+            data = await body(request)
+            if not await asyncio.to_thread(verify_password, data.get('password'), revision):
+                raise HTTPException(403, 'Current password is incorrect')
+            if not private_security(managed.root)['enabled']:
+                raise HTTPException(409, 'Two-factor authentication is not enabled')
+            if not await asyncio.to_thread(security_verify, managed.root, data.get('code')):
+                raise HTTPException(403, 'Invalid authenticator or recovery code')
+            with FileLock(str(managed.root / '.security.lock'), timeout=25):
+                store_oauth(managed.root / 'security.json', {'enabled': False})
+            with auth_lock:
+                key = request.cookies.get(cookie, '')
+                for other in [item for item in sessions if item != key]:
+                    del sessions[other]
+            return {'enabled': False}
+
         oauth_cookie = '__Host-gm_oauth'
 
         def oauth_authorized(key):
@@ -4070,11 +4304,12 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 return False
             if current_revision != revision:
                 return False
-            if pending_setup:
+            if pending_setup and not managed.pending_admin.exists():
                 return key == ''
             with auth_lock:
                 current = sessions.get(key)
-                return bool(current and current[0] > time.monotonic())
+                return bool(current and current[0] > time.monotonic() and
+                            (len(current) < 3 or current[2] == 'auth'))
 
         flows = OAuthFlows(managed, oauth_authorized)
         app.state.oauth_flows = flows
@@ -4096,7 +4331,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             raise HTTPException(403, 'Start authorization in this browser')
 
         def oauth_actor(request, data=None, *, start=False):
-            if not pending_setup:
+            if not pending_setup or managed.pending_admin.exists():
                 auth(request, csrf=True)
                 key = request.cookies.get(cookie, '')
                 if not oauth_authorized(key):
@@ -4227,7 +4462,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
         @app.get('/api/setup')
         def setup_status():
-            return {'required': pending_setup, 'public_key': managed.public_key() if pending_setup else None,
+            return {'required': pending_setup, 'password_ready': bool(pending_setup and managed.pending_admin.is_file()),
+                    'public_key': managed.public_key() if pending_setup else None,
                     'revision': revision.identifier if revision else None}
 
         async def save_settings(data, *, initial=False):
@@ -4246,23 +4482,27 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
         @app.post('/api/setup')
         async def setup(request: _GitMirrorWebRequest):
-            if not pending_setup:
+            if not pending_setup or managed.active():
                 raise HTTPException(409, 'Setup is already complete')
             data = await body(request, limit=65536)
-            reserve_attempt(request)
-            try:
-                return await save_settings(data, initial=True)
-            finally:
-                login_slots.release()
+            if managed.pending_admin.exists():
+                auth(request, csrf=True)
+            else:
+                # Compatible with earlier one-step setup clients; the secret is still required.
+                try:
+                    managed.authorize_setup(data.get('code'))
+                except (PermissionError, OSError, SyncError):
+                    raise HTTPException(403, 'Incorrect setup code') from None
+            return await save_settings(data, initial=True)
 
         @app.post('/api/managed/ssh-host')
         async def check_ssh_host(request: _GitMirrorWebRequest):
             data = await body(request)
-            if not pending_setup:
+            if not pending_setup or managed.pending_admin.exists():
                 auth(request, csrf=True)
             reserve_attempt(request)
             try:
-                if pending_setup:
+                if pending_setup and not managed.pending_admin.exists():
                     managed.authorize_setup(data.get('code'))
                 line = await asyncio.to_thread(verified_ssh_host, data)
                 return {'known_host': line}

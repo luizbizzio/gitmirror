@@ -20,6 +20,12 @@ GitMirror backs up Git history, branches, tags and Git LFS from GitHub, GitLab, 
 
 **Not supported yet:** GitHub Releases, release files, repository descriptions, topics, issues, pull requests, discussions, wiki, and cross-provider recovery of those items.
 
+## Dashboard sign-in
+
+The managed installer displays a random temporary password. On first access, use that password and set a new dashboard password before configuring your mirrors. The new password can be numeric and must contain at least six characters; longer passwords are recommended.
+
+After setup, the managed HTTPS dashboard provides optional TOTP two-factor authentication in **Settings**, with six-digit authenticator codes and single-use recovery codes. The authentication app setup key is shown only during enrollment. Keep the recovery codes in a safe place.
+
 ## Requirements
 
 Python 3.11 or newer, Git, Git LFS and OpenSSH. Each remote account needs API authorization and SSH access. A local destination needs storage access and uses the source credentials only.

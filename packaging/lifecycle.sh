@@ -231,7 +231,7 @@ fresh_install() {
     install_cli
     made_cli=1
     fresh=0
-    printf '\nOpen %s and enter the one-time setup code printed below.\n' "$url"
+    printf '\nOpen %s and sign in with the temporary password printed below.\n' "$url"
     if [[ -n "$lan" ]]; then
         printf 'Match this certificate fingerprint in the browser before trusting the local certificate.\n'
         openssl x509 -noout -sha256 -fingerprint -in "$etc/tls/server.crt"

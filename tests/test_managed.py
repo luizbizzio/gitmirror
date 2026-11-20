@@ -2,6 +2,7 @@
 import base64
 import hashlib
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -45,7 +46,7 @@ def test_one_time_browser_setup_rejects_cross_origin_and_bad_code(installation):
         assert response.json()['required'] and response.json()['public_key'].startswith('ssh-ed25519')
         assert config['code'] not in response.text
         assert client.get('/api/managed/settings').status_code == 401
-        assert client.post('/api/login', json={'password': PASSWORD}).status_code == 409
+        assert client.post('/api/login', json={'password': PASSWORD}).status_code == 401
         assert client.post('/api/setup', json=config, headers={'Origin': 'https://example.invalid'}).status_code == 403
         assert client.post('/api/setup', json={**config, 'code': 'incorrect'}).status_code == 403
         assert managed.active() is None
@@ -207,3 +208,75 @@ def test_unconfigured_dashboard_has_preview_without_opening_private_apis(install
         assert setup['source']['token'] not in html.text
         assert client.get('/api/overview').status_code == 401
         assert client.get('/api/managed/settings').status_code == 401
+
+
+def test_first_login_sets_six_digit_password_before_configuration(installation):
+    managed, payload = installation
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        status = client.get('/api/setup').json()
+        assert status['required'] and not status['password_ready']
+        assert client.post('/api/login', json={'password': payload['code']}).json()['first_login']
+        assert client.get('/api/overview').status_code == 401
+        csrf = {'X-CSRF-Token': client.get('/api/session').json()['csrf']}
+        assert client.post('/api/setup/password', headers=csrf,
+                           json={'password': '12345'}).status_code == 400
+        assert client.post('/api/setup/password', headers=csrf,
+                           json={'password': '123456'}).status_code == 200
+        assert not managed.bootstrap.exists() and managed.pending_admin.exists()
+        assert client.get('/api/setup').json()['password_ready']
+        assert client.post('/api/setup', json={**payload, 'password': '',
+                           'code': ''}).status_code == 403
+        response = client.post('/api/setup', headers=csrf,
+                               json={**payload, 'password': '', 'code': ''})
+        assert response.status_code == 200, response.text
+    assert managed.active() and not managed.pending_admin.exists()
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        assert client.post('/api/login', json={'password': '123456'}).status_code == 200
+        assert client.get('/api/overview').status_code == 200
+
+
+def test_totp_enrollment_login_recovery_and_disable(installation):
+    managed, payload = installation
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        assert client.post('/api/setup', json=payload).status_code == 200
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        csrf = login(client)
+        assert client.get('/api/security').json()['enabled'] is False
+        assert client.post('/api/security/totp/start', headers=csrf,
+                           json={'password': 'incorrect'}).status_code == 403
+        started = client.post('/api/security/totp/start', headers=csrf,
+                              json={'password': PASSWORD})
+        assert started.status_code == 200, started.text
+        secret = started.json()['secret']
+        assert len(secret) == 32
+        assert secret not in client.get('/api/security').text
+        assert client.post('/api/security/totp/confirm', headers=csrf,
+                           json={'code': 'not-a-code'}).status_code == 400
+        confirmed = client.post('/api/security/totp/confirm', headers=csrf,
+                                json={'code': gitmirror.totp_at(secret, int(time.time() // 30))})
+        assert confirmed.status_code == 200, confirmed.text
+        recovery = confirmed.json()['recovery_codes']
+        assert len(recovery) == len(set(recovery)) == 8
+        assert recovery[0] not in (managed.root / 'security.json').read_text('utf-8')
+        assert client.get('/api/security').json()['enabled']
+        assert client.post('/api/logout', headers=csrf, json={}).status_code == 200
+
+        signin = client.post('/api/login', json={'password': PASSWORD})
+        assert signin.json()['mfa_required']
+        assert client.get('/api/session').status_code == 401
+        assert client.post('/api/login/2fa', json={'code': '000000x'}).status_code == 401
+        verified = client.post('/api/login/2fa', json={'code': recovery[0]})
+        assert verified.status_code == 200, verified.text
+        assert client.get('/api/overview').status_code == 200
+        csrf = {'X-CSRF-Token': client.get('/api/session').json()['csrf']}
+        assert client.post('/api/logout', headers=csrf, json={}).status_code == 200
+        assert client.post('/api/login', json={'password': PASSWORD}).json()['mfa_required']
+        assert client.post('/api/login/2fa', json={'code': recovery[0]}).status_code == 401
+        assert client.post('/api/login/2fa', json={'code': recovery[1]}).status_code == 200
+        csrf = {'X-CSRF-Token': client.get('/api/session').json()['csrf']}
+        disabled = client.post('/api/security/totp/disable', headers=csrf, json={
+            'password': PASSWORD, 'code': recovery[2]})
+        assert disabled.status_code == 200, disabled.text
+        assert not client.get('/api/security').json()['enabled']
+        assert client.post('/api/logout', headers=csrf, json={}).status_code == 200
+        assert client.post('/api/login', json={'password': PASSWORD}).json()['authenticated']
