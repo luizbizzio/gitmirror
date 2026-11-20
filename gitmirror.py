@@ -4363,6 +4363,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                                  'username': username})
         response.set_cookie(cookie, key, httponly=True, samesite='strict', secure=secure,
                             max_age=lifetime, path='/')
+        if users and not pending_setup and stage == 'auth':
+            journal.audit(username, 'session.login')
         return response
 
     def verify_password(value, revision_for_password, username='admin'):
@@ -4474,7 +4476,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
     @app.post('/api/logout')
     def logout(request: _GitMirrorWebRequest):
-        auth(request, csrf=True)
+        active = auth(request, csrf=True)
+        if users and not pending_setup:
+            journal.audit(active[3], 'session.logout')
         with auth_lock:
             sessions.pop(request.cookies.get(cookie, ''), None)
         response = JSONResponse({'ok': True})
@@ -4710,6 +4714,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 flow = OAuthFlow(registration, role, browser, actor, origin, owner, identifier, method,
                                  time.monotonic() + (900 if method == 'device' else 600))
                 result = await asyncio.to_thread(flows.start, flow)
+                if not pending_setup:
+                    journal.audit(acting(request), 'oauth.started', registration.provider)
             except (OAuthError, OSError) as exc:
                 raise HTTPException(422, str(exc) if isinstance(exc, OAuthError) else 'OAuth storage unavailable') from None
             response = JSONResponse(result)
@@ -4761,7 +4767,10 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 raise HTTPException(404, 'Unknown OAuth operation')
 
             try:
-                return await asyncio.to_thread(manage)
+                result = await asyncio.to_thread(manage)
+                if not pending_setup:
+                    journal.audit(acting(request), 'oauth.' + operation, identifier)
+                return result
             except (OAuthError, OSError, Timeout) as exc:
                 raise HTTPException(409, str(exc) if isinstance(exc, OAuthError) else
                                     'Account storage is busy. Wait for the sync to finish and retry.') from None
@@ -4811,6 +4820,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 if pending_setup and not managed.pending_admin.exists():
                     managed.authorize_setup(data.get('code'))
                 line = await asyncio.to_thread(verified_ssh_host, data)
+                if not pending_setup:
+                    journal.audit(acting(request), 'ssh.host.verified', data.get('host', ''))
                 return {'known_host': line}
             except PermissionError as exc:
                 raise HTTPException(403, 'Incorrect setup code') from exc
@@ -4938,6 +4949,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             entries = [{key: repo.get(key) for key in ('id', 'name', 'default_branch', 'visibility', 'size_bytes')} for repo in records]
             at = time.time()
             journal.write('INSERT OR REPLACE INTO inventory VALUES (?,?,?)', (journal.scope, at, json.dumps(entries)))
+            journal.audit(acting(request), 'repositories.refreshed', detail=str(len(entries)))
             return {'checked': at, 'total': len(entries)}
         except (SyncError, OSError, sqlite3.Error):
             raise HTTPException(502, 'Cannot read repository inventory; check source credentials and connectivity')
