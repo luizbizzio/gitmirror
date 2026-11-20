@@ -65,7 +65,7 @@ gitmirror rollback
 gitmirror uninstall
 ```
 
-Update, rollback and uninstall ask for confirmation with `Continue? [y/N]`. Uninstall removes the application and its services but **preserves configuration, credentials and backups**. Running the installer again does not overwrite retained state as if it were a clean installation. For details on the update lifecycle, installation options and recovery, see the [Linux installation and maintenance guide](INSTALL.md).
+Update, rollback and uninstall ask for confirmation with `Continue? [y/N]`. Uninstall removes the application and its services but **preserves configuration, credentials and backups**. Running the same curl installer again detects a complete retained installation and asks before **reinstalling the application over the existing state**, without deleting saved accounts, tokens, backups, TLS certificates or passwords. A broken or incomplete installation is still refused rather than overwritten blindly. The existing dashboard address is preserved on reinstall. For details on the update lifecycle, installation options and recovery, see the [Linux installation and maintenance guide](INSTALL.md).
 
 **Security:** the installer executes code downloaded from the GitMirror repository as root. Review the [installer source](install.sh) before executing it if you do not trust that source. Without a published stable release, the installer can select the development `main` snapshot rather than a fixed release.
 
