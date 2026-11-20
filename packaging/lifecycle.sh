@@ -240,6 +240,66 @@ fresh_install() {
     printf '\nIf an experimental GitMirror cron or service is still running, stop it before enabling managed synchronization.\n'
 }
 
+# Reinstall the program after a normal uninstall, reusing the managed state.
+# Refuse to erase or replace anything under state/ or etc/.
+reinstall() {
+    fresh=1
+    made_web=0 made_scheduler=0 made_state=0 made_etc=0 made_app=0 made_account=0 made_cli=0
+    retained_reinstall_ready ||
+        fail 'Retained state is not a complete, inactive GitMirror uninstall; refusing to overwrite anything'
+    check_cli
+    settings
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1024 && 10#$port <= 65535)) ||
+        fail 'Retained listener port is invalid'
+    [[ -z "$lan" || "$lan" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] ||
+        fail 'Retained listener hostname is invalid'
+    if [[ -n "$lan" ]]; then
+        [[ -f "$etc/tls/server.crt" && ! -L "$etc/tls/server.crt" &&
+           -f "$etc/tls/server.key" && ! -L "$etc/tls/server.key" ]] ||
+            fail 'Retained TLS certificate or key is missing; cannot safely change HTTPS identity'
+        openssl x509 -noout -in "$etc/tls/server.crt" >/dev/null ||
+            fail 'Retained TLS certificate is invalid'
+        openssl pkey -noout -in "$etc/tls/server.key" >/dev/null ||
+            fail 'Retained TLS key is invalid'
+    fi
+    confirm REINSTALL 'Reinstall GitMirror services using the retained configuration, accounts, credentials and backups? Existing data will not be deleted.'
+    ensure_managed_lock
+    mkdir -- "$app"; made_app=1
+    mkdir -- "$app/releases"
+    build_release
+    point "$candidate" current
+    install -d -m 0700 -o "$account" -g "$account" "$state/tmp"
+    runuser -u "$account" -- "$app/current/venv/bin/gitmirror" managed-validate --state-dir "$state" ||
+        fail 'Retained GitMirror configuration failed validation; existing data was not changed'
+    # An unfinished setup can still require a temporary login code.
+    runuser -u "$account" -- "$app/current/venv/bin/gitmirror" managed-init --state-dir "$state"
+    local web_args="--port $port"
+    if [[ -n "$lan" ]]; then
+        web_args+=" --host 0.0.0.0 --allow-lan --allowed-host $lan"
+        web_args+=" --tls-cert $etc/tls/server.crt --tls-key $etc/tls/server.key"
+    fi
+    unit "$web" 'GitMirror web dashboard' "web --managed-dir $state $web_args"; made_web=1
+    unit "$scheduler" 'GitMirror synchronization scheduler' "managed-scheduler --state-dir $state"; made_scheduler=1
+    systemd-analyze verify "$unit_dir/$web" "$unit_dir/$scheduler"
+    systemctl daemon-reload
+    systemctl enable --now "$web" "$scheduler"
+    health || fail 'Reinstalled services failed their health checks; existing data was preserved'
+    install_cli
+    made_cli=1
+    fresh=0
+    printf '\nGitMirror reinstalled. Dashboard: %s\n' "$url"
+    if [[ -f "$state/setup-code" && ! -L "$state/setup-code" ]]; then
+        printf 'First login temporary password:\n'
+        cat -- "$state/setup-code"
+    else
+        printf 'Sign in using your existing administrator credentials. No password has been reset.\n'
+    fi
+    if [[ -n "$lan" ]]; then
+        printf 'Retained HTTPS certificate fingerprint:\n'
+        openssl x509 -noout -sha256 -fingerprint -in "$etc/tls/server.crt"
+    fi
+}
+
 # The installer owns both the directory and the lock entry. Never recreate an
 # existing entry here, including during upgrades or while a process holds it.
 ensure_managed_lock() {
@@ -351,6 +411,7 @@ lifecycle() {
     trap cleanup_lifecycle EXIT
     case "$action" in
         install) fresh_install ;;
+        reinstall) reinstall ;;
         upgrade) settings; upgrade ;;
         rollback)
             settings
