@@ -48,8 +48,23 @@ installations use the upgrade lifecycle, retaining their saved accounts, credent
 backup generations, systemd service configuration, TLS certificate and listener
 hostname. It checks whether the chosen version is already installed, asks for
 confirmation before an upgrade, waits for active operations, runs health checks,
-and restores the previous executable if activation fails. A partial managed
-installation or retained managed state is never overwritten automatically.
+and restores the previous executable if activation fails.
+
+**Reinstalling after uninstall:** GitMirror's normal uninstall removes the program
+and systemd units but preserves its service account, state and privileged settings.
+Running this same `curl | sudo bash` command again detects that complete retained
+installation, asks `Continue? [y/N]`, reinstalls the application and services,
+and **retains passwords, 2FA, provider credentials, accounts, HTTPS identity and
+backups**. It does not display or generate a new temporary password when a
+permanent password already exists. The previously configured address is reused,
+even if you supply new `--port` or `--lan` arguments. You can also explicitly
+request this operation with `sudo bash install.sh reinstall`.
+
+An **incomplete or inconsistent installation** (such as an interrupted install
+with leftover application directories, missing lock metadata, missing account,
+or service units still present) is not automatically overwritten. Diagnose
+its paths and services instead of deleting backups blindly. This safety check
+prevents a fresh installation from deleting data or adopting unknown files.
 The installer warns about likely old GitMirror cron entries during install,
 update and `gitmirror status`. It reports the account or cron file without
 printing the job command. It leaves those jobs untouched.
@@ -206,9 +221,10 @@ rolling back to a version without OAuth.
 ## Replacing an experimental installation
 
 The cron warning covers user crontabs and common system cron paths. Check
-custom scripts and schedules separately. The installer refuses to overwrite the
-directories, services and service account of an existing **managed** installation.
-It leaves experimental scripts, credentials and archives untouched. If an older
+custom scripts and schedules separately. The installer upgrades a complete running **managed** installation and can
+reinstall over a complete, inactive retained state after a normal uninstall.
+It refuses to overwrite incomplete or unrecognized installations. Experimental
+scripts, credentials and archives outside the managed directories are untouched. If an older
 managed install paused writes for migration, updates keep that pause. Check
 `gitmirror status` before resuming.
 
@@ -230,7 +246,7 @@ Run the same online installer for future upgrades. Use `status` to identify the 
 
 For a trusted offline release, use `--tag vX.Y.Z --artifact FILE --sha256 HEX`. Obtain the digest through a trusted channel.
 
-Run `gitmirror uninstall` and answer `y` to remove the application and its two systemd services. The service account, backup volumes, configuration and credentials are retained. Legacy schedule recovery is separate.
+Run `gitmirror uninstall` and answer `y` to remove the application and its two systemd services. The service account, backup volumes, configuration and credentials are retained. Reinstall with the original curl command (confirm `y`) to restore the program and reuse them. An incomplete installation still requires diagnosis rather than an unsafe overwrite. Legacy schedule recovery is separate.
 
 ## Release preparation
 
