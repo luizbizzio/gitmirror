@@ -3996,6 +3996,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         if not permitted or permitted.scheme != 'https' or permitted.hostname not in allowed:
             raise SyncError('Public origin must be HTTPS and use an allowed hostname')
     sessions, attempts = {}, {}
+    mfa_pending = {}
     global_attempts = deque()
     auth_lock = threading.Lock()
     login_slots = threading.BoundedSemaphore(2)
@@ -4014,9 +4015,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             sessions.pop(key, None)
         return None
 
-    def auth(request, *, csrf=False):
+    def auth(request, *, csrf=False, bootstrap=False):
         active = session(request)
-        if not active:
+        if not active or (len(active) > 2 and active[2] != 'auth' and not bootstrap):
             raise HTTPException(401, 'Sign in required')
         if csrf and not hmac.compare_digest(active[1].encode('ascii'),
                                             request.headers.get('X-CSRF-Token', '').encode('utf-8')):
@@ -4093,41 +4094,109 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             global_attempts.append(now)
         return ip, now
 
-    @app.post('/api/login')
-    async def login(request: _GitMirrorWebRequest):
-        if pending_setup:
-            raise HTTPException(409, 'Complete initial setup first')
-        entered = (await body(request)).get('password')
-        ip, now = reserve_attempt(request)
-        try:
-            valid = False
-            if isinstance(entered, str) and len(entered) <= 1024:
-                try:
-                    valid = hmac.compare_digest(await asyncio.to_thread(scrypt_password, entered, salt), password_hash)
-                except UnicodeError:
-                    pass
-        finally:
-            login_slots.release()
-        if not valid:
-            raise HTTPException(401, 'Invalid password')
+    def issue_session(request, stage='auth'):
+        now = time.monotonic()
         key = secrets.token_urlsafe(32)
         with auth_lock:
+            ip = request.client.host if request.client else 'unknown'
             attempts.pop(ip, None)
             sessions.pop(request.cookies.get(cookie, ''), None)
             for expired in [k for k, value in sessions.items() if value[0] <= now]:
                 del sessions[expired]
             if len(sessions) >= 128:
                 sessions.pop(next(iter(sessions)))
-            sessions[key] = (time.monotonic() + session_ttl, secrets.token_urlsafe(32))
+            sessions[key] = (now + session_ttl, secrets.token_urlsafe(32), stage)
         secure = bool(public_origin or request.url.scheme == 'https')
-        response = JSONResponse({'authenticated': True})
+        response = JSONResponse({'authenticated': stage == 'auth', 'first_login': stage == 'bootstrap'})
         response.set_cookie(cookie, key, httponly=True, samesite='strict', secure=secure,
                             max_age=session_ttl, path='/')
         return response
 
+    def verify_password(value, revision_for_password):
+        if not isinstance(value, str) or len(value) > 1024:
+            return False
+        try:
+            salt, digest = managed.credentials(revision_for_password) if managed else (salt, password_hash)
+            return hmac.compare_digest(scrypt_password(value, salt), digest)
+        except (OSError, ValueError, UnicodeError, TypeError, SyncError, OAuthError):
+            return False
+
+    @app.post('/api/login')
+    async def login(request: _GitMirrorWebRequest):
+        entered = (await body(request)).get('password')
+        ip, stamp = reserve_attempt(request)
+        try:
+            if pending_setup and managed and not managed.pending_admin.is_file():
+                try:
+                    managed.authorize_setup(entered)
+                    valid, stage = True, 'bootstrap'
+                except (PermissionError, OSError, SyncError, UnicodeError):
+                    valid, stage = False, 'bootstrap'
+            else:
+                valid = await asyncio.to_thread(verify_password, entered, revision)
+                stage = 'auth'
+        finally:
+            login_slots.release()
+        if not valid:
+            raise HTTPException(401, 'Invalid password')
+        if stage == 'auth' and managed and not pending_setup and private_security(managed.root)['enabled']:
+            challenge = secrets.token_urlsafe(32)
+            now = time.monotonic()
+            with auth_lock:
+                mfa_pending.clear() if len(mfa_pending) > 128 else None
+                mfa_pending[challenge] = (now + 180, ip)
+            response = JSONResponse({'mfa_required': True})
+            response.set_cookie('gm_2fa', challenge, httponly=True, secure=True, samesite='strict',
+                                max_age=180, path='/api/login')
+            return response
+        return issue_session(request, stage)
+
+    @app.post('/api/login/2fa')
+    async def login_second_factor(request: _GitMirrorWebRequest):
+        data = await body(request)
+        ip, stamp = reserve_attempt(request)
+        try:
+            challenge = request.cookies.get('gm_2fa', '')
+            with auth_lock:
+                pending = mfa_pending.get(challenge)
+            if (not pending or pending[0] < time.monotonic() or pending[1] != ip or
+                    not managed or pending_setup or not private_security(managed.root)['enabled']):
+                raise HTTPException(401, 'Start a new sign-in')
+            passed = await asyncio.to_thread(security_verify, managed.root, data.get('code'))
+            if not passed:
+                raise HTTPException(401, 'Invalid authenticator or recovery code')
+            with auth_lock:
+                mfa_pending.pop(challenge, None)
+            response = issue_session(request)
+            response.delete_cookie('gm_2fa', httponly=True, secure=True, samesite='strict', path='/api/login')
+            return response
+        finally:
+            login_slots.release()
+
+    @app.post('/api/setup/password')
+    async def setup_password(request: _GitMirrorWebRequest):
+        if not pending_setup or not managed:
+            raise HTTPException(409, 'Initial setup is already complete')
+        active = auth(request, csrf=True, bootstrap=True)
+        if len(active) < 3 or active[2] != 'bootstrap':
+            raise HTTPException(409, 'Temporary password already replaced')
+        data = await body(request)
+        try:
+            await asyncio.to_thread(managed.set_initial_password, data.get('password'))
+        except ConfigError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except (SyncError, OSError, Timeout):
+            raise HTTPException(409, 'Initial password setup is unavailable') from None
+        with auth_lock:
+            key = request.cookies.get(cookie, '')
+            if key in sessions:
+                sessions[key] = (sessions[key][0], sessions[key][1], 'auth')
+        return {'saved': True}
+
     @app.get('/api/session')
     def get_session(request: _GitMirrorWebRequest):
-        return {'csrf': auth(request)[1]}
+        active = auth(request, bootstrap=True)
+        return {'csrf': active[1], 'first_login': len(active) > 2 and active[2] == 'bootstrap'}
 
     @app.post('/api/logout')
     def logout(request: _GitMirrorWebRequest):
@@ -4150,10 +4219,11 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             if current_revision != revision:
                 return False
             if pending_setup:
-                return key == ''
+                return key == '' and not managed.pending_admin.exists()
             with auth_lock:
                 current = sessions.get(key)
-                return bool(current and current[0] > time.monotonic())
+                return bool(current and current[0] > time.monotonic() and
+                            (len(current) < 3 or current[2] == 'auth'))
 
         flows = OAuthFlows(managed, oauth_authorized)
         app.state.oauth_flows = flows
@@ -4175,7 +4245,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             raise HTTPException(403, 'Start authorization in this browser')
 
         def oauth_actor(request, data=None, *, start=False):
-            if not pending_setup:
+            if not pending_setup or managed.pending_admin.exists():
                 auth(request, csrf=True)
                 key = request.cookies.get(cookie, '')
                 if not oauth_authorized(key):
@@ -4306,7 +4376,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
         @app.get('/api/setup')
         def setup_status():
-            return {'required': pending_setup, 'public_key': managed.public_key() if pending_setup else None,
+            return {'required': pending_setup, 'password_ready': bool(pending_setup and managed.pending_admin.is_file()),
+                    'public_key': managed.public_key() if pending_setup else None,
                     'revision': revision.identifier if revision else None}
 
         async def save_settings(data, *, initial=False):
@@ -4328,20 +4399,24 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             if not pending_setup:
                 raise HTTPException(409, 'Setup is already complete')
             data = await body(request, limit=65536)
-            reserve_attempt(request)
-            try:
-                return await save_settings(data, initial=True)
-            finally:
-                login_slots.release()
+            if managed.pending_admin.exists():
+                auth(request, csrf=True)
+            else:
+                # Compatible with earlier one-step setup clients; the secret is still required.
+                try:
+                    managed.authorize_setup(data.get('code'))
+                except (PermissionError, OSError, SyncError):
+                    raise HTTPException(403, 'Incorrect setup code') from None
+            return await save_settings(data, initial=True)
 
         @app.post('/api/managed/ssh-host')
         async def check_ssh_host(request: _GitMirrorWebRequest):
             data = await body(request)
-            if not pending_setup:
+            if not pending_setup or managed.pending_admin.exists():
                 auth(request, csrf=True)
             reserve_attempt(request)
             try:
-                if pending_setup:
+                if pending_setup and not managed.pending_admin.exists():
                     managed.authorize_setup(data.get('code'))
                 line = await asyncio.to_thread(verified_ssh_host, data)
                 return {'known_host': line}
