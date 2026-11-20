@@ -3584,6 +3584,194 @@ def security_verify(root, code):
 
 
 
+
+DASHBOARD_ROLES = ('administrator', 'operator', 'viewer')
+DASHBOARD_USERNAME = re.compile(r'[a-z][a-z0-9_.-]{2,31}\Z')
+
+
+class DashboardUsers:
+    """Separate managed-dashboard identities. No users or secrets in the Git configuration."""
+
+    def __init__(self, managed):
+        self.managed = managed
+        self.path = managed.root / 'dashboard-users.json'
+        self.lock = managed.root / '.dashboard-users.lock'
+
+    def ensure(self, revision):
+        """One-time, non-destructive upgrade of the original administrator and global TOTP."""
+        if self.path.is_file() or revision is None:
+            return
+        with FileLock(str(self.lock), timeout=25):
+            if self.path.is_file():
+                return
+            original = oauth_private_file(revision.path / 'admin.json')
+            legacy_2fa = private_security(self.managed.root)
+            record = {'role': 'administrator', 'salt': original['salt'],
+                      'password': original['password'], 'generation': 0,
+                      'totp': legacy_2fa}
+            store_oauth(self.path, {'version': 1, 'users': {'admin': record}})
+
+    def _all(self):
+        data = oauth_private_file(self.path)
+        if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('users'), dict):
+            raise SyncError('Dashboard user database is invalid')
+        return data
+
+    def get(self, username):
+        if not isinstance(username, str) or not DASHBOARD_USERNAME.fullmatch(username):
+            return None
+        try:
+            user = self._all()['users'].get(username)
+        except FileNotFoundError:
+            return None
+        if not isinstance(user, dict) or user.get('role') not in DASHBOARD_ROLES:
+            return None
+        return user
+
+    def verify(self, username, password):
+        user = self.get(username)
+        if not isinstance(password, str) or len(password) > 1024:
+            return False
+        try:
+            if user:
+                salt, digest = bytes.fromhex(user['salt']), bytes.fromhex(user['password'])
+            else:
+                salt, digest = b'\0' * 32, b'\0' * 64
+            valid = hmac.compare_digest(scrypt_password(password, salt), digest)
+            return bool(user and valid)
+        except (ValueError, TypeError, UnicodeError):
+            return False
+
+    def public(self):
+        data = self._all()
+        return [{'username': name, 'role': user['role'],
+                 'totp': bool(user.get('totp', {}).get('enabled')),
+                 'generation': user.get('generation', 0)}
+                for name, user in sorted(data['users'].items())]
+
+    def _mutate(self, change):
+        with FileLock(str(self.lock), timeout=25):
+            data = self._all()
+            result = change(data['users'])
+            if not any(item.get('role') == 'administrator' for item in data['users'].values()):
+                raise ConfigError('At least one administrator must remain')
+            store_oauth(self.path, data)
+            return result
+
+    @staticmethod
+    def _password(user, password):
+        if not valid_admin_password(password):
+            raise ConfigError('Password must contain 6 to 1024 characters')
+        salt = secrets.token_bytes(32)
+        user['salt'], user['password'] = salt.hex(), scrypt_password(password, salt).hex()
+        user['generation'] = user.get('generation', 0) + 1
+
+    def create(self, username, role, password):
+        if not isinstance(username, str):
+            raise ConfigError('Choose a username')
+        username = username.strip().lower()
+        if not DASHBOARD_USERNAME.fullmatch(username) or role not in DASHBOARD_ROLES:
+            raise ConfigError('Use a 3 to 32 character username and a valid role')
+        if not valid_admin_password(password):
+            raise ConfigError('Password must contain 6 to 1024 characters')
+        def change(users):
+            if username in users or len(users) >= 32:
+                raise ConfigError('Username already exists or user limit reached')
+            user = {'role': role, 'totp': {'enabled': False}, 'generation': 0}
+            self._password(user, password)
+            users[username] = user
+        self._mutate(change)
+        return username
+
+    def manage(self, username, action, value=None, *, actor=None):
+        if not isinstance(username, str) or not DASHBOARD_USERNAME.fullmatch(username):
+            raise ConfigError('Invalid username')
+        if action not in ('role', 'password', 'delete', 'reset_2fa'):
+            raise ConfigError('Unknown user operation')
+        def change(users):
+            if username not in users:
+                raise ConfigError('Unknown user')
+            if action == 'delete':
+                if username == actor:
+                    raise ConfigError('You cannot delete your own account')
+                del users[username]
+                return
+            user = users[username]
+            if action == 'role':
+                if value not in DASHBOARD_ROLES:
+                    raise ConfigError('Unknown role')
+                if username == actor and value != 'administrator':
+                    raise ConfigError('You cannot remove your own administrator role')
+                user['role'] = value
+            elif action == 'password':
+                self._password(user, value)
+                return
+            elif action == 'reset_2fa':
+                user['totp'] = {'enabled': False}
+            user['generation'] = user.get('generation', 0) + 1
+        self._mutate(change)
+
+    def start_totp(self, username):
+        secret = base64.b32encode(secrets.token_bytes(20)).decode('ascii').rstrip('=')
+        def change(users):
+            state = users[username].get('totp', {})
+            if state.get('enabled'):
+                raise ConfigError('Two-factor authentication is already enabled')
+            users[username]['totp'] = {'enabled': False, 'pending_secret': secret,
+                                        'pending_until': time.time() + 600}
+        self._mutate(change)
+        return secret
+
+    def confirm_totp(self, username, code):
+        def change(users):
+            state = users[username].get('totp', {})
+            if state.get('enabled') or state.get('pending_until', 0) <= time.time():
+                raise ConfigError('Authenticator setup has expired')
+            secret = state.get('pending_secret', '')
+            if totp_counter(secret, code) is None:
+                raise ConfigError('Invalid six-digit authenticator code')
+            recovery = [secrets.token_urlsafe(12) for _ in range(8)]
+            users[username]['totp'] = {
+                'enabled': True, 'secret': secret, 'last_counter': -1,
+                'recovery': [hashlib.sha256(code.encode('ascii')).hexdigest() for code in recovery]}
+            users[username]['generation'] = users[username].get('generation', 0) + 1
+            return recovery
+        return self._mutate(change)
+
+    def cancel_totp(self, username):
+        def change(users):
+            if not users[username].get('totp', {}).get('enabled'):
+                users[username]['totp'] = {'enabled': False}
+        self._mutate(change)
+
+    def verify_totp(self, username, code):
+        """Single-use TOTPs and recovery codes, with a cross-process file lock."""
+        def change(users):
+            state = users.get(username, {}).get('totp', {})
+            if not state.get('enabled'):
+                return False
+            counter = totp_counter(state.get('secret', ''), code)
+            if counter is not None and counter > state.get('last_counter', -1):
+                state['last_counter'] = counter
+                return True
+            if isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_-]{16}', code):
+                digest = hashlib.sha256(code.encode('ascii')).hexdigest()
+                matches = state.get('recovery', [])
+                for index, item in enumerate(matches):
+                    if hmac.compare_digest(item, digest):
+                        del matches[index]
+                        return True
+            return False
+        return self._mutate(change)
+
+    def disable_totp(self, username):
+        def change(users):
+            users[username]['totp'] = {'enabled': False}
+            users[username]['generation'] = users[username].get('generation', 0) + 1
+        self._mutate(change)
+
+
+
 def ssh_host_key_line(line):
     parts = line.split()
     if (len(parts) < 3 or not re.fullmatch(r'[A-Za-z0-9.\[\]:,_|+=-]+', parts[0])
