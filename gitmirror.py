@@ -4255,7 +4255,11 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         if not users or pending_setup:
             return
         key = request.cookies.get(cookie, '')
-        username = acting(request)
+        with auth_lock:
+            old = sessions.get(key)
+            username = old[3] if old else None
+        if not username:
+            return
         current = users.get(username)
         with auth_lock:
             for candidate, value in list(sessions.items()):
@@ -4369,35 +4373,41 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
     @app.post('/api/login')
     async def login(request: _GitMirrorWebRequest):
-        entered = (await body(request)).get('password')
+        data = await body(request)
+        entered = data.get('password')
+        username = data.get('username', 'admin')
+        username = username.strip().lower() if isinstance(username, str) else ''
         ip, stamp = reserve_attempt(request)
         try:
             if pending_setup and managed and not managed.pending_admin.is_file():
                 try:
                     managed.authorize_setup(entered)
-                    valid, stage = True, 'bootstrap'
+                    valid, stage = username == 'admin', 'bootstrap'
                 except (PermissionError, OSError, SyncError, UnicodeError):
                     valid, stage = False, 'bootstrap'
             else:
-                valid = await asyncio.to_thread(verify_password, entered, revision)
+                valid = await asyncio.to_thread(verify_password, entered, revision, username)
+                valid = valid and (managed is not None or username == 'admin')
                 stage = 'auth'
         finally:
             login_slots.release()
         if not valid:
-            raise HTTPException(401, 'Invalid password')
-        if stage == 'auth' and managed and not pending_setup and private_security(managed.root)['enabled']:
+            raise HTTPException(401, 'Invalid username or password')
+        account = users.get(username) if users and not pending_setup else None
+        if stage == 'auth' and account and account.get('totp', {}).get('enabled'):
             challenge = secrets.token_urlsafe(32)
             now = time.monotonic()
             with auth_lock:
                 sessions.pop(request.cookies.get(cookie, ''), None)
                 if len(mfa_pending) > 128:
                     mfa_pending.clear()
-                mfa_pending[challenge] = (now + 180, ip)
+                mfa_pending[challenge] = (now + 180, ip, username, account['generation'])
             response = JSONResponse({'mfa_required': True})
-            response.set_cookie('gm_2fa', challenge, httponly=True, secure=True, samesite='strict',
-                                max_age=180, path='/api/login')
+            response.set_cookie('gm_2fa', challenge, httponly=True,
+                                secure=bool(public_origin or request.url.scheme == 'https'),
+                                samesite='strict', max_age=180, path='/api/login')
             return response
-        return issue_session(request, stage)
+        return issue_session(request, stage, username)
 
     @app.post('/api/login/2fa')
     async def login_second_factor(request: _GitMirrorWebRequest):
@@ -4407,16 +4417,20 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             challenge = request.cookies.get('gm_2fa', '')
             with auth_lock:
                 pending = mfa_pending.get(challenge)
+            user = users.get(pending[2]) if pending and users else None
             if (not pending or pending[0] < time.monotonic() or pending[1] != ip or
-                    not managed or pending_setup or not private_security(managed.root)['enabled']):
+                    not user or user['generation'] != pending[3] or
+                    not user.get('totp', {}).get('enabled')):
                 raise HTTPException(401, 'Start a new sign-in')
-            passed = await asyncio.to_thread(security_verify, managed.root, data.get('code'))
+            passed = await asyncio.to_thread(users.verify_totp, pending[2], data.get('code'))
             if not passed:
                 raise HTTPException(401, 'Invalid authenticator or recovery code')
             with auth_lock:
                 mfa_pending.pop(challenge, None)
-            response = issue_session(request)
-            response.delete_cookie('gm_2fa', httponly=True, secure=True, samesite='strict', path='/api/login')
+            response = issue_session(request, username=pending[2])
+            response.delete_cookie('gm_2fa', httponly=True,
+                                   secure=bool(public_origin or request.url.scheme == 'https'),
+                                   samesite='strict', path='/api/login')
             return response
         finally:
             login_slots.release()
@@ -4438,7 +4452,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         with auth_lock:
             key = request.cookies.get(cookie, '')
             if key in sessions:
-                sessions[key] = (time.monotonic() + session_ttl, sessions[key][1], 'auth')
+                sessions[key] = (time.monotonic() + session_ttl, sessions[key][1], 'auth', 'admin', 0)
         response = JSONResponse({'saved': True})
         response.set_cookie(cookie, key, httponly=True, samesite='strict',
                             secure=bool(public_origin or request.url.scheme == 'https'),
@@ -4448,7 +4462,10 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
     @app.get('/api/session')
     def get_session(request: _GitMirrorWebRequest):
         active = auth(request, bootstrap=True)
-        return {'csrf': active[1], 'first_login': len(active) > 2 and active[2] == 'bootstrap'}
+        username = active[3]
+        account = users.get(username) if users and not pending_setup else None
+        return {'csrf': active[1], 'first_login': active[2] == 'bootstrap',
+                'username': username, 'role': account['role'] if account else 'administrator'}
 
     @app.post('/api/logout')
     def logout(request: _GitMirrorWebRequest):
