@@ -24,13 +24,16 @@ const row = (...cells) => `<tr>${cells.map((value) => `<td>${value}</td>`).join(
 const button = (action, value, label, disabled = false) => `<button class="link" type="button" data-action="${action}" data-value="${escape(value)}" ${disabled ? "disabled" : ""}>${escape(label)}</button>`;
 const origins = {cli: "CLI", web: "Web", scheduled: "Scheduler", cron: "Cron"};
 const pages = {overview: "Dashboard", repositories: "Repositories", destinations: "Destinations", backups: "Backups",
-  activity: "Activity log", settings: "Settings"};
+  activity: "Activity log", settings: "Settings", users: "Users"};
 
 let csrf = "", view = "overview", snapshot = null, stream = null, refreshTimer = null;
 let repositories = [], targetSignature = "", currentRun = "", restoreSelection = null, targets = [];
 let loading = false, refreshPending = false, logRequest = 0, busy = false;
 let previewMode = false, initialSetupData = null;
 let securityEnrollment = false, securityRecovery = false;
+let currentRole = "administrator", currentUsername = "admin";
+const canOperate = () => currentRole !== "viewer";
+const canAdmin = () => currentRole === "administrator";
 let inventoryWarmupAttempted = false;
 const mobileNavigation = window.matchMedia("(max-width: 760px)");
 let compactNavigation = false;
@@ -110,6 +113,7 @@ function updateSystemStatus(data) {
 
 function signOut() {
   csrf = "";
+  currentRole = "administrator";
   stream?.close();
   stream = null;
   clearInterval(refreshTimer);
@@ -152,6 +156,7 @@ function report(error) { notify(error.message, true); }
 
 function openView(name, {updateUrl = true} = {}) {
   if (!Object.hasOwn(pages, name)) return;
+  if (name === "users" && (!canAdmin() || previewMode)) name = "overview";
   view = name;
   for (const item of all("#main-navigation [data-view]")) {
     if (item.dataset.view === view) item.setAttribute("aria-current", "page");
@@ -438,8 +443,11 @@ function renderDestinations(data) {
 
 function renderSettings(data) {
   $("#security-panel").hidden = !data.web.managed;
-  $("#edit-configuration").hidden = !data.web.managed;
-  $("#check-connections").hidden = !data.web.managed;
+  $("#edit-configuration").hidden = !data.web.managed || !canAdmin();
+  $("#check-connections").hidden = !data.web.managed || !canOperate();
+  $("#password-panel").hidden = !data.web.managed;
+  $("#account-description").textContent = currentUsername + " · " + currentRole;
+  $("#totp-account-description").textContent = "Account: GitMirror (" + currentUsername + "). Type: TOTP, SHA1, 6 digits, 30 seconds.";
   $("#check-connections button").disabled = busy;
   $("#settings").innerHTML = list([["Source", `${providerLabel(data.source.provider)} / ${data.source.owner}`],
     ["Source API", data.source.api_url], ["Schedule interval", `${data.schedule_hours} hours`],
@@ -574,6 +582,7 @@ async function refresh() {
     busy = snapshot.active.some((run) => run.origin === "web");
     updateSystemStatus(snapshot);
     renderContext();
+    $("#discover").disabled = !canOperate() || busy;
     switch (view) {
       case "overview":
         renderOverview(snapshot);
@@ -581,6 +590,7 @@ async function refresh() {
         break;
       case "destinations": renderDestinations(snapshot); break;
       case "settings": renderSettings(snapshot); if (snapshot.web.managed) await loadSecurity(); break;
+      case "users": if (canAdmin()) await loadUsers(); break;
       case "activity": renderActivity(); await loadLog(); break;
       case "backups": renderBackups(await api("/api/backups")); break;
       case "repositories": {
@@ -616,6 +626,11 @@ function connect() {
 async function boot() {
   const session = await api("/api/session");
   csrf = session.csrf;
+  currentRole = session.role || "administrator";
+  currentUsername = session.username || "admin";
+  $("[data-view=users]").hidden = !canAdmin();
+  $("#signed-in-user").hidden = false;
+  $("#signed-in-user").textContent = currentUsername + " · " + currentRole;
   previewMode = false;
   initialSetupData = null;
   inventoryWarmupAttempted = false;
@@ -744,7 +759,8 @@ $("#login-form").addEventListener("submit", async (event) => {
   control.disabled = true;
   $("#login-error").textContent = "";
   try {
-    const result = await post("/api/login", {password: $("#login-password").value});
+    const result = await post("/api/login", {
+      username: $("#login-username").value.trim(), password: $("#login-password").value});
     $("#login-password").value = "";
     if (result.mfa_required) showSecondFactor();
     else await finishLogin();
