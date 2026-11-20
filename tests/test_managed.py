@@ -39,6 +39,43 @@ def managed_app(installation, **options):
                                    managed=installation, revision=revision, **options)
 
 
+
+def test_managed_dashboard_hostnames_and_tailscale_ips(installation, monkeypatch):
+    managed, config = installation
+    monkeypatch.setattr(gitmirror.socket, 'gethostname', lambda: 'rpi5')
+    monkeypatch.setattr(gitmirror.socket, 'getfqdn', lambda: 'rpi5.lan')
+    from subprocess import CompletedProcess
+    import json
+
+    def local_interfaces(argv, **kwargs):
+        if argv[:2] == ['ip', '-j']:
+            payload = [{'addr_info': [{'local': '192.168.1.80'},
+                                     {'local': '100.101.102.103'}]}]
+            return CompletedProcess(argv, 0, json.dumps(payload), '')
+        if argv == ['hostname', '-I']:
+            return CompletedProcess(argv, 0, '192.168.1.80 100.101.102.103', '')
+        if argv == ['tailscale', 'status', '--json']:
+            payload = {'Self': {'DNSName': 'rpi5.my-tailnet.ts.net.',
+                                'TailscaleIPs': ['100.101.102.103']}}
+            return CompletedProcess(argv, 0, json.dumps(payload), '')
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(gitmirror.subprocess, 'run', local_interfaces)
+    app = managed_app(managed, allowed_hosts=['rpi5.local'])
+    for host in ('rpi5', 'rpi5.local', 'rpi5.lan', '192.168.1.80',
+                 '100.101.102.103', 'rpi5.my-tailnet.ts.net'):
+        with TestClient(app, base_url='https://' + host + ':8787') as client:
+            assert client.get('/api/setup').status_code == 200, host
+            bad_origin = client.post('/api/login',
+                                     headers={'Origin': 'https://evil.example'},
+                                     json={'password': config['code']})
+            assert bad_origin.status_code == 403
+    for host in ('evil.example', '192.168.1.81', 'rpi5.evil.ts.net',
+                 'fake.my-tailnet.ts.net'):
+        with TestClient(app, base_url='https://' + host + ':8787') as client:
+            assert client.get('/').status_code == 400, host
+
+
 def test_one_time_browser_setup_rejects_cross_origin_and_bad_code(installation):
     managed, config = installation
     with TestClient(managed_app(managed), base_url='http://localhost') as client:
