@@ -159,7 +159,7 @@ issue_certificate() {
             seen[DNS:$dns]=1
         fi
     fi
-    (IFS=,; san="${alternative_names[*]}")
+    san=$(IFS=,; printf '%s' "${alternative_names[*]}")
     [[ -n "$san" ]] || fail 'No usable dashboard TLS hostname'
     install -d -m 0750 -g "$account" "$etc/tls"
     (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
