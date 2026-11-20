@@ -4289,8 +4289,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 return False
             if current_revision != revision:
                 return False
-            if pending_setup:
-                return key == '' and not managed.pending_admin.exists()
+            if pending_setup and not managed.pending_admin.exists():
+                return key == ''
             with auth_lock:
                 current = sessions.get(key)
                 return bool(current and current[0] > time.monotonic() and
