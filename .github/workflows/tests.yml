@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main, feature/first-login-and-totp]
+    branches: [main]
   pull_request:
 
 jobs:
