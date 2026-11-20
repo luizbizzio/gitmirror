@@ -3157,6 +3157,12 @@ class DashboardJournal:
                         scope TEXT NOT NULL, id TEXT NOT NULL, due REAL NOT NULL, lease REAL NOT NULL,
                         PRIMARY KEY(scope, id)
                     );
+                    CREATE TABLE IF NOT EXISTS dashboard_audit (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        at REAL NOT NULL, username TEXT NOT NULL,
+                        action TEXT NOT NULL, target TEXT NOT NULL, detail TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS dashboard_audit_at ON dashboard_audit(at DESC);
                 """)
             if os.name != 'nt':
                 self.path.chmod(0o600)
@@ -3185,6 +3191,13 @@ class DashboardJournal:
             return self.change.stat().st_mtime_ns
         except OSError:
             return 0
+
+    def audit(self, username, action, target='', detail=''):
+        if not all(isinstance(item, str) and len(item) <= 200 for item in
+                   (username, action, target, detail)):
+            raise ValueError('Invalid audit entry')
+        self.write('INSERT INTO dashboard_audit (at,username,action,target,detail) VALUES (?,?,?,?,?)',
+                   (time.time(), username, action, target, detail))
 
     def begin(self, identifier, operation, mode, origin, repository, destinations, *, state='running'):
         now = time.time()
