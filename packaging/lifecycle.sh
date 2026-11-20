@@ -12,7 +12,7 @@ installer=/opt/gitmirror-managed/current/install.sh
 engine=/opt/gitmirror-managed/current/venv/bin/gitmirror
 
 if (($# == 0)); then
-    printf 'GitMirror management: gitmirror -up | -v | status | check | rollback | uninstall\n'
+    printf 'GitMirror management: gitmirror update | status | check | rollback | uninstall | -v\n'
     printf 'Other arguments are passed to the GitMirror Python CLI.\n'
     exit 0
 fi
