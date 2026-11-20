@@ -338,7 +338,7 @@ def test_actual_http_event_stream_changes_and_revokes(web_setup, monkeypatch):
 
 def test_web_rejects_short_password_and_unsafe_bind(web_setup):
     settings, config = web_setup
-    with pytest.raises(gitmirror.SyncError, match='12 to 1024'):
+    with pytest.raises(gitmirror.SyncError, match='6 to 1024'):
         gitmirror.create_web_app(settings, config, password='short', assets_dir=ASSETS)
     with pytest.raises(gitmirror.SyncError, match='--allow-lan'):
         gitmirror.serve_web(config, host='0.0.0.0')
