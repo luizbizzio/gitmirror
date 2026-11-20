@@ -109,7 +109,78 @@ def test_automatic_install_upgrade_selection_does_not_overwrite_partial_state(tm
         select_action
     """, partial)
     assert failed.returncode != 0
-    assert 'refusing to overwrite' in failed.stderr
+    assert 'Nothing was overwritten' in failed.stderr
+
+
+
+def test_retained_uninstall_is_selected_for_reinstall_without_erasing_data(tmp_path):
+    setup = """
+        app="$PWD/app" state="$PWD/state" etc="$PWD/etc" unit_dir="$PWD/units"
+        web=web.service scheduler=scheduler.service account=gitmirror-managed
+        mkdir -m 700 "$state"
+        mkdir -m 755 "$etc" "$unit_dir"
+        printf '8787\nrpi5.local\n' > "$etc/listener"
+        touch "$etc/sync.lock" "$etc/sync-lock-created"
+        printf 'test-preserved-secret\n' > "$state/sentinel"
+        printf 'test-preserved-configuration\n' > "$etc/sentinel"
+        getent() { return 0; }
+        id() { [[ "$1" == -u ]] && printf '%s\n' "$(command id -u)"; }
+        stat() {
+            if [[ "$*" == *"$etc" ]]; then
+                printf '0 755\n'
+            else
+                command stat "$@"
+            fi
+        }
+        systemctl() { return 3; }
+        action=auto
+        select_action
+        [[ "$action" == reinstall ]]
+        [[ "$(cat "$state/sentinel")" == test-preserved-secret ]]
+        [[ "$(cat "$etc/sentinel")" == test-preserved-configuration ]]
+        action=reinstall
+        retained_reinstall_ready
+        touch "$unit_dir/$web"
+        if retained_reinstall_ready; then exit 7; fi
+        rm -- "$unit_dir/$web"
+        mkdir "$app"
+        if retained_reinstall_ready; then exit 8; fi
+    """
+    result = shell(setup, tmp_path)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert (tmp_path / 'state/sentinel').read_text().strip() == 'test-preserved-secret'
+    assert (tmp_path / 'etc/sentinel').read_text().strip() == 'test-preserved-configuration'
+
+
+def test_reinstall_error_only_cleans_new_program_not_retained_data(tmp_path):
+    setup = """
+        source "$PROJECT/packaging/lifecycle.sh"
+        app="$PWD/app" state="$PWD/state" etc="$PWD/etc" unit_dir="$PWD/units"
+        web=web.service scheduler=scheduler.service account=gitmirror-managed
+        cli="$PWD/launcher"
+        mkdir -m 700 "$state"
+        mkdir -m 755 "$etc" "$unit_dir"
+        printf '8787\n\n' > "$etc/listener"
+        touch "$etc/sync.lock" "$etc/sync-lock-created"
+        printf 'keep-me\n' > "$state/secret"
+        printf 'keep-settings\n' > "$etc/secret"
+        getent() { return 0; }
+        id() { [[ "$1" == -u ]] && printf '%s\n' "$(command id -u)"; }
+        stat() {
+            if [[ "$*" == *"$etc" ]]; then printf '0 755\n'; else command stat "$@"; fi
+        }
+        systemctl() { return 3; }
+        confirm() { :; }
+        ensure_managed_lock() { :; }
+        build_release() { false; }
+        trap cleanup_lifecycle EXIT
+        reinstall
+    """
+    result = shell(setup, tmp_path)
+    assert result.returncode != 0, result.stdout
+    assert not (tmp_path / 'app').exists()
+    assert (tmp_path / 'state/secret').read_text().strip() == 'keep-me'
+    assert (tmp_path / 'etc/secret').read_text().strip() == 'keep-settings'
 
 
 def test_automatic_fallback_uses_main_without_dev_confirmation(tmp_path):
