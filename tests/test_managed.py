@@ -377,3 +377,44 @@ def test_existing_managed_totp_is_migrated_to_admin(installation):
         assert client.post('/api/login/2fa', json={'code': code}).status_code == 200
     assert (managed.root / 'dashboard-users.json').exists()
     assert managed.root.joinpath('security.json').exists()
+
+
+
+def test_user_2fa_is_individual_and_other_accounts_stay_accessible(installation):
+    managed, config = installation
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        assert client.post('/api/setup', json=config).status_code == 200
+    with (TestClient(managed_app(managed), base_url='https://localhost') as admin,
+          TestClient(managed_app(managed), base_url='https://localhost') as viewer):
+        csrf = login(admin)
+        assert admin.post('/api/users', headers=csrf, json={
+            'username': 'visitor', 'role': 'viewer',
+            'password': 'visitor-pass', 'current_password': PASSWORD}).status_code == 200
+        assert viewer.post('/api/login', json={
+            'username': 'visitor', 'password': 'visitor-pass'}).status_code == 200
+        vcsrf = {'X-CSRF-Token': viewer.get('/api/session').json()['csrf']}
+        started = viewer.post('/api/security/totp/start', headers=vcsrf, json={'password': 'visitor-pass'})
+        assert started.status_code == 200, started.text
+        secret = started.json()['secret']
+        confirmed = viewer.post('/api/security/totp/confirm', headers=vcsrf, json={
+            'code': gitmirror.totp_at(secret, int(time.time() // 30))})
+        assert confirmed.status_code == 200, confirmed.text
+        recovery = confirmed.json()['recovery_codes']
+        assert len(recovery) == 8
+        assert admin.get('/api/security').json()['enabled'] is False
+        assert viewer.get('/api/security').json()['enabled'] is True
+        assert viewer.post('/api/logout', headers=vcsrf, json={}).status_code == 200
+        assert viewer.post('/api/login', json={
+            'username': 'visitor', 'password': 'visitor-pass'}).json()['mfa_required']
+        assert viewer.get('/api/session').status_code == 401
+        assert viewer.post('/api/login/2fa', json={'code': recovery[0]}).status_code == 200
+        assert viewer.get('/api/session').json()['username'] == 'visitor'
+        assert admin.get('/api/session').status_code == 200
+        # Reset by the administrator invalidates this viewer's current session.
+        assert admin.post('/api/users/visitor/manage', headers=csrf, json={
+            'action': 'reset_2fa', 'current_password': PASSWORD}).status_code == 200
+        assert viewer.get('/api/session').status_code == 401
+        assert viewer.post('/api/login', json={
+            'username': 'visitor', 'password': 'visitor-pass'}).json()['authenticated']
+        assert viewer.get('/api/security').json()['enabled'] is False
+        assert managed.root.joinpath('dashboard-users.json').stat().st_mode & 0o077 == 0
