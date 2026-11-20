@@ -120,6 +120,8 @@ function signOut() {
   $("#login-form").hidden = false;
   $("#first-password-form").hidden = true;
   $("#mfa-form").hidden = true;
+  $("#login-label").textContent = "Dashboard password";
+  $("#login-description").textContent = "Sign in to manage your mirrors and backups.";
   securityEnrollment = securityRecovery = false;
   for (const dialog of all("dialog[open]")) dialog.close();
   $("#login-password").focus();
