@@ -4096,6 +4096,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
     def issue_session(request, stage='auth'):
         now = time.monotonic()
+        lifetime = min(session_ttl, 600) if stage == 'bootstrap' else session_ttl
         key = secrets.token_urlsafe(32)
         with auth_lock:
             ip = request.client.host if request.client else 'unknown'
@@ -4105,11 +4106,11 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 del sessions[expired]
             if len(sessions) >= 128:
                 sessions.pop(next(iter(sessions)))
-            sessions[key] = (now + session_ttl, secrets.token_urlsafe(32), stage)
+            sessions[key] = (now + lifetime, secrets.token_urlsafe(32), stage)
         secure = bool(public_origin or request.url.scheme == 'https')
         response = JSONResponse({'authenticated': stage == 'auth', 'first_login': stage == 'bootstrap'})
         response.set_cookie(cookie, key, httponly=True, samesite='strict', secure=secure,
-                            max_age=session_ttl, path='/')
+                            max_age=lifetime, path='/')
         return response
 
     def verify_password(value, revision_for_password):
@@ -4190,8 +4191,12 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         with auth_lock:
             key = request.cookies.get(cookie, '')
             if key in sessions:
-                sessions[key] = (sessions[key][0], sessions[key][1], 'auth')
-        return {'saved': True}
+                sessions[key] = (time.monotonic() + session_ttl, sessions[key][1], 'auth')
+        response = JSONResponse({'saved': True})
+        response.set_cookie(cookie, key, httponly=True, samesite='strict',
+                            secure=bool(public_origin or request.url.scheme == 'https'),
+                            max_age=session_ttl, path='/')
+        return response
 
     @app.get('/api/session')
     def get_session(request: _GitMirrorWebRequest):
@@ -4467,7 +4472,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
         @app.post('/api/setup')
         async def setup(request: _GitMirrorWebRequest):
-            if not pending_setup:
+            if not pending_setup or managed.active():
                 raise HTTPException(409, 'Setup is already complete')
             data = await body(request, limit=65536)
             if managed.pending_admin.exists():
