@@ -318,6 +318,36 @@ def test_dependencies_require_approval_and_install_only_missing(tmp_path):
     assert (tmp_path / 'apt.calls').read_text().splitlines() == ['update', 'install -y -- git-lfs']
 
 
+
+def test_new_cert_includes_short_hostname_ip_and_tailscale(tmp_path):
+    if not shutil.which('openssl') or not shutil.which('jq'):
+        pytest.skip('OpenSSL and jq required for certificate test')
+    result = shell("""
+        source "$PROJECT/packaging/lifecycle.sh"
+        etc="$PWD/etc"; mkdir "$etc"
+        account=$(command id -gn)
+        lan=rpi5.local
+        hostname() {
+            case "$1" in
+                -s) printf 'rpi5\\n' ;;
+                -f) printf 'rpi5.local\\n' ;;
+                -I) printf '192.168.2.50 100.101.102.103\\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        tailscale() {
+            printf '{"Self":{"DNSName":"rpi5.my-tailnet.ts.net."}}\\n'
+        }
+        chown() { :; }
+        issue_certificate
+        openssl x509 -noout -ext subjectAltName -in "$etc/tls/server.crt"
+    """, tmp_path)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    for name in ('DNS:rpi5.local', 'DNS:rpi5', 'IP Address:192.168.2.50',
+                 'IP Address:100.101.102.103', 'DNS:rpi5.my-tailnet.ts.net'):
+        assert name in result.stdout, (name, result.stdout)
+
+
 def test_installer_exposes_clean_lifecycle_only(tmp_path):
     result = subprocess.run(['bash', str(ROOT / 'install.sh'), '--help'],
                             capture_output=True, text=True, timeout=10)
