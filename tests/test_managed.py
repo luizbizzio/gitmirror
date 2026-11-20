@@ -280,3 +280,100 @@ def test_totp_enrollment_login_recovery_and_disable(installation):
         assert not client.get('/api/security').json()['enabled']
         assert client.post('/api/logout', headers=csrf, json={}).status_code == 200
         assert client.post('/api/login', json={'password': PASSWORD}).json()['authenticated']
+
+
+
+def test_managed_user_roles_session_revocation_and_audit(installation):
+    managed, payload = installation
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        assert client.post('/api/setup', json=payload).status_code == 200
+
+    with (TestClient(managed_app(managed), base_url='https://localhost') as admin,
+          TestClient(managed_app(managed), base_url='https://localhost') as viewer,
+          TestClient(managed_app(managed), base_url='https://localhost') as operator):
+        csrf = login(admin)
+        assert admin.get('/api/session').json()['role'] == 'administrator'
+        assert admin.get('/api/users').json()['users'][0]['username'] == 'admin'
+        assert admin.post('/api/users', headers=csrf, json={
+            'username': 'viewer1', 'role': 'viewer', 'password': '123456',
+            'current_password': 'wrong'}).status_code == 403
+        assert admin.post('/api/users', headers=csrf, json={
+            'username': 'viewer1', 'role': 'viewer', 'password': '123456',
+            'current_password': PASSWORD}).status_code == 200
+        assert admin.post('/api/users', headers=csrf, json={
+            'username': 'operator1', 'role': 'operator', 'password': 'op-passphrase',
+            'current_password': PASSWORD}).status_code == 200
+        response = admin.get('/api/users')
+        assert response.status_code == 200
+        assert [account['username'] for account in response.json()['users']] == [
+            'admin', 'operator1', 'viewer1']
+        assert 'salt' not in response.text and 'password' not in response.text
+        assert admin.post('/api/users/admin/manage', headers=csrf, json={
+            'action': 'role', 'value': 'viewer',
+            'current_password': PASSWORD}).status_code == 400
+        assert admin.post('/api/users/admin/manage', headers=csrf, json={
+            'action': 'delete', 'current_password': PASSWORD}).status_code == 400
+
+        assert viewer.post('/api/login', json={
+            'username': 'viewer1', 'password': '123456'}).status_code == 200
+        vcsrf = {'X-CSRF-Token': viewer.get('/api/session').json()['csrf']}
+        assert viewer.get('/api/session').json()['role'] == 'viewer'
+        for path in ('/api/overview', '/api/repositories', '/api/backups'):
+            assert viewer.get(path).status_code == 200
+        for path in ('/api/users', '/api/audit', '/api/managed/settings'):
+            assert viewer.get(path).status_code == 403
+        for path in ('/api/sync', '/api/managed/check', '/api/backups/verify',
+                     '/api/backups/restore', '/api/repositories/refresh',
+                     '/api/managed/settings', '/api/users'):
+            assert viewer.post(path, headers=vcsrf, json={}).status_code == 403
+        assert viewer.post('/api/users/me/password', headers=vcsrf, json={
+            'current_password': 'wrong', 'password': '654321'}).status_code == 403
+        assert viewer.post('/api/users/me/password', headers=vcsrf, json={
+            'current_password': '123456', 'password': '654321'}).status_code == 200
+        assert viewer.get('/api/session').status_code == 200
+
+        assert operator.post('/api/login', json={
+            'username': 'operator1', 'password': 'op-passphrase'}).status_code == 200
+        ocsrf = {'X-CSRF-Token': operator.get('/api/session').json()['csrf']}
+        assert operator.get('/api/session').json()['role'] == 'operator'
+        assert operator.post('/api/sync', headers=ocsrf, json={}).status_code == 400
+        assert operator.post('/api/backups/restore', headers=ocsrf, json={}).status_code == 403
+        assert operator.get('/api/users').status_code == 403
+        assert operator.get('/api/managed/settings').status_code == 403
+
+        assert admin.post('/api/users/operator1/manage', headers=csrf, json={
+            'action': 'role', 'value': 'viewer',
+            'current_password': PASSWORD}).status_code == 200
+        assert operator.get('/api/session').status_code == 401
+        assert admin.post('/api/users/viewer1/manage', headers=csrf, json={
+            'action': 'reset_2fa', 'current_password': PASSWORD}).status_code == 200
+        assert viewer.get('/api/session').status_code == 401
+        assert admin.post('/api/users/viewer1/manage', headers=csrf, json={
+            'action': 'password', 'value': 'reset-pass',
+            'current_password': PASSWORD}).status_code == 200
+        assert admin.post('/api/users/viewer1/manage', headers=csrf, json={
+            'action': 'delete', 'current_password': PASSWORD}).status_code == 200
+        assert viewer.post('/api/login', json={
+            'username': 'viewer1', 'password': 'reset-pass'}).status_code == 401
+        history = admin.get('/api/audit').json()['entries']
+        actions = [entry['action'] for entry in history]
+        assert 'user.created' in actions and 'user.role' in actions
+        assert 'password.changed' in actions and 'user.delete' in actions
+        assert PASSWORD not in str(history) and 'reset-pass' not in str(history)
+
+
+def test_existing_managed_totp_is_migrated_to_admin(installation):
+    managed, payload = installation
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        assert client.post('/api/setup', json=payload).status_code == 200
+    secret = base64.b32encode(b'old-2fa-setup-for-test').decode().rstrip('=')
+    gitmirror.store_oauth(managed.root / 'security.json', {
+        'enabled': True, 'secret': secret, 'last_counter': -1, 'recovery': []})
+    with TestClient(managed_app(managed), base_url='https://localhost') as client:
+        assert client.get('/api/login').status_code == 405
+        result = client.post('/api/login', json={'username': 'admin', 'password': PASSWORD})
+        assert result.json()['mfa_required']
+        code = gitmirror.totp_at(secret, int(time.time() // 30))
+        assert client.post('/api/login/2fa', json={'code': code}).status_code == 200
+    assert (managed.root / 'dashboard-users.json').exists()
+    assert managed.root.joinpath('security.json').exists()
