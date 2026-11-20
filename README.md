@@ -26,6 +26,8 @@ The managed installer displays a random temporary password. On first access, use
 
 After setup, the managed HTTPS dashboard provides optional TOTP two-factor authentication in **Settings**, with six-digit authenticator codes and single-use recovery codes. The authentication app setup key is shown only during enrollment. Keep the recovery codes in a safe place.
 
+The managed dashboard also supports individual accounts under **Users**. Existing administrators are migrated automatically to username `admin`, keeping their current password and 2FA. Administrators manage users and settings, operators can run synchronizations and verify backups, and viewers have read-only access. User credentials and TOTP settings remain separate from repository configurations, with an audit trail for privileged dashboard actions. See [INSTALL.md](INSTALL.md#dashboard-users-and-roles) for the full permission table.
+
 ## Requirements
 
 Python 3.11 or newer, Git, Git LFS and OpenSSH. Each remote account needs API authorization and SSH access. A local destination needs storage access and uses the source credentials only.
