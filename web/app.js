@@ -1558,6 +1558,8 @@ async function startDashboard() {
   const response = await fetch("/api/setup", {credentials: "same-origin"});
   // Standalone dashboards have no managed setup endpoint.
   if (response.status === 404) {
+    $("#login-username").hidden = $("#login-username-label").hidden = true;
+    $("#login-username").required = false;
     await boot();
     return;
   }
@@ -1565,6 +1567,8 @@ async function startDashboard() {
   const data = await response.json();
   if (data.required) {
     initialSetupData = data;
+    $("#login-username").hidden = $("#login-username-label").hidden = !data.password_ready;
+    $("#login-username").required = data.password_ready;
     try {
       const current = await api("/api/session");
       csrf = current.csrf;
