@@ -4480,8 +4480,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
     if managed:
         @app.get('/api/security')
         def security_status(request: _GitMirrorWebRequest):
-            auth(request)
-            state = private_security(managed.root)
+            active = auth(request)
+            account = users.get(active[3]) if not pending_setup else None
+            state = account.get('totp', {'enabled': False}) if account else {'enabled': False}
             return {'enabled': state['enabled'], 'pending': bool(
                 not state['enabled'] and state.get('pending_until', 0) > time.time()),
                 'recovery_remaining': len(state.get('recovery', [])) if state['enabled'] else 0}
@@ -4492,70 +4493,105 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 raise HTTPException(403, 'Complete setup and use HTTPS before enabling 2FA')
             auth(request, csrf=True)
             data = await body(request)
-            if not await asyncio.to_thread(verify_password, data.get('password'), revision):
-                raise HTTPException(403, 'Current password is incorrect')
-            with FileLock(str(managed.root / '.security.lock'), timeout=25):
-                state = private_security(managed.root)
-                if state['enabled']:
-                    raise HTTPException(409, 'Two-factor authentication is already enabled')
-                secret = base64.b32encode(secrets.token_bytes(20)).decode('ascii').rstrip('=')
-                state = {'enabled': False, 'pending_secret': secret, 'pending_until': time.time() + 600}
-                store_oauth(managed.root / 'security.json', state)
-            uri = ('otpauth://totp/GitMirror:admin?secret=' + secret +
-                   '&issuer=GitMirror&algorithm=SHA1&digits=6&period=30')
+            username = verify_current(request, data.get('password'))
+            try:
+                secret = await asyncio.to_thread(users.start_totp, username)
+            except (ConfigError, OAuthError, OSError, Timeout) as exc:
+                raise HTTPException(409, str(exc)) from None
+            uri = ('otpauth://totp/GitMirror:' + urllib.parse.quote(username) +
+                   '?secret=' + secret + '&issuer=GitMirror&algorithm=SHA1&digits=6&period=30')
             return {'secret': secret, 'uri': uri, 'expires_in': 600}
 
         @app.post('/api/security/totp/confirm')
         async def security_confirm(request: _GitMirrorWebRequest):
             if pending_setup:
                 raise HTTPException(409, 'Complete initial setup first')
-            auth(request, csrf=True)
+            active = auth(request, csrf=True)
             data = await body(request)
-            with FileLock(str(managed.root / '.security.lock'), timeout=25):
-                state = private_security(managed.root)
-                if state['enabled'] or state.get('pending_until', 0) <= time.time():
-                    raise HTTPException(409, 'Authenticator setup has expired. Start again')
-                secret = state.get('pending_secret', '')
-                if totp_counter(secret, data.get('code')) is None:
-                    raise HTTPException(400, 'Invalid six-digit authenticator code')
-                recovery = [secrets.token_urlsafe(12) for _ in range(8)]
-                state = {'enabled': True, 'secret': secret, 'last_counter': -1,
-                         'recovery': [hashlib.sha256(code.encode('ascii')).hexdigest() for code in recovery]}
-                store_oauth(managed.root / 'security.json', state)
-            with auth_lock:
-                key = request.cookies.get(cookie, '')
-                for other in [item for item in sessions if item != key]:
-                    del sessions[other]
+            try:
+                recovery = await asyncio.to_thread(users.confirm_totp, active[3], data.get('code'))
+            except (ConfigError, OAuthError, OSError, Timeout) as exc:
+                raise HTTPException(400, str(exc)) from None
+            keep_current_session(request)
+            journal.audit(active[3], 'totp.enabled')
             return {'enabled': True, 'recovery_codes': recovery}
 
         @app.post('/api/security/totp/cancel')
-        def security_cancel(request: _GitMirrorWebRequest):
-            auth(request, csrf=True)
-            with FileLock(str(managed.root / '.security.lock'), timeout=25):
-                state = private_security(managed.root)
-                if not state['enabled']:
-                    store_oauth(managed.root / 'security.json', {'enabled': False})
+        async def security_cancel(request: _GitMirrorWebRequest):
+            active = auth(request, csrf=True)
+            await asyncio.to_thread(users.cancel_totp, active[3])
             return {'cancelled': True}
 
         @app.post('/api/security/totp/disable')
         async def security_disable(request: _GitMirrorWebRequest):
             if pending_setup:
                 raise HTTPException(409, 'Complete initial setup first')
-            auth(request, csrf=True)
+            active = auth(request, csrf=True)
             data = await body(request)
-            if not await asyncio.to_thread(verify_password, data.get('password'), revision):
-                raise HTTPException(403, 'Current password is incorrect')
-            if not private_security(managed.root)['enabled']:
+            verify_current(request, data.get('password'))
+            if not users.get(active[3]).get('totp', {}).get('enabled'):
                 raise HTTPException(409, 'Two-factor authentication is not enabled')
-            if not await asyncio.to_thread(security_verify, managed.root, data.get('code')):
+            if not await asyncio.to_thread(users.verify_totp, active[3], data.get('code')):
                 raise HTTPException(403, 'Invalid authenticator or recovery code')
-            with FileLock(str(managed.root / '.security.lock'), timeout=25):
-                store_oauth(managed.root / 'security.json', {'enabled': False})
-            with auth_lock:
-                key = request.cookies.get(cookie, '')
-                for other in [item for item in sessions if item != key]:
-                    del sessions[other]
+            await asyncio.to_thread(users.disable_totp, active[3])
+            keep_current_session(request)
+            journal.audit(active[3], 'totp.disabled')
             return {'enabled': False}
+
+        @app.get('/api/users')
+        def list_users(request: _GitMirrorWebRequest):
+            auth(request, role='administrator_only')
+            return {'users': users.public()}
+
+        @app.post('/api/users')
+        async def create_user(request: _GitMirrorWebRequest):
+            active = auth(request, csrf=True, role='administrator_only')
+            data = await body(request)
+            verify_current(request, data.get('current_password'))
+            try:
+                username = await asyncio.to_thread(users.create, data.get('username'),
+                                                   data.get('role'), data.get('password'))
+            except (ConfigError, OAuthError, OSError, Timeout) as exc:
+                raise HTTPException(400, str(exc)) from None
+            journal.audit(active[3], 'user.created', username, data.get('role', ''))
+            return {'created': username}
+
+        @app.post('/api/users/{username}/manage')
+        async def manage_user(username: str, request: _GitMirrorWebRequest):
+            active = auth(request, csrf=True, role='administrator_only')
+            data = await body(request)
+            verify_current(request, data.get('current_password'))
+            operation = data.get('action')
+            try:
+                await asyncio.to_thread(users.manage, username, operation, data.get('value'), actor=active[3])
+            except (ConfigError, OAuthError, OSError, Timeout) as exc:
+                raise HTTPException(400, str(exc)) from None
+            journal.audit(active[3], 'user.' + operation, username,
+                          data.get('value') if operation == 'role' else '')
+            if username == active[3]:
+                keep_current_session(request)
+            return {'saved': True}
+
+        @app.post('/api/users/me/password')
+        async def own_password(request: _GitMirrorWebRequest):
+            if pending_setup:
+                raise HTTPException(409, 'Complete initial setup first')
+            active = auth(request, csrf=True)
+            data = await body(request)
+            verify_current(request, data.get('current_password'))
+            try:
+                await asyncio.to_thread(users.manage, active[3], 'password', data.get('password'), actor=active[3])
+            except (ConfigError, OAuthError, OSError, Timeout) as exc:
+                raise HTTPException(400, str(exc)) from None
+            keep_current_session(request)
+            journal.audit(active[3], 'password.changed')
+            return {'saved': True}
+
+        @app.get('/api/audit')
+        def audit_history(request: _GitMirrorWebRequest):
+            auth(request, role='administrator_only')
+            return {'entries': journal.read(
+                'SELECT at,username,action,target,detail FROM dashboard_audit ORDER BY id DESC LIMIT 200')}
 
         oauth_cookie = '__Host-gm_oauth'
 
