@@ -4472,7 +4472,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         username = active[3]
         account = users.get(username) if users and not pending_setup else None
         return {'csrf': active[1], 'first_login': active[2] == 'bootstrap',
-                'username': username, 'role': account['role'] if account else 'administrator'}
+                'username': username, 'role': account['role'] if account else 'administrator',
+                'managed': bool(managed)}
 
     @app.post('/api/logout')
     def logout(request: _GitMirrorWebRequest):
