@@ -811,3 +811,11 @@ input:not([type=checkbox]):focus, select:focus, textarea:focus {
 #security-panel .action-form { margin-top: 14px; }
 #security-enroll > p, #security-recovery > p { margin: 12px 0; }
 #security-copy { margin-bottom: 12px; }
+
+/* Managed user administration */
+#view-users > article.panel { margin-bottom: 18px; }
+#view-users .action-form { margin: 14px 0; }
+#user-manage { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }
+#user-manage h3 { font-size: 1.05rem; margin-bottom: 4px; }
+#user-message, #my-password-status { margin: 10px 0; }
+#signed-in-user { font-size: .85rem; overflow-wrap: anywhere; }
