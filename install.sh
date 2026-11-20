@@ -29,7 +29,7 @@ GitMirror installer and maintenance
   --tag vX.Y.Z    Select an immutable stable release
   --artifact FILE --sha256 HEX --tag vX.Y.Z   Install a trusted offline archive
   --yes           Approve installing missing apt dependencies
-  After installation: gitmirror -up (update), gitmirror -v (version)
+  After installation: gitmirror update, gitmirror -v (version)
   Without a published stable release, interactive runs can choose main.
   Updates keep configuration, backups and service settings. See INSTALL.md.
 EOF
@@ -39,11 +39,14 @@ confirm() {
     local phrase=$1 description=$2 reply
     printf '%s\n' "$description"
     if [[ -n "$confirmation" ]]; then
+        # Keep explicit confirmation for existing non-interactive automation.
         [[ "$confirmation" == "$phrase" ]] || fail "Expected confirmation: $phrase"
-    else
-        read -r -p "Type $phrase to continue: " reply </dev/tty || fail 'An explicit confirmation is required'
-        [[ "$reply" == "$phrase" ]] || fail 'Canceled'
+        return
     fi
+    # Require a real terminal, never assume yes when input is piped or absent.
+    read -r -p "Continue? [y/N] " reply </dev/tty ||
+        fail 'A terminal is required to confirm this operation'
+    [[ "$reply" =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || fail 'Canceled'
 }
 
 require_platform() {
