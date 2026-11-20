@@ -183,6 +183,50 @@ def test_reinstall_error_only_cleans_new_program_not_retained_data(tmp_path):
     assert (tmp_path / 'etc/secret').read_text().strip() == 'keep-settings'
 
 
+
+def test_reinstall_recreates_services_without_resetting_saved_admin(tmp_path):
+    setup = """
+        source "$PROJECT/packaging/lifecycle.sh"
+        app="$PWD/app" state="$PWD/state" etc="$PWD/etc" unit_dir="$PWD/units"
+        web=web.service scheduler=scheduler.service account=gitmirror-managed
+        cli="$PWD/launcher"
+        tag=dev-tests checksum=abcdef0123456789
+        mkdir -m 700 "$state"
+        mkdir -m 755 "$etc" "$unit_dir"
+        printf '8787\n\n' > "$etc/listener"
+        touch "$etc/sync.lock" "$etc/sync-lock-created"
+        printf 'existing-admin-password-hash\n' > "$state/password"
+        printf 'backup-repository-data\n' > "$state/backup"
+        getent() { return 0; }
+        id() { [[ "$1" == -u ]] && printf '%s\n' "$(command id -u)"; }
+        stat() {
+            if [[ "$*" == *"$etc" ]]; then printf '0 755\n'; else command stat "$@"; fi
+        }
+        systemctl() { [[ "$1" == is-active ]] && return 3 || return 0; }
+        confirm() { :; }
+        ensure_managed_lock() { :; }
+        build_release() {
+            candidate="$app/releases/reinstalled"
+            mkdir -p "$candidate/venv/bin"
+            printf '#!/bin/sh\nexit 0\n' > "$candidate/venv/bin/gitmirror"
+            chmod +x "$candidate/venv/bin/gitmirror"
+        }
+        runuser() { :; }
+        unit() { touch "$unit_dir/$1"; }
+        health() { return 0; }
+        install_cli() { touch "$cli"; }
+        reinstall
+    """
+    result = shell(setup, tmp_path)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert 'Sign in using your existing administrator credentials' in result.stdout
+    assert (tmp_path / 'state/password').read_text().strip() == 'existing-admin-password-hash'
+    assert (tmp_path / 'state/backup').read_text().strip() == 'backup-repository-data'
+    assert (tmp_path / 'app/current').is_symlink()
+    assert (tmp_path / 'units/web.service').exists()
+    assert (tmp_path / 'units/scheduler.service').exists()
+
+
 def test_automatic_fallback_uses_main_without_dev_confirmation(tmp_path):
     result = shell("""
         tag= checksum= artifact= development=0 confirmation=
