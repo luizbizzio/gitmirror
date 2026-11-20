@@ -1385,6 +1385,15 @@ $("#security-confirm").addEventListener("submit", async (event) => {
   finally { button.disabled = false; }
 });
 
+$("#security-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("#security-secret").textContent);
+    $("#security-error").textContent = "Setup key copied.";
+  } catch {
+    $("#security-error").textContent = "Copy unavailable. Select the setup key above.";
+  }
+});
+
 $("#security-cancel").addEventListener("click", async () => {
   try {
     await post("/api/security/totp/cancel", {});
