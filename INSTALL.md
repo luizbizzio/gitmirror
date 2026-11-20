@@ -104,6 +104,24 @@ GitMirror shows eight single-use recovery codes only once. Save them away from t
 
 2FA is supported in the managed HTTPS dashboard. The separate standalone dashboard continues to use its configured password file. Login rate limits remain enabled. GitMirror keeps 2FA credentials in a private file under the managed state directory with owner-only permissions.
 
+## Dashboard users and roles
+
+The managed installation can create up to 32 local dashboard accounts. Existing installations are upgraded automatically: the previous administrator is preserved as username `admin`, with its password and any configured TOTP authenticator. No reinstallation or new initial setup is required. Sign in using username `admin` and your existing password.
+
+Open **Users** as an administrator to create a user, select their role, change a role, reset a password or 2FA, or delete a user. Creating or changing an account requires the administrator's current password. New users receive an initial password chosen by the administrator and should change it in **Settings** after signing in. All users can configure their own TOTP app and single-use recovery codes.
+
+| Role | Access |
+| --- | --- |
+| Administrator | Full configuration, OAuth connections, SSH settings, repository sync, backup verification, restore, account management and audit history |
+| Operator | Read the dashboard and logs, refresh repository inventory, run dry-run or applied syncs, check connections and verify backups |
+| Viewer | Read dashboard status, repositories, backups and redacted activity logs only |
+
+Roles are enforced on the server for every privileged action. Only administrators can access account management, configuration and restore endpoints. Users cannot delete their own account or demote themselves from the administrator role, and GitMirror prevents removing the last administrator. Role changes, password changes and 2FA resets revoke affected sessions; a current self-service session stays signed in after password or 2FA changes. User credentials are hashed with scrypt and stored separately from GitMirror's versioned repository configurations.
+
+**Audit history:** the Users page records who created or changed accounts, changed 2FA and passwords, updated configurations, or started sync, verification and restore operations. It stores no submitted passwords, OAuth tokens or TOTP codes. Scheduled CLI operations remain identified as scheduled in the normal activity log rather than attributed to a dashboard account.
+
+The managed Linux dashboard supports user accounts; standalone or Docker dashboards keep their existing single-password behavior.
+
 ## Register OAuth apps for browser authorization
 
 Open the managed dashboard at the HTTPS address your browser will use every time,
