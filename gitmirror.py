@@ -10,6 +10,7 @@ import datetime as dt
 import errno
 import fnmatch
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
@@ -3522,6 +3523,67 @@ def scrypt_password(password, salt):
     return hashlib.scrypt(password.encode('utf-8'), salt=salt, n=16384, r=8, p=1)
 
 
+def valid_admin_password(password):
+    """An unrestricted 6+ character password; rate limiting and optional TOTP protect login."""
+    return isinstance(password, str) and 6 <= len(password) <= 1024
+
+
+def totp_at(secret, counter):
+    key = base64.b32decode(secret, casefold=True)
+    digest = hmac.new(key, int(counter).to_bytes(8, 'big'), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0f
+    number = int.from_bytes(digest[offset:offset + 4], 'big') & 0x7fffffff
+    return f'{number % 1000000:06d}'
+
+
+def totp_counter(secret, code, now=None):
+    if not isinstance(code, str) or not re.fullmatch(r'[0-9]{6}', code):
+        return None
+    current = int((time.time() if now is None else now) // 30)
+    try:
+        for counter in (current - 1, current, current + 1):
+            if counter >= 0 and hmac.compare_digest(totp_at(secret, counter), code):
+                return counter
+    except (binascii.Error, ValueError, TypeError):
+        pass
+    return None
+
+
+def private_security(root):
+    path = root / 'security.json'
+    try:
+        state = oauth_private_file(path)
+    except FileNotFoundError:
+        return {'enabled': False}
+    if not isinstance(state, dict) or type(state.get('enabled')) is not bool:
+        raise SyncError('Dashboard 2FA settings are invalid')
+    return state
+
+
+def security_verify(root, code):
+    """Accept a fresh TOTP or one disposable recovery code, atomically."""
+    path = root / 'security.json'
+    with FileLock(str(root / '.security.lock'), timeout=25):
+        state = private_security(root)
+        if not state['enabled']:
+            return True
+        current = totp_counter(state.get('secret', ''), code)
+        if current is not None and current > state.get('last_counter', -1):
+            state['last_counter'] = current
+            store_oauth(path, state)
+            return True
+        if isinstance(code, str) and re.fullmatch(r'[A-Za-z0-9_-]{16}', code):
+            digest = hashlib.sha256(code.encode('ascii')).hexdigest()
+            hashes = state.get('recovery', [])
+            matched = next((i for i, value in enumerate(hashes) if hmac.compare_digest(value, digest)), None)
+            if matched is not None:
+                state['recovery'] = hashes[:matched] + hashes[matched + 1:]
+                store_oauth(path, state)
+                return True
+        return False
+
+
+
 def ssh_host_key_line(line):
     parts = line.split()
     if (len(parts) < 3 or not re.fullmatch(r'[A-Za-z0-9.\[\]:,_|+=-]+', parts[0])
@@ -3563,6 +3625,7 @@ class ManagedInstallation:
         self.volumes = self.root / 'backups'
         self.restores = self.root / 'restores'
         self.bootstrap = self.root / 'setup-code'
+        self.pending_admin = self.root / 'initial-admin.json'
         self.identity = self.root / 'identity'
         self.pointer = self.root / 'active.json'
         self.previous = self.root / 'previous.json'
@@ -3575,7 +3638,7 @@ class ManagedInstallation:
             if not self.identity.is_file():
                 subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.identity)],
                                check=True, timeout=20, capture_output=True)
-            if self.active() is None and not self.bootstrap.exists():
+            if self.active() is None and not self.bootstrap.exists() and not self.pending_admin.exists():
                 private_text(self.bootstrap, secrets.token_urlsafe(24) + '\n')
 
     def active(self):
@@ -3617,11 +3680,23 @@ class ManagedInstallation:
                 'public_key': self.public_key()}
 
     def credentials(self, revision):
-        content = json.loads((revision.path / 'admin.json').read_text('utf-8'))
+        path = revision.path / 'admin.json' if revision else self.pending_admin
+        content = oauth_private_file(path)
         salt, digest = bytes.fromhex(content['salt']), bytes.fromhex(content['password'])
         if len(salt) != 32 or len(digest) != 64:
             raise SyncError('Managed admin authentication data is invalid')
         return salt, digest
+
+    def set_initial_password(self, password):
+        if not valid_admin_password(password):
+            raise ConfigError('Password must contain 6 to 1024 characters')
+        with FileLock(str(self.root / '.configuration.lock'), timeout=0):
+            if self.active() or self.pending_admin.exists() or not self.bootstrap.is_file():
+                raise SyncError('Initial password has already been configured')
+            salt = secrets.token_bytes(32)
+            private_text(self.pending_admin, json.dumps({
+                'salt': salt.hex(), 'password': scrypt_password(password, salt).hex()}))
+            self.bootstrap.unlink()
 
     def authorize_setup(self, code):
         if self.active():
@@ -3697,17 +3772,20 @@ class ManagedInstallation:
         with FileLock(str(self.root / '.configuration.lock'), timeout=0):
             active = self.active()
             if bootstrap:
-                self.authorize_setup(payload.get('code'))
+                if not self.pending_admin.exists():
+                    self.authorize_setup(payload.get('code'))
             elif not active:
                 raise SyncError('Complete the initial setup first')
             old = load_config(active.config) if active else None
             if active and payload.get('revision') != active.identifier:
                 raise SyncError('Configuration changed in another session; reload before saving')
             password = payload.get('password', '')
-            if not isinstance(password, str) or (password and not 12 <= len(password) <= 1024):
-                raise ConfigError('Admin password must contain 12 to 1024 characters')
-            if bootstrap and not password:
+            if not isinstance(password, str) or (password and not valid_admin_password(password)):
+                raise ConfigError('Admin password must contain 6 to 1024 characters')
+            if bootstrap and not self.pending_admin.exists() and not password:
                 raise ConfigError('Set an admin password to finish setup')
+            if bootstrap and self.pending_admin.exists() and password:
+                raise ConfigError('Initial admin password is already configured')
             if password and not bootstrap:
                 current = payload.get('current_password')
                 salt, verifier = self.credentials(active)
@@ -3733,6 +3811,7 @@ class ManagedInstallation:
                             shutil.rmtree(folder)
             if bootstrap:
                 self.bootstrap.unlink(missing_ok=True)
+                self.pending_admin.unlink(missing_ok=True)
             return revision.identifier
 
     def write_revision(self, revision, payload, old, active, password):
@@ -3905,8 +3984,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
     elif managed:
         salt, password_hash = managed.credentials(revision)
     else:
-        if not isinstance(password, str) or not 12 <= len(password) <= 1024:
-            raise SyncError('Web password must contain 12 to 1024 characters')
+        if not valid_admin_password(password):
+            raise SyncError('Web password must contain 6 to 1024 characters')
         salt = secrets.token_bytes(32)
         password_hash = scrypt_password(password, salt)
     journal = DashboardJournal(settings, initialize=True)
