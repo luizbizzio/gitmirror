@@ -1453,6 +1453,107 @@ $("#security-disable").addEventListener("submit", async (event) => {
   finally { button.disabled = false; }
 });
 
+async function loadUsers() {
+  if (!canAdmin()) return;
+  const [accounts, audit] = await Promise.all([api("/api/users"), api("/api/audit")]);
+  $("#user-list").innerHTML = table(["User", "Role", "2FA", "Action"],
+    accounts.users.map((user) => row("<strong>" + escape(user.username) + "</strong>",
+      escape(user.role), user.totp ? "Enabled" : "Disabled",
+      button("user-manage", user.username, "Manage"))));
+  $("#user-audit").innerHTML = audit.entries.length
+    ? table(["Date", "User", "Action", "Target", "Detail"], audit.entries.map((item) =>
+        row(escape(date(item.at)), escape(item.username), escape(item.action),
+          escape(item.target), escape(item.detail))))
+    : empty("No recorded account actions yet.");
+}
+
+$("#user-create").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector("button[type=submit]");
+  submit.disabled = true;
+  $("#user-message").textContent = "";
+  try {
+    const elements = form.elements;
+    await post("/api/users", {
+      username: elements.username.value.trim().toLowerCase(),
+      role: elements.role.value,
+      password: elements.password.value,
+      current_password: elements.current_password.value,
+    });
+    form.reset();
+    $("#user-message").textContent = "User created. Share the initial password securely.";
+    await loadUsers();
+  } catch (error) { $("#user-message").textContent = error.message; }
+  finally { submit.disabled = false; }
+});
+
+$("#user-list").addEventListener("click", (event) => {
+  const trigger = event.target.closest("button[data-action=user-manage]");
+  if (!trigger) return;
+  const form = $("#user-manage");
+  form.reset();
+  form.elements.username.value = trigger.dataset.value;
+  form.hidden = false;
+  $("#user-manage-role").hidden = false;
+  $("#user-manage-password").hidden = true;
+  form.scrollIntoView({behavior: "smooth", block: "nearest"});
+});
+
+$("#user-manage [name=action]").addEventListener("change", (event) => {
+  const action = event.target.value;
+  $("#user-manage-role").hidden = action !== "role";
+  $("#user-manage-password").hidden = action !== "password";
+  $("#user-manage [name=password]").required = action === "password";
+});
+$("#user-manage-cancel").addEventListener("click", () => {
+  $("#user-manage").reset();
+  $("#user-manage").hidden = true;
+});
+
+$("#user-manage").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const field = form.elements;
+  const username = field.username.value;
+  const operation = field.action.value;
+  if (operation === "delete" && !window.confirm("Delete dashboard account " + username + "?")) return;
+  if (operation === "reset_2fa" && !window.confirm("Reset 2FA for " + username + "?")) return;
+  const submit = form.querySelector("button[type=submit]");
+  submit.disabled = true;
+  $("#user-message").textContent = "";
+  try {
+    await post("/api/users/" + encodeURIComponent(username) + "/manage", {
+      action: operation,
+      value: operation === "role" ? field.role.value :
+        operation === "password" ? field.password.value : null,
+      current_password: field.current_password.value,
+    });
+    form.reset();
+    form.hidden = true;
+    $("#user-message").textContent = "Account updated.";
+    await loadUsers();
+  } catch (error) { $("#user-message").textContent = error.message; }
+  finally { submit.disabled = false; }
+});
+
+$("#my-password-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector("button[type=submit]");
+  submit.disabled = true;
+  $("#my-password-status").textContent = "";
+  try {
+    await post("/api/users/me/password", {
+      current_password: form.elements.current_password.value,
+      password: form.elements.password.value,
+    });
+    form.reset();
+    $("#my-password-status").textContent = "Your password was changed. Other sessions were signed out.";
+  } catch (error) { $("#my-password-status").textContent = error.message; }
+  finally { submit.disabled = false; }
+});
+
 async function startDashboard() {
   const response = await fetch("/api/setup", {credentials: "same-origin"});
   // Standalone dashboards have no managed setup endpoint.
