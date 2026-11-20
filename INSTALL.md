@@ -80,12 +80,28 @@ files are packed locally and checked before installation. To explicitly use the
 latest development snapshot even when a release exists, append `-s -- --dev`
 to `sudo bash`. Upgrades ask for a `y` or `n` confirmation.
 
-A fresh install binds to localhost by default. For a headless Raspberry Pi,
-append `-s -- --lan rpi5` to `sudo bash` if `rpi5` resolves through
-Tailscale, or use your desired LAN hostname/IP. The chosen listener, certificate
-and authorized hostnames remain unchanged on subsequent updates. You can also set
-`--port` for first installation. A hostname change requires a certificate valid
-for that name; reinstalling or upgrading is not a hostname migration mechanism.
+On a fresh install, GitMirror enables LAN HTTPS and uses the device's **short
+hostname** (for example `rpi5`) rather than adding `.local`. It prints the URL
+and a certificate fingerprint. From another device, use
+`https://rpi5:8787`, the Raspberry Pi's actual LAN IP
+(`https://192.168.1.80:8787` is an example), the Tailscale IP, or the exact
+Tailscale MagicDNS name, as applicable. The short hostname must resolve on the
+client device. To restrict a new installation to localhost, append
+`-s -- --local-only` to `sudo bash`.
+
+For a specific first-install hostname/IP, append `-s -- --lan rpi5` or
+`-s -- --lan 192.168.1.80`. The installer-generated certificate includes the
+configured hostname, short hostname, currently assigned device IPs, and the
+Tailscale MagicDNS name when Tailscale is available during installation.
+Certificate trust is separate from hostname approval: a browser may still
+warn about a self-signed certificate. Existing installations keep their
+original certificate and may require its renewal before newly accepted
+hostnames or IPs appear in its certificate's Subject Alternative Names.
+
+The listener, its existing certificate and saved settings are preserved during
+updates and retained-state reinstalls. Use `--port` only on first installation.
+Changing the listener hostname requires separately updating its certificate
+and service configuration; an ordinary upgrade is not a hostname migration.
 
 Bash, curl and administrator access are required. Missing Python, Git, Git LFS,
 OpenSSH and other system packages require explicit approval. Use `--yes` only
@@ -101,7 +117,12 @@ Managed code lives under `/opt/gitmirror-managed`, app state under
 `/etc/gitmirror-managed`. Services use the dedicated `gitmirror-managed`
 account. For LAN HTTPS, verify the certificate fingerprint printed during
 installation before trusting the browser warning, and avoid public port
-forwarding.
+forwarding. The managed dashboard accepts Host headers for the configured
+hostname, the device's short/system hostname, IP addresses actually assigned
+to local interfaces (including Tailscale), and its exact Tailscale MagicDNS
+name. It does not accept unrestricted domain suffixes or arbitrary
+private-network IPs. The standalone dashboard keeps its explicit allowed-host
+configuration. Origin/CSRF checks remain active for all hostnames.
 
 ## Setup in the browser
 
