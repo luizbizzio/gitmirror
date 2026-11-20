@@ -34,6 +34,45 @@ Python 3.11 or newer, Git, Git LFS and OpenSSH. Each remote account needs API au
 
 ## Install
 
+### One-command installation on Linux or Raspberry Pi OS
+
+For a new managed installation on Debian 12+ or Raspberry Pi OS (64-bit), run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash
+```
+
+This installs GitMirror, its systemd services and the web dashboard. By default, the dashboard listens only on `http://127.0.0.1:8787` on the Raspberry Pi or Linux machine.
+
+For a headless Raspberry Pi that you want to manage from another computer on your LAN, specify its hostname or IP address **during the first installation**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash -s -- --lan rpi5.local
+```
+
+Replace `rpi5.local` with an address reachable from your computer. The LAN option enables HTTPS using a locally generated certificate. **Compare the certificate's SHA-256 fingerprint shown in the terminal before trusting the browser's certificate warning.** Do not forward the dashboard's port to the public internet.
+
+The installer checks system dependencies and asks before installing missing packages. At the end of a successful first installation, it prints the **dashboard URL and a temporary password**. Sign in with that temporary password, set your own administrator password (at least six characters), and complete Setup. Afterward, sign in as `admin` with your chosen password; optionally enable 2FA in Settings. The temporary password is not a permanent login credential.
+
+Manage the installation with:
+
+```sh
+gitmirror update
+gitmirror status
+gitmirror check
+gitmirror -v
+gitmirror rollback
+gitmirror uninstall
+```
+
+Update, rollback and uninstall ask for confirmation with `Continue? [y/N]`. Uninstall removes the application and its services but **preserves configuration, credentials and backups**. Running the installer again does not overwrite retained state as if it were a clean installation. For details on the update lifecycle, installation options and recovery, see the [Linux installation and maintenance guide](INSTALL.md).
+
+**Security:** the installer executes code downloaded from the GitMirror repository as root. Review the [installer source](install.sh) before executing it if you do not trust that source. Without a published stable release, the installer can select the development `main` snapshot rather than a fixed release.
+
+### Manual or standalone Python installation
+
+For users who need a standalone CLI installation, or for platforms outside the managed Linux installer:
+
 ```sh
 python -m pip install -e .
 cp config.example.yml config.yml
@@ -178,8 +217,9 @@ interface uses a centered dark-mode admin workspace inspired by Pi-hole, with
 a collapsible desktop sidebar, mobile navigation drawer, and URL-linked sections.
 Source Sans Pro is bundled locally under its SIL Open Font License, so no external
 font provider is required. The setup form has section shortcuts for quicker navigation.
-On a new managed install, you can inspect the dashboard and settings before clicking
-**Setup** in the top bar. Private operations and repository information remain protected until login.
+On a new managed install, sign in with the temporary password printed during installation
+and set a permanent password before opening **Setup**. Private operations and repository information
+remain protected until login.
 The dashboard also shows two storage doughnut charts: source repository sizes reported
 by GitHub, GitLab, Codeberg or Gitea (when the provider includes them), and logical file
 sizes of the repositories in configured local backup volumes. Source estimates can
@@ -199,8 +239,7 @@ visibility and last observed status, with details per destination.
 
 The managed installer and browser setup are documented in the [installation and
 maintenance guide](INSTALL.md). The same online `install.sh` command detects a
-clean installation or a managed update. After installation, run `gitmirror -up`
-or `gitmirror update` to check for and apply updates directly, like Pi-hole.
+clean installation or a managed update. After installation, run `gitmirror update` to check for and apply updates directly, like Pi-hole.
 Run `gitmirror -v` to see the installed version. The updater prefers verified
 stable releases and uses the development `main` when no release exists.
 It preserves managed configuration, backups and service settings and supports
