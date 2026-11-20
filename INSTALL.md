@@ -14,8 +14,8 @@ gitmirror update
 
 `gitmirror -up` and `gitmirror upgrade` remain supported aliases. This command checks for a newer version, prints
 the current and candidate versions, and applies the update when available. It
-may request your normal `sudo` password, but does **not** ask you to type
-`UPGRADE` again. No `git clone`, archive creation, release tag or curl command
+may request your normal `sudo` password and then ask you to confirm with
+`y` or `n`. Press Enter to cancel. You do not need to type `UPGRADE`. No `git clone`, archive creation, release tag or curl command
 is needed after the first installation. When the installed version is already
 current, the command makes no service changes.
 
@@ -23,7 +23,10 @@ Other management commands: `gitmirror -v` shows the installed version;
 `gitmirror status`, `gitmirror check`, `gitmirror rollback` and
 `gitmirror uninstall` call the corresponding managed operations. Unrecognized
 arguments go to the existing Python `gitmirror` CLI in the virtual environment.
-Rollback and uninstall retain their explicit confirmation prompts.
+Update, rollback and uninstall ask `Continue? [y/N]` before making changes.
+Answer `y` to proceed, or `n` (or Enter) to cancel. In scripts, the existing
+`--confirm UPGRADE`, `--confirm ROLLBACK`, and `--confirm UNINSTALL`
+options remain supported.
 
 On systems installed before the command launcher was introduced, run the
 one-command installer **once** to upgrade and register the command. Existing
@@ -60,7 +63,7 @@ This is not an immutable release: changes on `main` can be deployed by the next
 installation command. A revision is identified by its Git commit and the selected
 files are packed locally and checked before installation. To explicitly use the
 latest development snapshot even when a release exists, append `-s -- --dev`
-to `sudo bash`. Upgrades still require an explicit `UPGRADE` confirmation.
+to `sudo bash`. Upgrades ask for a `y` or `n` confirmation.
 
 A fresh install binds to localhost by default. For a headless Raspberry Pi,
 append `-s -- --lan rpi5` to `sudo bash` if `rpi5` resolves through
@@ -209,7 +212,7 @@ Run the same online installer for future upgrades. Use `status` to identify the 
 
 For a trusted offline release, use `--tag vX.Y.Z --artifact FILE --sha256 HEX`. Obtain the digest through a trusted channel.
 
-Run `sudo bash install.sh uninstall` and confirm to remove the application and its two systemd services. The service account, backup volumes, configuration and credentials are retained. Legacy schedule recovery is separate.
+Run `gitmirror uninstall` and answer `y` to remove the application and its two systemd services. The service account, backup volumes, configuration and credentials are retained. Legacy schedule recovery is separate.
 
 ## Release preparation
 
