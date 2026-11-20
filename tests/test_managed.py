@@ -257,7 +257,7 @@ def test_totp_enrollment_login_recovery_and_disable(installation):
         assert confirmed.status_code == 200, confirmed.text
         recovery = confirmed.json()['recovery_codes']
         assert len(recovery) == len(set(recovery)) == 8
-        assert recovery[0] not in (managed.root / 'security.json').read_text('utf-8')
+        assert recovery[0] not in (managed.root / 'dashboard-users.json').read_text('utf-8')
         assert client.get('/api/security').json()['enabled']
         assert client.post('/api/logout', headers=csrf, json={}).status_code == 200
 
