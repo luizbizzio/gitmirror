@@ -3881,8 +3881,13 @@ class ManagedInstallation:
                 'public_key': self.public_key()}
 
     def credentials(self, revision):
-        path = revision.path / 'admin.json' if revision else self.pending_admin
-        content = oauth_private_file(path)
+        if revision and (self.root / 'dashboard-users.json').is_file():
+            content = DashboardUsers(self).get('admin')
+            if content is None:
+                raise SyncError('Dashboard administrator account is missing')
+        else:
+            path = revision.path / 'admin.json' if revision else self.pending_admin
+            content = oauth_private_file(path)
         salt, digest = bytes.fromhex(content['salt']), bytes.fromhex(content['password'])
         if len(salt) != 32 or len(digest) != 64:
             raise SyncError('Managed admin authentication data is invalid')
