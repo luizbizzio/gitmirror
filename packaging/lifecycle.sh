@@ -21,7 +21,7 @@ case "$1" in
     -up|update|upgrade)
         shift
         action=upgrade
-        args=(--confirm UPGRADE)
+        args=()
         ;;
     status|check|rollback|uninstall)
         action=$1
