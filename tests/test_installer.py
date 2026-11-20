@@ -243,7 +243,7 @@ def test_managed_cli_install_update_and_refuse_conflicting_commands(tmp_path):
         [[ -x "$cli" ]]
         bash -n "$cli"
         grep -Fq -- '-up|update|upgrade)' "$cli"
-        grep -Fq -- 'args=(--confirm UPGRADE)' "$cli"
+        ! grep -Fq -- 'args=(--confirm UPGRADE)' "$cli"
         grep -Fq -- 'exec sudo -- "$installer"' "$cli"
         check_cli
         remove_cli
@@ -272,7 +272,7 @@ def test_managed_cli_install_update_and_refuse_conflicting_commands(tmp_path):
     assert symlink.returncode != 0
 
 
-def test_managed_update_command_runs_installer_with_no_second_confirmation(tmp_path):
+def test_managed_update_command_preserves_interactive_confirmation(tmp_path):
     generated = shell("""
         source "$PROJECT/packaging/lifecycle.sh"
         managed_cli_content >launcher
@@ -295,7 +295,25 @@ def test_managed_update_command_runs_installer_with_no_second_confirmation(tmp_p
         response = subprocess.run([str(script), invocation], cwd=tmp_path, env=env,
                                   capture_output=True, text=True, timeout=8)
         assert response.returncode == 0, response.stderr
-        assert response.stdout.splitlines() == ['upgrade', '--confirm', 'UPGRADE']
+        assert response.stdout.splitlines() == ['upgrade']
+
+
+def test_maintenance_confirmation_accepts_yes_and_rejects_no(tmp_path):
+    # util-linux script creates a terminal, including when tests are started via CI.
+    if not shutil.which('script'):
+        pytest.skip('util-linux script is unavailable')
+    command = 'GITMIRROR_INSTALL_LIBRARY=1; source "$PROJECT/install.sh"; confirmation=; confirm UNINSTALL "Remove GitMirror?"'
+    for answer, accepted in [('y', True), ('Y', True), ('yes', True),
+                             ('n', False), ('N', False), ('', False), ('no', False)]:
+        result = subprocess.run(['script', '-q', '-e', '-c', command, '/dev/null'],
+                                input=answer + '\n', text=True, capture_output=True,
+                                cwd=tmp_path, env={**os.environ, 'PROJECT': str(ROOT)},
+                                timeout=8)
+        assert (result.returncode == 0) is accepted, (answer, result.stdout, result.stderr)
+        assert 'Continue? [y/N]' in result.stdout
+
+    noninteractive = shell('confirmation=; confirm UNINSTALL "Remove GitMirror?"', tmp_path)
+    assert noninteractive.returncode != 0
 
 
 def test_status_warns_about_old_cron_without_printing_credentials_or_modifying_jobs(tmp_path):
