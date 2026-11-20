@@ -158,7 +158,9 @@ def test_setup_host_key_lookup_requires_bootstrap_and_exact_fingerprint(installa
 
     monkeypatch.setattr(gitmirror.subprocess, 'run', scan)
     arguments = {'host': 'mirror.example.invalid', 'port': 2222, 'fingerprint': f'SHA256:{verified}'}
-    with TestClient(managed_app(managed), base_url='http://localhost') as client:
+    app = managed_app(managed)
+    calls.clear()  # Managed app startup may inspect local addresses for permitted Host headers.
+    with TestClient(app, base_url='http://localhost') as client:
         path = '/api/managed/ssh-host'
         assert client.post(path, json=arguments).status_code == 403
         assert not calls
