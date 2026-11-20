@@ -437,8 +437,9 @@ function renderDestinations(data) {
     ${list(destination.provider === "local"
       ? [["Backup path", destination.path], ["Retention", retentionText(destination.retention)]]
       : [["Account", destination.owner ?? "Determined on login"], ["API", destination.api_url]])}</article>`).join("")
-    : emptyPage("No destinations configured",
-      "Configure a remote mirror or local backup location.", "Edit configuration");
+    : (canAdmin() ? emptyPage("No destinations configured",
+      "Configure a remote mirror or local backup location.", "Edit configuration") :
+      empty("No destinations configured."));
 }
 
 function renderSettings(data) {
@@ -468,7 +469,7 @@ function renderSyncTargets() {
   }
   $("#actions-help").textContent = snapshot.web.allow_actions ? (busy ? "A dashboard operation is active." :
     "Uses the existing GitMirror CLI and its locks.") : "Dashboard actions are disabled on this server.";
-  $("#sync-submit").disabled = !snapshot.web.allow_actions || busy;
+  $("#sync-submit").disabled = !snapshot.web.allow_actions || !canOperate() || busy;
   syncMode();
 }
 
@@ -503,7 +504,7 @@ function openRepository(id) {
   });
   $("#details-content").innerHTML = list([["Visibility", repo.visibility], ["Default branch", repo.default_branch || "Unconfirmed"],
     ["Reported source size", size(repo.size_bytes)], ["Last verified backup", date(repo.last_backup)]]) + `<div class="table-wrap">${table(["Destination", "Status", "Checked", "Detail"], destinations)}</div>`
-    + button("prepare-sync", repo.id, "Prepare manual synchronization", !snapshot.web.allow_actions);
+    + button("prepare-sync", repo.id, "Prepare manual synchronization", !snapshot.web.allow_actions || !canOperate());
   $("#details-dialog").showModal();
 }
 
@@ -519,8 +520,8 @@ function renderBackups(data) {
         const index = targets.push({repo: repo.id, name: repo.name, destinations: [volume.id], generation: generation.id}) - 1;
         return row(`<code>${escape(generation.id)}</code>${generation.current ? " · Current" : ""}`,
           pill(generation.integrity), escape(date(generation.verified)), escape(date(generation.created)),
-          `${button("verify", index, "Verify", !snapshot.web.allow_actions || busy)} ·
-           ${button("restore", index, "Restore", !snapshot.web.allow_actions || !snapshot.web.restore_enabled || busy)}`);
+          `${button("verify", index, "Verify", !snapshot.web.allow_actions || !canOperate() || busy)} ·
+           ${button("restore", index, "Restore", !snapshot.web.allow_actions || !canAdmin() || !snapshot.web.restore_enabled || busy)}`);
       });
       return `<details data-key="${escape(key)}" ${opened.has(key) ? "open" : ""}>
         <summary>${escape(repo.name)} <small class="muted">· ${size(repo.logical_bytes)} logical · ${repo.generations.length} generations</small></summary>
@@ -586,7 +587,7 @@ async function refresh() {
     switch (view) {
       case "overview":
         renderOverview(snapshot);
-        if (!inventoryWarmupAttempted) warmupInventory();
+        if (canOperate() && !inventoryWarmupAttempted) warmupInventory();
         break;
       case "destinations": renderDestinations(snapshot); break;
       case "settings": renderSettings(snapshot); if (snapshot.web.managed) await loadSecurity(); break;
@@ -642,7 +643,8 @@ async function boot() {
   $("#settings-editor").hidden = false;
   $("#logout").hidden = false;
   $("#refresh").disabled = false;
-  $("#discover").disabled = false;
+  $("#discover").disabled = !canOperate();
+  $("#sync-form").hidden = !canOperate();
   $("#top-setup").textContent = "Settings";
   $("#system-state").innerHTML = '<span class="status-dot"></span> Loading status';
   $("#system-detail").textContent = "Checking source and destinations";
@@ -689,7 +691,7 @@ document.addEventListener("click", (event) => {
     if (previewMode) showInitialSetup();
     else {
       openView("settings");
-      if (snapshot?.web?.managed) $("#edit-configuration").click();
+      if (snapshot?.web?.managed && canAdmin()) $("#edit-configuration").click();
     }
   }
   if (target.dataset.close) $(`#${target.dataset.close}`).close();
