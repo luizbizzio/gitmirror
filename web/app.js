@@ -721,9 +721,21 @@ function showSecondFactor() {
 async function finishLogin() {
   const status = await api("/api/session");
   csrf = status.csrf;
-  if (status.first_login) showFirstPassword();
-  else if (initialSetupData?.required) enterPreview(initialSetupData);
-  else await boot();
+  if (status.first_login) {
+    showFirstPassword();
+    return;
+  }
+  // A completed setup may have restarted the server since the login page was opened.
+  const response = await fetch("/api/setup", {credentials: "same-origin"});
+  if (response.ok) {
+    const setup = await response.json();
+    if (setup.required) {
+      enterPreview(setup);
+      return;
+    }
+  }
+  initialSetupData = null;
+  await boot();
 }
 
 $("#login-form").addEventListener("submit", async (event) => {
