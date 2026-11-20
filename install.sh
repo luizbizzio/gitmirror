@@ -23,7 +23,7 @@ usage() {
     cat <<'EOF'
 GitMirror installer and maintenance
   (no command)  Install, update, or safely reinstall retained managed state
-  install [--port PORT] [--lan HOST_OR_IPV4]
+  install [--port PORT] [--lan HOST_OR_IPV4] [--local-only]
   reinstall       Reinstall the application using preserved state (no data deletion)
   upgrade | status | check | rollback | uninstall
   --dev           Use current development main instead of a published release
@@ -235,12 +235,13 @@ warn_legacy_cron() {
 main() {
     action=auto
     tag= checksum= artifact= confirmation= lan=
-    approve=0 development=0 port=8787
+    approve=0 development=0 local_only=0 port=8787
     case "${1:-}" in install|reinstall|upgrade|rollback|uninstall|status|check) action=$1; shift;; esac
     while (($#)); do
         case "$1" in
             --yes) approve=1; shift; continue ;;
             --dev) development=1; shift; continue ;;
+            --local-only) local_only=1; shift; continue ;;
             --help|-h) usage; exit 0 ;;
         esac
         (($# >= 2)) || fail "Missing value for $1"
@@ -257,11 +258,20 @@ main() {
     fi
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1024 && 10#$port <= 65535)) || fail 'Use a port from 1024 to 65535'
     port=$((10#$port))
+    [[ "$local_only" != 1 || -z "$lan" ]] || fail 'Use --lan or --local-only, not both'
     [[ -z "$lan" || "$lan" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] || fail 'Use a LAN hostname or IPv4 address'
     require_platform
     exec 9>/run/lock/gitmirror-managed-install.lock
     flock -n 9 || fail 'Another GitMirror installation or maintenance operation is active'
     select_action
+    # New managed installations default to the device's short hostname, without .local.
+    # Existing installations and preserved reinstall settings are never changed.
+    if [[ "$action" == install && -z "$lan" && "$local_only" == 0 ]]; then
+        lan=$(hostname -s)
+        [[ "$lan" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] ||
+            fail 'Invalid device hostname. Supply --lan HOST_OR_IPV4 or --local-only'
+        printf 'LAN dashboard hostname: %s (use --local-only to restrict to loopback)\n' "$lan"
+    fi
     case "$action" in
         status)
             if [[ -f "$app/current/version" ]]; then
