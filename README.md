@@ -42,15 +42,21 @@ For a new managed installation on Debian 12+ or Raspberry Pi OS (64-bit), run:
 curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash
 ```
 
-This installs GitMirror, its systemd services and the web dashboard. By default, the dashboard listens only on `http://127.0.0.1:8787` on the Raspberry Pi or Linux machine.
+The installer enables HTTPS on your trusted LAN using the device's **short hostname**, such as `https://rpi5:8787`. It does not automatically append `.local`. The managed dashboard also accepts the Raspberry Pi's current local interface IPs, its Tailscale IP and its exact Tailscale MagicDNS name, when available. For example, you can use `https://192.168.1.80:8787` if that is the Pi's actual LAN address. The name `rpi5` must resolve on your computer; use the IP address if it does not.
 
-For a headless Raspberry Pi that you want to manage from another computer on your LAN, specify its hostname or IP address **during the first installation**:
+You can optionally select a specific hostname or IP on first installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash -s -- --lan rpi5.local
+curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash -s -- --lan rpi5
 ```
 
-Replace `rpi5.local` with an address reachable from your computer. The LAN option enables HTTPS using a locally generated certificate. **Compare the certificate's SHA-256 fingerprint shown in the terminal before trusting the browser's certificate warning.** Do not forward the dashboard's port to the public internet.
+To restrict the dashboard to the Raspberry Pi itself, use `--local-only` instead:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/luizbizzio/gitmirror/main/install.sh | sudo bash -s -- --local-only
+```
+
+For new LAN installations, the generated HTTPS certificate includes the short hostname, configured hostname, current device IPs and available Tailscale MagicDNS name. Because it is locally self-signed, browsers may still warn until the certificate is trusted. **Compare its SHA-256 fingerprint printed by the installer before trusting it.** Existing installations retain their previous TLS certificate, which might not include the newly supported names or IPs. Hostname acceptance and certificate trust are two different checks. Do not forward the dashboard's port to the public internet.
 
 The installer checks system dependencies and asks before installing missing packages. At the end of a successful first installation, it prints the **dashboard URL and a temporary password**. Sign in with that temporary password, set your own administrator password (at least six characters), and complete Setup. Afterward, sign in as `admin` with your chosen password; optionally enable 2FA in Settings. The temporary password is not a permanent login credential.
 
