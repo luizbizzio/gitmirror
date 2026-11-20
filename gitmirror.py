@@ -4149,6 +4149,63 @@ def validate_managed(installation):
 
 # Optional self-hosted dashboard
 
+def managed_dashboard_hosts():
+    """Names and interface addresses of this device, not arbitrary private networks.
+
+    Restricting access to actual interface IPs and system/Tailscale hostnames avoids
+    the confusing single-host allowlist without accepting random DNS-rebinding hosts.
+    """
+    names = set()
+    for lookup in (socket.gethostname, socket.getfqdn):
+        try:
+            name = lookup().strip().rstrip('.').casefold()
+        except OSError:
+            continue
+        if re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,252}', name):
+            names.add(name)
+            names.add(name.split('.', 1)[0])
+    # Linux interface addresses, including Wi-Fi/Ethernet and Tailscale (100.64/10).
+    try:
+        output = subprocess.run(['ip', '-j', 'address', 'show'], capture_output=True,
+                                text=True, check=True, timeout=3)
+        for interface in json.loads(output.stdout):
+            for address in interface.get('addr_info', []):
+                value = address.get('local', '')
+                try:
+                    names.add(str(ipaddress.ip_address(value)))
+                except ValueError:
+                    continue
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    # Fallback on minimal Pi installations without iproute2.
+    try:
+        output = subprocess.run(['hostname', '-I'], capture_output=True, text=True,
+                                check=True, timeout=3)
+        for value in output.stdout.split():
+            try:
+                names.add(str(ipaddress.ip_address(value)))
+            except ValueError:
+                continue
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # MagicDNS identity is an exact host, not an unrestricted *.ts.net wildcard.
+    try:
+        output = subprocess.run(['tailscale', 'status', '--json'], capture_output=True,
+                                text=True, check=True, timeout=3)
+        self_info = json.loads(output.stdout).get('Self') or {}
+        dns_name = self_info.get('DNSName', '').strip().rstrip('.').casefold()
+        if re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,252}', dns_name) and dns_name.endswith('.ts.net'):
+            names.add(dns_name)
+        for value in self_info.get('TailscaleIPs', []):
+            try:
+                names.add(str(ipaddress.ip_address(value)))
+            except ValueError:
+                continue
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        pass
+    return names
+
+
 def create_web_app(settings, config_file, *, password, allow_actions=False, assets_dir=None,
                    allowed_hosts=None, restore_dir=None, public_origin=None, session_ttl=43200,
                    managed=None, revision=None, reload_config=None):
@@ -4200,6 +4257,8 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
     journal = DashboardJournal(settings, initialize=True)
     app = FastAPI(title='GitMirror Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
     allowed = {'localhost', '127.0.0.1', '::1', *(h.casefold() for h in allowed_hosts or ())}
+    if managed:
+        allowed.update(managed_dashboard_hosts())
     if public_origin:
         permitted = urlsplit_origin(public_origin)
         if not permitted or permitted.scheme != 'https' or permitted.hostname not in allowed:
