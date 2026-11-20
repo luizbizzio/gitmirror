@@ -4189,6 +4189,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             raise SyncError('Web password must contain 6 to 1024 characters')
         salt = secrets.token_bytes(32)
         password_hash = scrypt_password(password, salt)
+    users = DashboardUsers(managed) if managed else None
+    if users and revision:
+        users.ensure(revision)
     journal = DashboardJournal(settings, initialize=True)
     app = FastAPI(title='GitMirror Dashboard', docs_url=None, redoc_url=None, openapi_url=None)
     allowed = {'localhost', '127.0.0.1', '::1', *(h.casefold() for h in allowed_hosts or ())}
@@ -4211,19 +4214,56 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         key = request.cookies.get(cookie, '')
         with auth_lock:
             active = sessions.get(key)
-            if active and active[0] > time.monotonic():
-                return active
-            sessions.pop(key, None)
-        return None
+            if not active or active[0] <= time.monotonic():
+                sessions.pop(key, None)
+                return None
+        if users and not pending_setup and active[2] == 'auth':
+            account = users.get(active[3])
+            if not account or account.get('generation', 0) != active[4]:
+                with auth_lock:
+                    sessions.pop(key, None)
+                return None
+        return active
 
-    def auth(request, *, csrf=False, bootstrap=False):
+    def auth(request, *, csrf=False, bootstrap=False, role=None):
         active = session(request)
-        if not active or (len(active) > 2 and active[2] != 'auth' and not bootstrap):
+        if not active or (active[2] != 'auth' and not bootstrap):
             raise HTTPException(401, 'Sign in required')
         if csrf and not hmac.compare_digest(active[1].encode('ascii'),
                                             request.headers.get('X-CSRF-Token', '').encode('utf-8')):
             raise HTTPException(403, 'Invalid session verification token')
+        if role:
+            current = users.get(active[3])['role'] if users and not pending_setup else 'administrator'
+            allowed_roles = {'administrator': DASHBOARD_ROLES,
+                             'operator': ('administrator', 'operator'),
+                             'administrator_only': ('administrator',)}[role]
+            if current not in allowed_roles:
+                raise HTTPException(403, 'Your account does not have permission for this action')
         return active
+
+    def acting(request):
+        active = auth(request)
+        return active[3] if users and not pending_setup else 'admin'
+
+    def verify_current(request, password):
+        name = acting(request)
+        if not verify_password(password, revision, name):
+            raise HTTPException(403, 'Current password is incorrect')
+        return name
+
+    def keep_current_session(request):
+        if not users or pending_setup:
+            return
+        key = request.cookies.get(cookie, '')
+        username = acting(request)
+        current = users.get(username)
+        with auth_lock:
+            for candidate, value in list(sessions.items()):
+                if value[3] == username and candidate != key:
+                    del sessions[candidate]
+            if key in sessions:
+                old = sessions[key]
+                sessions[key] = (old[0], old[1], old[2], username, current['generation'])
 
     async def body(request, *, limit=16384):
         if request.headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
@@ -4295,10 +4335,11 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             global_attempts.append(now)
         return ip, now
 
-    def issue_session(request, stage='auth'):
+    def issue_session(request, stage='auth', username='admin'):
         now = time.monotonic()
         lifetime = min(session_ttl, 600) if stage == 'bootstrap' else session_ttl
         key = secrets.token_urlsafe(32)
+        generation = users.get(username)['generation'] if users and not pending_setup and stage == 'auth' else 0
         with auth_lock:
             ip = request.client.host if request.client else 'unknown'
             attempts.pop(ip, None)
@@ -4307,16 +4348,19 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 del sessions[expired]
             if len(sessions) >= 128:
                 sessions.pop(next(iter(sessions)))
-            sessions[key] = (now + lifetime, secrets.token_urlsafe(32), stage)
+            sessions[key] = (now + lifetime, secrets.token_urlsafe(32), stage, username, generation)
         secure = bool(public_origin or request.url.scheme == 'https')
-        response = JSONResponse({'authenticated': stage == 'auth', 'first_login': stage == 'bootstrap'})
+        response = JSONResponse({'authenticated': stage == 'auth', 'first_login': stage == 'bootstrap',
+                                 'username': username})
         response.set_cookie(cookie, key, httponly=True, samesite='strict', secure=secure,
                             max_age=lifetime, path='/')
         return response
 
-    def verify_password(value, revision_for_password):
+    def verify_password(value, revision_for_password, username='admin'):
         if not isinstance(value, str) or len(value) > 1024:
             return False
+        if users and not pending_setup:
+            return users.verify(username, value)
         try:
             check_salt, digest = managed.credentials(revision_for_password) if managed else (salt, password_hash)
             return hmac.compare_digest(scrypt_password(value, check_salt), digest)
