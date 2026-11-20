@@ -9,10 +9,10 @@ launcher at `/usr/local/bin/gitmirror`. Update it with the same kind of command
 used by Pi-hole:
 
 ```sh
-gitmirror -up
+gitmirror update
 ```
 
-`gitmirror update` is an alias. This command checks for a newer version, prints
+`gitmirror -up` and `gitmirror upgrade` remain supported aliases. This command checks for a newer version, prints
 the current and candidate versions, and applies the update when available. It
 may request your normal `sudo` password, but does **not** ask you to type
 `UPGRADE` again. No `git clone`, archive creation, release tag or curl command
