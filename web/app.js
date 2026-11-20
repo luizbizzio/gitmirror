@@ -700,6 +700,8 @@ document.addEventListener("click", (event) => {
 });
 
 function showFirstPassword() {
+  $("#shell").hidden = true;
+  $("#login").hidden = false;
   $("#login-form").hidden = true;
   $("#mfa-form").hidden = true;
   $("#first-password-form").hidden = false;
@@ -1334,6 +1336,81 @@ function openConfiguration(initial, data) {
   });
   if (!initial) wrapper.scrollIntoView({block: "start"});
 }
+
+async function loadSecurity() {
+  if (securityEnrollment || securityRecovery) return;
+  const state = await api("/api/security");
+  $("#security-state").textContent = state.enabled ? "Enabled" : "Disabled";
+  $("#security-start").hidden = state.enabled;
+  $("#security-disable").hidden = !state.enabled;
+  $("#security-enroll").hidden = true;
+  $("#security-recovery").hidden = true;
+}
+
+$("#security-start").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#security-error").textContent = "";
+  try {
+    const result = await post("/api/security/totp/start", {password: $("#security-start-password").value});
+    $("#security-start-password").value = "";
+    $("#security-secret").textContent = result.secret;
+    securityEnrollment = true;
+    $("#security-start").hidden = true;
+    $("#security-enroll").hidden = false;
+    $("#security-state").textContent = "Waiting for confirmation";
+  } catch (error) { $("#security-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+$("#security-confirm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#security-error").textContent = "";
+  try {
+    const result = await post("/api/security/totp/confirm", {code: $("#security-confirm-code").value.trim()});
+    $("#security-confirm-code").value = "";
+    $("#security-secret").textContent = "";
+    securityEnrollment = false;
+    securityRecovery = true;
+    $("#security-enroll").hidden = true;
+    $("#security-recovery").hidden = false;
+    $("#security-codes").textContent = result.recovery_codes.join("\n");
+    $("#security-state").textContent = "Enabled";
+  } catch (error) { $("#security-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
+$("#security-cancel").addEventListener("click", async () => {
+  try {
+    await post("/api/security/totp/cancel", {});
+    $("#security-secret").textContent = "";
+    securityEnrollment = false;
+    await loadSecurity();
+  } catch (error) { $("#security-error").textContent = error.message; }
+});
+
+$("#security-recovery-done").addEventListener("click", async () => {
+  $("#security-codes").textContent = "";
+  securityRecovery = false;
+  await loadSecurity().catch(report);
+});
+
+$("#security-disable").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  $("#security-error").textContent = "";
+  try {
+    await post("/api/security/totp/disable", {password: $("#security-disable-password").value,
+      code: $("#security-disable-code").value.trim()});
+    $("#security-disable-password").value = $("#security-disable-code").value = "";
+    await loadSecurity();
+  } catch (error) { $("#security-error").textContent = error.message; }
+  finally { button.disabled = false; }
+});
 
 async function startDashboard() {
   const response = await fetch("/api/setup", {credentials: "same-origin"});
