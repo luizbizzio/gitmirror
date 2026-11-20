@@ -31,7 +31,7 @@ let repositories = [], targetSignature = "", currentRun = "", restoreSelection =
 let loading = false, refreshPending = false, logRequest = 0, busy = false;
 let previewMode = false, initialSetupData = null;
 let securityEnrollment = false, securityRecovery = false;
-let currentRole = "administrator", currentUsername = "admin";
+let currentRole = "administrator", currentUsername = "admin", managedDashboard = false;
 const canOperate = () => currentRole !== "viewer";
 const canAdmin = () => currentRole === "administrator";
 let inventoryWarmupAttempted = false;
@@ -114,6 +114,7 @@ function updateSystemStatus(data) {
 function signOut() {
   csrf = "";
   currentRole = "administrator";
+  managedDashboard = false;
   stream?.close();
   stream = null;
   clearInterval(refreshTimer);
@@ -156,7 +157,7 @@ function report(error) { notify(error.message, true); }
 
 function openView(name, {updateUrl = true} = {}) {
   if (!Object.hasOwn(pages, name)) return;
-  if (name === "users" && (!canAdmin() || previewMode)) name = "overview";
+  if (name === "users" && (!canAdmin() || !managedDashboard || previewMode)) name = "overview";
   view = name;
   for (const item of all("#main-navigation [data-view]")) {
     if (item.dataset.view === view) item.setAttribute("aria-current", "page");
@@ -629,9 +630,10 @@ async function boot() {
   csrf = session.csrf;
   currentRole = session.role || "administrator";
   currentUsername = session.username || "admin";
+  managedDashboard = Boolean(session.managed);
   $("#login-username").hidden = $("#login-username-label").hidden = !session.managed;
   $("#login-username").required = Boolean(session.managed);
-  $("[data-view=users]").hidden = !canAdmin();
+  $("[data-view=users]").hidden = !managedDashboard || !canAdmin();
   $("#signed-in-user").hidden = false;
   $("#signed-in-user").textContent = currentUsername + " · " + currentRole;
   previewMode = false;
