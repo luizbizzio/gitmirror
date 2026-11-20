@@ -22,8 +22,9 @@ fail() { printf 'GitMirror: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 GitMirror installer and maintenance
-  (no command)  Install if absent, otherwise update the managed installation
+  (no command)  Install, update, or safely reinstall retained managed state
   install [--port PORT] [--lan HOST_OR_IPV4]
+  reinstall       Reinstall the application using preserved state (no data deletion)
   upgrade | status | check | rollback | uninstall
   --dev           Use current development main instead of a published release
   --tag vX.Y.Z    Select an immutable stable release
@@ -175,18 +176,40 @@ release_source() {
     printf 'Verified %s (%s)\n' "$tag" "$checksum"
 }
 
+retained_reinstall_ready() {
+    # A completed uninstall leaves only the protected state, installer settings and service account.
+    # Never treat an interrupted installation or an active service as safely reusable.
+    [[ ! -e "$app" && ! -L "$app" && ! -e "$unit_dir/$web" && ! -L "$unit_dir/$web" &&
+       ! -e "$unit_dir/$scheduler" && ! -L "$unit_dir/$scheduler" ]] || return 1
+    [[ -d "$state" && ! -L "$state" && -d "$etc" && ! -L "$etc" ]] || return 1
+    getent passwd "$account" >/dev/null && getent group "$account" >/dev/null || return 1
+    local uid
+    uid=$(id -u "$account") || return 1
+    [[ "$(stat -c '%u %a' -- "$state")" == "$uid 700" &&
+       "$(stat -c '%u %a' -- "$etc")" == '0 755' ]] || return 1
+    [[ -f "$etc/listener" && ! -L "$etc/listener" ]] || return 1
+    [[ -f "$etc/sync.lock" && ! -L "$etc/sync.lock" &&
+       -f "$etc/sync-lock-created" && ! -L "$etc/sync-lock-created" ]] || return 1
+    if systemctl is-active --quiet "$web" || systemctl is-active --quiet "$scheduler"; then
+        return 1
+    fi
+}
+
 select_action() {
     if [[ "$action" != auto ]]; then
         return
     fi
     if [[ -f "$app/current/version" ]]; then
         action=upgrade
-    elif [[ -e "$app" || -L "$app" || -e "$state" || -L "$state" ||
-            -e "$etc" || -L "$etc" || -e "$unit_dir/$web" || -L "$unit_dir/$web" ||
-            -e "$unit_dir/$scheduler" || -L "$unit_dir/$scheduler" ]]; then
-        fail 'A partial or retained managed installation exists; refusing to overwrite it'
-    else
+    elif [[ ! -e "$app" && ! -L "$app" && ! -e "$state" && ! -L "$state" &&
+            ! -e "$etc" && ! -L "$etc" && ! -e "$unit_dir/$web" && ! -L "$unit_dir/$web" &&
+            ! -e "$unit_dir/$scheduler" && ! -L "$unit_dir/$scheduler" ]]; then
         action=install
+    elif retained_reinstall_ready; then
+        action=reinstall
+        printf 'Previous GitMirror installation was removed, but its managed data is preserved.\n'
+    else
+        fail 'Unrecognized or incomplete managed installation. Nothing was overwritten. Inspect /opt, /var/lib and /etc/gitmirror-managed before retrying'
     fi
 }
 
@@ -213,7 +236,7 @@ main() {
     action=auto
     tag= checksum= artifact= confirmation= lan=
     approve=0 development=0 port=8787
-    case "${1:-}" in install|upgrade|rollback|uninstall|status|check) action=$1; shift;; esac
+    case "${1:-}" in install|reinstall|upgrade|rollback|uninstall|status|check) action=$1; shift;; esac
     while (($#)); do
         case "$1" in
             --yes) approve=1; shift; continue ;;
@@ -264,6 +287,10 @@ main() {
             fail 'Managed installation or retained state already exists. Use status or upgrade'
         ! getent passwd "$account" >/dev/null && ! getent group "$account" >/dev/null ||
             fail 'The managed service account already exists'
+    elif [[ "$action" == reinstall ]]; then
+        retained_reinstall_ready ||
+            fail 'Cannot safely reinstall: retained state or service account is incomplete or services are present'
+        printf 'Existing GitMirror credentials, backups and settings will be retained.\n'
     else
         [[ -f "$app/current/version" ]] || fail 'No managed installation to upgrade'
         printf 'Installed release: %s\n' "$(cat "$app/current/version")"
