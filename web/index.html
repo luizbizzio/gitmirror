@@ -290,6 +290,21 @@
             </form>
             <p id="user-message" role="status"></p>
             <div id="user-list" class="table-wrap"></div>
+            <form id="user-manage" class="action-form" hidden>
+              <h3>Manage account</h3>
+              <label>Username<input name="username" autocomplete="off" readonly></label>
+              <label>Action<select name="action">
+                <option value="role">Change role</option>
+                <option value="password">Reset password</option>
+                <option value="reset_2fa">Reset 2FA</option>
+                <option value="delete">Delete account</option>
+              </select></label>
+              <label id="user-manage-role">New role<select name="role"><option value="viewer">Viewer</option><option value="operator">Operator</option><option value="administrator">Administrator</option></select></label>
+              <label id="user-manage-password" hidden>New password<input name="password" type="password" minlength="6" autocomplete="new-password"></label>
+              <label>Your administrator password<input name="current_password" type="password" autocomplete="current-password" required></label>
+              <button class="button primary" type="submit">Apply change</button>
+              <button id="user-manage-cancel" class="button secondary" type="button">Cancel</button>
+            </form>
           </article>
           <article class="panel">
             <header><h2>Security and activity audit</h2></header>
