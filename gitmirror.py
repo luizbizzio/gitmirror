@@ -4606,8 +4606,11 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 return key == ''
             with auth_lock:
                 current = sessions.get(key)
-                return bool(current and current[0] > time.monotonic() and
-                            (len(current) < 3 or current[2] == 'auth'))
+            if not current or current[0] <= time.monotonic() or current[2] != 'auth':
+                return False
+            account = users.get(current[3]) if not pending_setup else None
+            return bool(pending_setup or account and account['role'] == 'administrator' and
+                        account['generation'] == current[4])
 
         flows = OAuthFlows(managed, oauth_authorized)
         app.state.oauth_flows = flows
@@ -4630,7 +4633,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
         def oauth_actor(request, data=None, *, start=False):
             if not pending_setup or managed.pending_admin.exists():
-                auth(request, csrf=True)
+                auth(request, csrf=True, role='administrator_only')
                 key = request.cookies.get(cookie, '')
                 if not oauth_authorized(key):
                     raise HTTPException(409, 'Dashboard configuration changed. Reload and sign in again.')
@@ -4784,7 +4787,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 raise HTTPException(409, 'Setup is already complete')
             data = await body(request, limit=65536)
             if managed.pending_admin.exists():
-                auth(request, csrf=True)
+                auth(request, csrf=True, role='administrator_only')
             else:
                 # Compatible with earlier one-step setup clients; the secret is still required.
                 try:
@@ -4797,7 +4800,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         async def check_ssh_host(request: _GitMirrorWebRequest):
             data = await body(request)
             if not pending_setup or managed.pending_admin.exists():
-                auth(request, csrf=True)
+                auth(request, csrf=True, role='administrator_only')
             reserve_attempt(request)
             try:
                 if pending_setup and not managed.pending_admin.exists():
@@ -4815,14 +4818,23 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
         @app.get('/api/managed/settings')
         def managed_settings(request: _GitMirrorWebRequest):
-            auth(request)
+            auth(request, role='administrator_only')
             return {**managed.settings(revision), 'revision': revision.identifier}
 
         @app.post('/api/managed/settings')
         async def update_settings(request: _GitMirrorWebRequest):
-            auth(request, csrf=True)
+            active = auth(request, csrf=True, role='administrator_only')
             data = await body(request, limit=65536)
-            return await save_settings(data)
+            if data.get('password'):
+                verify_current(request, data.get('current_password'))
+                if active[3] != 'admin':
+                    raise HTTPException(403, 'Change your password in Security settings')
+            result = await save_settings(data)
+            if data.get('password'):
+                # Preserve the existing administrator password editor while moving its identity to the account store.
+                await asyncio.to_thread(users.manage, 'admin', 'password', data['password'], actor=active[3])
+            journal.audit(active[3], 'configuration.updated')
+            return result
 
     def local_data():
         nonlocal backup_cache
@@ -4909,7 +4921,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
 
     @app.post('/api/repositories/refresh')
     def refresh_repositories(request: _GitMirrorWebRequest):
-        auth(request, csrf=True)
+        active = auth(request, csrf=True, role='operator')
         if not discovery_lock.acquire(blocking=False):
             raise HTTPException(409, 'Inventory refresh is already running')
         try:
@@ -5020,7 +5032,7 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         return {'id': job_id, 'state': 'queued', 'mode': mode}
 
     def require_action(request):
-        auth(request, csrf=True)
+        auth(request, csrf=True, role='operator')
         if not allow_actions:
             raise HTTPException(403, 'Start the dashboard with --allow-actions')
 
@@ -5065,7 +5077,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             args.append(f'--only={repository}')
         for target in targets:
             args.extend(('--destination', target))
-        return await asyncio.to_thread(start, 'sync', mode, repository, targets, args)
+        result = await asyncio.to_thread(start, 'sync', mode, repository, targets, args)
+        journal.audit(acting(request), 'sync.' + mode, repository, result['id'])
+        return result
 
     @app.post('/api/managed/check')
     async def check_connections(request: _GitMirrorWebRequest):
@@ -5080,7 +5094,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         args = ['doctor', '--ssh' if ssh else '--network', '--monitor']
         if repository:
             args.append(f'--only={repository}')
-        return await asyncio.to_thread(start, 'doctor', 'check', repository, [], args)
+        result = await asyncio.to_thread(start, 'doctor', 'check', repository, [], args)
+        journal.audit(acting(request), 'connection.checked', repository, result['id'])
+        return result
 
     @app.post('/api/backups/verify')
     async def verify(request: _GitMirrorWebRequest):
@@ -5089,10 +5105,13 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         targets = selected(data, local=True)
         repository, _, options = backup_args(data, targets)
         args = ['verify-backup', f'--only={repository}', *options]
-        return await asyncio.to_thread(start, 'verify', 'verify', repository, targets, args)
+        result = await asyncio.to_thread(start, 'verify', 'verify', repository, targets, args)
+        journal.audit(acting(request), 'backup.verified', repository, result['id'])
+        return result
 
     @app.post('/api/backups/restore')
     async def restore(request: _GitMirrorWebRequest):
+        auth(request, csrf=True, role='administrator_only')
         require_action(request)
         if restore_dir is None:
             raise HTTPException(403, 'Configure a restore directory on the server')
@@ -5112,7 +5131,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
         args = ['restore', f'--repo={repository}', f'--output={output}', *options]
         if archive:
             args.append('--include-archive')
-        return await asyncio.to_thread(start, 'restore', 'restore', repository, targets, args)
+        result = await asyncio.to_thread(start, 'restore', 'restore', repository, targets, args)
+        journal.audit(acting(request), 'backup.restored', repository, result['id'])
+        return result
 
     return app
 
