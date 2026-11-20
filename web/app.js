@@ -629,6 +629,8 @@ async function boot() {
   csrf = session.csrf;
   currentRole = session.role || "administrator";
   currentUsername = session.username || "admin";
+  $("#login-username").hidden = $("#login-username-label").hidden = !session.managed;
+  $("#login-username").required = Boolean(session.managed);
   $("[data-view=users]").hidden = !canAdmin();
   $("#signed-in-user").hidden = false;
   $("#signed-in-user").textContent = currentUsername + " · " + currentRole;
