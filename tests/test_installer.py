@@ -213,6 +213,7 @@ def test_reinstall_recreates_services_without_resetting_saved_admin(tmp_path):
         }
         runuser() { :; }
         unit() { touch "$unit_dir/$1"; }
+        systemd-analyze() { :; }
         health() { return 0; }
         install_cli() { touch "$cli"; }
         reinstall
