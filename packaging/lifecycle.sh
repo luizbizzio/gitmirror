@@ -131,8 +131,36 @@ health() {
 }
 
 issue_certificate() {
-    local san="DNS:$lan"
-    [[ "$lan" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && san="IP:$lan"
+    # Cover the short hostname, configured alias, current interface IPs, and
+    # Tailscale MagicDNS in one certificate. No wildcard DNS identities.
+    local name ip dns san
+    local -a alternative_names=()
+    local -A seen=()
+    for name in "$lan" "$(hostname -s 2>/dev/null || true)" "$(hostname -f 2>/dev/null || true)"; do
+        [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || continue
+        if [[ "$name" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+            [[ -n "${seen[IP:$name]:-}" ]] || alternative_names+=("IP:$name")
+            seen[IP:$name]=1
+        else
+            [[ -n "${seen[DNS:$name]:-}" ]] || alternative_names+=("DNS:$name")
+            seen[DNS:$name]=1
+        fi
+    done
+    for ip in $(hostname -I 2>/dev/null || true); do
+        [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ || "$ip" =~ ^[a-fA-F0-9:]+$ ]] || continue
+        [[ -n "${seen[IP:$ip]:-}" ]] || alternative_names+=("IP:$ip")
+        seen[IP:$ip]=1
+    done
+    if command -v tailscale >/dev/null && command -v jq >/dev/null; then
+        dns=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)
+        dns=${dns%.}
+        if [[ "$dns" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}\.ts\.net$ ]]; then
+            [[ -n "${seen[DNS:$dns]:-}" ]] || alternative_names+=("DNS:$dns")
+            seen[DNS:$dns]=1
+        fi
+    fi
+    (IFS=,; san="${alternative_names[*]}")
+    [[ -n "$san" ]] || fail 'No usable dashboard TLS hostname'
     install -d -m 0750 -g "$account" "$etc/tls"
     (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -days 365 -subj "/CN=$lan" -addext "subjectAltName=$san" \
