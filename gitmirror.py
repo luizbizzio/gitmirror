@@ -4144,7 +4144,9 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
             challenge = secrets.token_urlsafe(32)
             now = time.monotonic()
             with auth_lock:
-                mfa_pending.clear() if len(mfa_pending) > 128 else None
+                sessions.pop(request.cookies.get(cookie, ''), None)
+                if len(mfa_pending) > 128:
+                    mfa_pending.clear()
                 mfa_pending[challenge] = (now + 180, ip)
             response = JSONResponse({'mfa_required': True})
             response.set_cookie('gm_2fa', challenge, httponly=True, secure=True, samesite='strict',
@@ -4258,6 +4260,10 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 state = {'enabled': True, 'secret': secret, 'last_counter': -1,
                          'recovery': [hashlib.sha256(code.encode('ascii')).hexdigest() for code in recovery]}
                 store_oauth(managed.root / 'security.json', state)
+            with auth_lock:
+                key = request.cookies.get(cookie, '')
+                for other in [item for item in sessions if item != key]:
+                    del sessions[other]
             return {'enabled': True, 'recovery_codes': recovery}
 
         @app.post('/api/security/totp/cancel')
@@ -4283,6 +4289,10 @@ def create_web_app(settings, config_file, *, password, allow_actions=False, asse
                 raise HTTPException(403, 'Invalid authenticator or recovery code')
             with FileLock(str(managed.root / '.security.lock'), timeout=25):
                 store_oauth(managed.root / 'security.json', {'enabled': False})
+            with auth_lock:
+                key = request.cookies.get(cookie, '')
+                for other in [item for item in sessions if item != key]:
+                    del sessions[other]
             return {'enabled': False}
 
         oauth_cookie = '__Host-gm_oauth'
