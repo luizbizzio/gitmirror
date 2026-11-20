@@ -188,7 +188,7 @@ def test_reinstall_recreates_services_without_resetting_saved_admin(tmp_path):
     setup = """
         source "$PROJECT/packaging/lifecycle.sh"
         app="$PWD/app" state="$PWD/state" etc="$PWD/etc" unit_dir="$PWD/units"
-        web=web.service scheduler=scheduler.service account=gitmirror-managed
+        web=web.service scheduler=scheduler.service account="$(command id -un)"
         cli="$PWD/launcher"
         tag=dev-tests checksum=abcdef0123456789
         mkdir -m 700 "$state"
