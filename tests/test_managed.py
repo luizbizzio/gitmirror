@@ -366,7 +366,7 @@ def test_existing_managed_totp_is_migrated_to_admin(installation):
     managed, payload = installation
     with TestClient(managed_app(managed), base_url='https://localhost') as client:
         assert client.post('/api/setup', json=payload).status_code == 200
-    secret = base64.b32encode(b'old-2fa-setup-for-test').decode().rstrip('=')
+    secret = base64.b32encode(b'old-2fa-setup-test00').decode().rstrip('=')
     gitmirror.store_oauth(managed.root / 'security.json', {
         'enabled': True, 'secret': secret, 'last_counter': -1, 'recovery': []})
     with TestClient(managed_app(managed), base_url='https://localhost') as client:
